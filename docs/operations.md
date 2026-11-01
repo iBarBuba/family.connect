@@ -469,11 +469,16 @@ money that goes to somebody else.
 
 ### Before turning it on
 
+0. **Business → Agreements.** The Paid Applications Agreement, with its bank
+   and tax forms, must be active. Until it is, no subscription can be sold,
+   and none even loads in Sandbox.
 1. **App Store Connect → the app → Subscriptions.** Create one subscription
    group ("Family hosting") holding the products named in `product_ids`: by
    default `me.nettrash.FamilyConnect.family.monthly` and `….family.yearly`.
    Give them prices, a display name and a description, and the review
-   screenshot Apple asks for.
+   screenshot Apple asks for. Leave **Family Sharing off**: it cannot be
+   turned off again, and the server is not built for shared purchases — one
+   subscription belongs to one account.
 2. **Billing Grace Period** (in the same place): turn it on, 16 days. While
    Apple retries a failed payment the subscription stays active, and the
    server counts it as active. The family's 14 days start only after that.
@@ -485,9 +490,15 @@ money that goes to somebody else.
    functionality. The server keeps, per subscriber, Apple's transaction id,
    the product, the environment and when it expires. Say the same on the
    privacy policy page.
-5. **Ship the app that can buy.** Until the iPhone/iPad/Mac app with the
-   subscription screen is on the App Store, nobody can start a family once
-   the switch is on.
+5. **Turn it on BEFORE submitting the app that can buy, not after.** App
+   Review buys in Sandbox, on this server, in the version under review, and
+   the subscription screen appears only while the switch is on (with
+   `"Sandbox"` in `environments`, the default). A first subscription is
+   reviewed together with an app version, so submit both at once, and give
+   App Review an account in the review notes: "New Family… → subscribe".
+   Until that version is out, only TestFlight and development builds can
+   buy, so a new family on this server can only be started from them.
+   Families that already exist are unaffected: they stay free.
 
 ### Turning it on
 

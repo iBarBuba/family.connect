@@ -147,6 +147,51 @@ chat,messenger,private,self-hosted,server,calls,video,voice,photos,relatives,gra
 
 *("family" and "connect" are left out on purpose — the app name is meant to carry them. Confirm the App Store Connect name first: the icon and the app itself are called "Family", and if the store listing is named that too, "connect" is indexed nowhere and should take "group"'s place here; the five free characters are held for exactly that. "kids" is dropped deliberately — a keyword implying a child audience invites a Guideline 1.3 and age-rating question this app cannot answer.)*
 
+## In-App Subscription — Family Hosting
+
+*Monetization → Subscriptions. Paid families (#89) sell one thing: an auto-renewable subscription
+in one group, bought only in this app — iPhone, iPad and Mac, one purchase
+(`docs/paid-families-2026-10-30.md`, D1). The rest of the console work — the Paid Applications
+Agreement, Family Sharing OFF, the grace period, the notification URL, App Privacy, and WHEN the
+server's switch goes on — is `docs/operations.md` §9; this section is only the words. App Store
+Connect allows a display name of 2 to 30 characters and a description of at most 45. The counts
+in brackets were measured in characters, not bytes; `count-appstore.py` skips tables, so measure
+again by hand after changing one.*
+
+| Product ID | Reference name | Duration | Level |
+| --- | --- | --- | --- |
+| `me.nettrash.FamilyConnect.family.yearly` | Family hosting (yearly) | 1 year | 1 |
+| `me.nettrash.FamilyConnect.family.monthly` | Family hosting (monthly) | 1 month | 2 |
+
+The group: reference name `Family hosting` (seen only in App Store Connect), and App Name Display
+Options → **Use App Name**, so Manage Subscriptions shows the app's name above the group's.
+
+| Language | Group display name | Monthly display name | Yearly display name | Description (both products) |
+| --- | --- | --- | --- | --- |
+| English (U.S.) — primary | Family Hosting (14) | Family Hosting, Monthly (23) | Family Hosting, Yearly (22) | Hosts your family. Members join for free. (41) |
+| German | Familien-Hosting (16) | Familien-Hosting, monatlich (27) | Familien-Hosting, jährlich (26) | Hostet deine Familie, Beitritt kostenlos. (41) |
+| Spanish (Spain), Spanish (Mexico) | Alojamiento familiar (20) | Alojamiento familiar, mensual (29) | Alojamiento familiar, anual (27) | Aloja a tu familia. Unirse es gratis. (37) |
+| French, French (Canada) | Hébergement familial (20) | Hébergement familial, mensuel (29) | Hébergement familial, annuel (28) | Hébergez votre famille. Adhésion gratuite. (42) |
+| Japanese | ファミリーホスティング (11) | ファミリーホスティング（月額） (15) | ファミリーホスティング（年額） (15) | ファミリーをホスト。メンバーは無料で参加できます。 (25) |
+| Russian | Хостинг семьи (13) | Хостинг семьи на месяц (22) | Хостинг семьи на год (20) | Ваша семья на сервере. Участникам бесплатно. (44) |
+| Chinese (Simplified) | 家庭托管 (4) | 家庭托管（月度） (8) | 家庭托管（年度） (8) | 托管您的家庭，成员免费加入。 (14) |
+
+*Why the words are these. The in-app screen is Apple's `SubscriptionStoreView` under the app's
+own heading, "Host Your Family", and lists the products by these display names; the translations
+follow that heading and its sentence in `Localizable.xcstrings`, informal "du" in German included.
+No limit appears — 25 members, 10 GiB, the assistant allowance — because each is a server setting
+and the screen already shows the live values from `paid_family_limits`; a number typed here goes
+stale the first time an operator changes one. No price or period either: Apple's sheet shows both.
+And never "family plan" or "share with your family": it reads as Family Sharing, which is off for
+these products and cannot be turned off again once on. "Members join for free" is the true shape —
+only the owner pays.*
+
+*App Store Connect has no Serbian, so `sr` and `sr-Latn` devices, like any language without a row
+here, see the primary language. Each product also needs a review screenshot of that screen, from a
+TestFlight or development build against a server with the switch on. `ios/FamilyConnect.storekit`
+carries the English row, so a local test purchase reads the same; it pins its own `_locale` to
+`en_US`, which is why the other languages are not copied into it.*
+
 ## Notes for App Review (paste verbatim — 3981 as written, 3997 with the placeholders filled / 4000)
 
 DEMO SERVER: https://fc.nettrash.me — compiled in, nothing to configure.
@@ -595,8 +640,10 @@ Each item is tagged **[code]** (a change in this repository) or **[nettrash]** (
 - [ ] **[nettrash]** Set `[server] support_contact` in the live config and fill `[SUPPORT_EMAIL]`. It ships commented out at `config.example.toml:24` and is therefore unset by default, and it is the only escalation path the app draws for a report about the family owner — which is the answer Apple will want when it asks who moderates the moderator. Note that the app surfaces it in exactly one place, the report sheet, so if it is unset that sheet has no escalation line at all.
 - [ ] **[nettrash]** Read the live server's `config.toml` and write the answers into the review notes rather than assuming defaults. Six values matter and none of them is in this repo: is `[ai]` enabled (and `ai_history` left at its default true) — the one that gates three other answers; are `[calls] enabled` and `video_enabled` on, without which the reviewer never sees a call button; what is `retention_days` actually set to (the shipped default of 100 permanently deletes messages and their media server-side); is `stun_urls` still Google's public STUN (`config.example.toml:214`); do `turn_urls` and `turn_secret` actually point at the coturn 4.6.1 already deployed alongside the server, since an unconfigured `turn_urls` is empty by default and calls that cannot connect directly then simply fail; is `[push] include_message_body` still true (`:135`), which puts plaintext message bodies on lock screens via APNs and FCM. Confirm too that APNs credentials are installed, or push silently logs and never arrives.
 - [ ] **[nettrash]** In App Store Connect: paste the Support URL and Privacy Policy URL, enter the owner demo credentials in App Review Information, and upload the two screenshot sets.
+- [ ] **[nettrash]** Paid families (#89) in App Store Connect: `docs/operations.md` §9, steps 0 to 5, with the products, names and descriptions from **In-App Subscription — Family Hosting** above. The subscriptions go to review WITH the app version that sells them, and `[subscriptions] enabled` goes on at fc.nettrash.me when that version is SUBMITTED, not once it is out — App Review buys in Sandbox against that server and sees the subscription screen only while the switch is on.
+- [ ] **[code]** Before the version that sells paid families is filed, two texts above must change, and both are already at the limit, so each sentence has to be paid for elsewhere in its field. First, the Notes for App Review — iOS and macOS alike — must say how to reach the subscription screen, and the owner demo account CANNOT: an account that owns a family is never offered "New Family…" (`Families.offersNewFamily`). The path that always works is a new account (registration is open) → "Create a family" → the subscription screen, bought in Sandbox; `[DEMO_USER_2]`, who owns nothing, also gets "New Family…", but only while the server's `member_families` door is open. Second, guideline 3.1.2(c): the Description must carry a working link to the Terms of Use — Apple's standard EULA, `https://www.apple.com/legal/internet-services/itunes/dev/stdeula/` — unless a custom EULA is filed under App Information → License Agreement. The privacy policy link is already filed. The app's own subscription screen carries both links.
 - [x] **[nettrash]** Export compliance is answered: **NO**, decided 2026-08-31. The basis is written up under **Export compliance** below — read it before repeating the answer anywhere else, because the reason the sibling apps' answer does not simply transfer is the one fact that makes this non-trivial.
-- [ ] **[nettrash]** Complete the age-rating questionnaire. The honest inputs are: user-generated content yes, person-to-person messaging with media yes, both bounded to a single family whose membership an owner controls, with in-app reporting, blocking, an owner report inbox and member removal. Web access is restricted: there is no in-app browser — tapped links hand off to the system browser through `openURL` — though the app does fetch metadata from linked hosts for previews. No gambling, contests, purchases or ads. No parental controls and no age verification, since birthdays carry no year. The open judgement is the assistant: if `[ai]` is enabled it writes model output into the shared family chat, and whether that moves the rating is a policy call that cannot be made until the item above resolves.
+- [ ] **[nettrash]** Complete the age-rating questionnaire. The honest inputs are: user-generated content yes, person-to-person messaging with media yes, both bounded to a single family whose membership an owner controls, with in-app reporting, blocking, an owner report inbox and member removal. Web access is restricted: there is no in-app browser — tapped links hand off to the system browser through `openURL` — though the app does fetch metadata from linked hosts for previews. No gambling, contests or ads. One purchase exists since #89: the optional Family Hosting subscription, sold only in this app and only while the server's `[subscriptions] enabled` is on. No parental controls and no age verification, since birthdays carry no year. The open judgement is the assistant: if `[ai]` is enabled it writes model output into the shared family chat, and whether that moves the rating is a policy call that cannot be made until the item above resolves.
 - [x] **[nettrash]** DECIDED 2026-09-17: **iPad kept**, reversing the 2026-09-16 decision to drop it — and the reversal is the interesting half. The question put to you was: "`TARGETED_DEVICE_FAMILY` is 1,2 but there is no size-class adaptation anywhere — the iPad is a stretched iPhone. Either adapt the layout, or drop to 1 and drop the iPad screenshot slot." That claim was written on 2026-08-28 and was already two weeks stale when it was acted on: `5e66173` (#43, 2026-09-03) had given the iPad a `NavigationSplitView` — chat list as sidebar, conversation in the detail column, chosen by idiom — with adaptations in `BoardView`, `AttachmentView`, `AlbumStackView`, `CallVideoView` and `UnreadDivider`. Verified on 2026-09-17 by restoring 1,2 and shooting the 13" set: it is a genuine two-column iPad app. The lesson for this file: a claim about the CODE has to be re-read from the code before a release decision rests on it.
 - [ ] **[nettrash]** Decide which name leads the App Store record. The app's on-device display name is "Family"; the product and this document are called "Family Connect", and the Siri vocabulary teaches "Call Anna on Family".
 - [ ] **[nettrash]** Decide whether open registration on fc.nettrash.me is acceptable at launch. There is no invite gate, no email, no allowlist and no config switch, so any App Store customer can create an account and a family on his box. Family isolation bounds the exposure — a new account sees nobody and reaches nobody — but storage (100 MB per attachment), server load and his own position as the operator of record are real. A `[registration]` switch on the server is the obvious follow-up.
@@ -716,6 +763,14 @@ labels rather than against this list.
   Statistics screen derives from them. A behavioural record of how someone uses the app, not
   content, and not to be folded into User Content. Typing indicators are **not** collected — they
   are relayed live over the socket and never stored.
+- **Purchases → `NSPrivacyCollectedDataTypePurchaseHistory`**, since paid families (#89). For each
+  App Store subscription an account presents, the server keeps the product, the environment, the
+  expiry, whether it renews or was refunded, and Apple's transaction ids, sealed under the
+  account's key (`subscriptions`, migration 0061) — that is what decides whether the account's
+  families are paid for. It goes with the account: Delete Account removes the rows. Only a server
+  whose `[subscriptions] enabled` is on collects it, but the label describes the app as shipped
+  against fc.nettrash.me, as every entry here does. Apple learns nothing about the account from
+  the purchase: it carries only `appAccountToken`, a random UUID the server made.
 - **Not collected: Contacts.** The contact-link feature persists the picked card's identifier,
   name, phone numbers and email addresses (`ContactLinks.swift:35-43`), but in this app's own
   `UserDefaults` only — none of it is ever transmitted, the picker runs out of process, and the app
@@ -724,8 +779,8 @@ labels rather than against this list.
   `includesCallsInRecents = true` and reports calls with a phone-number handle. That is on-device
   and not collection by the developer, but it is where the number visibly surfaces.
 - **Also not collected:** email address, phone number, physical address, health, fitness,
-  financial, browsing history, search history, purchases, advertising data, crash and performance
-  data. There is no analytics, no crash reporting, no attribution SDK and no IDFA anywhere in the
+  financial, browsing history, search history, advertising data, crash and performance data.
+  There is no analytics, no crash reporting, no attribution SDK and no IDFA anywhere in the
   build; the only third-party binary is WebRTC, which carries call media.
 
 **Required-reason APIs** are declared in the same manifest, and one of them was previously wrong:

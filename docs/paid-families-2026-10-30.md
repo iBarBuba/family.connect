@@ -264,8 +264,9 @@ new family cannot be started from this app (recommended), unless you would rathe
    check the journal, the banner and the expiry, which Sandbox makes take minutes, not a month.
 
 It ships in two steps without breaking anybody: the server first (the switch is off by default, and old apps never
-see a difference), then the apps. Turn the switch on fc.nettrash.me only once the Apple app that can buy is on the
-App Store.
+see a difference), then the apps. Turn the switch on fc.nettrash.me when the Apple app that can buy is SUBMITTED, not
+once it is out: App Review buys in Sandbox on that server, and sees the subscription screen only while the switch is
+on (docs/operations.md §9, step 5).
 
 ## 10. Decisions
 

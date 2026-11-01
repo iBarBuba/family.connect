@@ -36,8 +36,8 @@
           "introductoryOffer" : null,
           "localizations" : [
             {
-              "description" : "Your family on this server, for a month at a time.",
-              "displayName" : "Family hosting, monthly",
+              "description" : "Hosts your family. Members join for free.",
+              "displayName" : "Family Hosting, Monthly",
               "locale" : "en_US"
             }
           ],
@@ -61,8 +61,8 @@
           "introductoryOffer" : null,
           "localizations" : [
             {
-              "description" : "Your family on this server, for a year at a time.",
-              "displayName" : "Family hosting, yearly",
+              "description" : "Hosts your family. Members join for free.",
+              "displayName" : "Family Hosting, Yearly",
               "locale" : "en_US"
             }
           ],
