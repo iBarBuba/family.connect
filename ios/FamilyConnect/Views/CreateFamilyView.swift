@@ -20,8 +20,14 @@ final class CreateFamilyModel {
     /// families").
     var showsSubscription = false
 
+    /// The name as the server reads it: trimmed.
+    var trimmedName: String { name.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    /// 1–64 characters, counted as the server counts them (Unicode scalars),
+    /// and checked here, before the subscription screen: nobody pays for a
+    /// family the server would refuse to create.
     var canSubmit: Bool {
-        !isWorking && !name.trimmingCharacters(in: .whitespaces).isEmpty
+        !isWorking && (1...64).contains(trimmedName.unicodeScalars.count)
     }
 }
 
@@ -107,7 +113,7 @@ struct CreateFamilyView: View {
     private func create() {
         model.errorText = nil
         model.isWorking = true
-        let name = model.name.trimmingCharacters(in: .whitespaces)
+        let name = model.trimmedName
         Task {
             defer { model.isWorking = false }
             do {

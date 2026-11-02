@@ -95,14 +95,38 @@ pub fn ai_allowance_used(date: &str) -> String {
 /// families"). RFC 3339, the wire's own shape, so it is written as any
 /// other instant is.
 pub fn next_month_utc(now_ms: f64) -> String {
+    let (year, month) = next_month(now_ms);
+    format!("{year:04}-{month:02}-01T00:00:00Z")
+}
+
+/// [`next_month_utc`] in milliseconds since 1970: the moment a refusal for
+/// the month runs out.
+pub fn next_month_utc_ms(now_ms: f64) -> i64 {
+    let (year, month) = next_month(now_ms);
+    days_from_civil(year, month, 1) * 86_400_000
+}
+
+/// The UTC year and month after the one `now_ms` falls in.
+fn next_month(now_ms: f64) -> (i64, u32) {
     let days = (now_ms / 86_400_000.0).floor() as i64;
     let (year, month, _) = civil_from_days(days);
-    let (year, month) = if month == 12 {
+    if month == 12 {
         (year + 1, 1)
     } else {
         (year, month + 1)
-    };
-    format!("{year:04}-{month:02}-01T00:00:00Z")
+    }
+}
+
+/// The day counted from 1970-01-01 of a proleptic Gregorian date — the
+/// inverse of [`civil_from_days`] (Howard Hinnant's `days_from_civil`).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year.rem_euclid(400);
+    let month = i64::from(month);
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// The proleptic Gregorian date of a day counted from 1970-01-01 (Howard
@@ -353,6 +377,20 @@ mod tests {
             "2028-03-01T00:00:00Z",
             "a leap day"
         );
+        // The same moment as a number, for a refusal that runs out then.
+        for (now, first) in [
+            (at((2026, 10, 30), 12), (2026, 11, 1)),
+            (at((2026, 11, 1), 0), (2026, 12, 1)),
+            (at((2026, 12, 31), 23), (2027, 1, 1)),
+            (at((2028, 2, 29), 10), (2028, 3, 1)),
+            (at((1969, 12, 31), 23), (1970, 1, 1)),
+        ] {
+            assert_eq!(next_month_utc_ms(now) as f64, at(first, 0), "{first:?}");
+        }
+        for days in [-800_000, -1, 0, 59, 20_756, 2_932_896] {
+            let (year, month, day) = civil_from_days(days);
+            assert_eq!(days_from_civil(year, month, day), days);
+        }
     }
 
     #[test]

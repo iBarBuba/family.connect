@@ -447,13 +447,16 @@ struct PaidFamiliesRulesTests {
         #expect(AssistantFailure(reason: nil) == .stopped)
     }
 
-    @Test("a transcript or a backdrop past the allowance is terminal, dated the 1st of next month UTC")
+    @Test("a transcript or a backdrop past the allowance is terminal until the 1st of next month UTC, and dated so")
     func restAllowance() {
         let error = APIError.forbidden(code: "ai_allowance_used")
         let renews = Fixture.date("2026-11-01T00:00:00Z")
         let transcript = TranscriptOutcome(error: error, now: Fixture.now)
         #expect(transcript == .failed(.allowanceUsed(renewsAt: renews)))
         #expect(!TranscriptFailure.allowanceUsed(renewsAt: renews).offersRetry)
+        #expect(TranscriptFailure.allowanceUsed(renewsAt: renews).holds(at: renews.addingTimeInterval(-1)))
+        #expect(!TranscriptFailure.allowanceUsed(renewsAt: renews).holds(at: renews))
+        #expect(TranscriptFailure.refused.holds(at: .distantFuture), "the other refusals never run out")
         #expect(TranscriptFailure.allowanceUsed(renewsAt: renews).message
             == PaidFamilies.assistantAllowanceUsed(renewsAt: renews))
         // Other 403s are as they were.
@@ -552,6 +555,26 @@ struct PaidFamiliesSessionTests {
 
         session.applySubscription(Fixture.subscription(active: true))
         #expect(!session.needsSubscriptionToCreate, "a subscriber creates as before")
+    }
+
+    @Test("the name is checked before anybody pays: 1–64 characters, as the server counts them")
+    func createNameBeforePaying() {
+        let model = CreateFamilyModel()
+        model.name = "   "
+        #expect(!model.canSubmit)
+        model.name = String(repeating: "a", count: 64)
+        #expect(model.canSubmit)
+        model.name = String(repeating: "a", count: 65)
+        #expect(!model.canSubmit, "a pasted name the server would refuse never reaches the purchase")
+        // Trimmed first, as the server trims.
+        model.name = "  " + String(repeating: "a", count: 64) + "\n"
+        #expect(model.canSubmit)
+        #expect(model.trimmedName.count == 64)
+        // Unicode scalars, as the server counts: a family emoji is seven.
+        model.name = String(repeating: "👨‍👩‍👧‍👦", count: 9)
+        #expect(model.canSubmit)
+        model.name = String(repeating: "👨‍👩‍👧‍👦", count: 10)
+        #expect(!model.canSubmit)
     }
 
     @Test("a server that does not charge: nothing held, nothing needed")

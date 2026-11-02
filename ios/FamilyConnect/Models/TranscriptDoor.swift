@@ -238,6 +238,15 @@ nonisolated enum TranscriptFailure: Equatable, Sendable {
 
     /// Whether the row offers to ask again.
     var offersRetry: Bool { self == .retry }
+
+    /// Whether this is still the row's answer at `now`. Only a used-up month
+    /// runs out: from the renewal it named, the server takes the request
+    /// again, and the row is back to "Show text" (docs/protocol.md,
+    /// "Transcripts on request").
+    func holds(at now: Date) -> Bool {
+        if case .allowanceUsed(let renewsAt) = self { return now < renewsAt }
+        return true
+    }
 }
 
 /// What asking for a recording's text came to.

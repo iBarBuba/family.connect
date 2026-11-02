@@ -1087,7 +1087,15 @@ pub fn transcript_block(props: &TranscriptProps) -> Html {
             <button type="button" class="link transcript-action" onclick={show.clone()}>{ label }</button>
         }
     };
-    match &props.state {
+    // A used-up month's line lasts until the month renews: drawn after that,
+    // it is "Show text" again, as though nothing had been asked
+    // (docs/protocol.md, "Transcripts on request").
+    let now = js_sys::Date::now();
+    let state = props
+        .state
+        .as_ref()
+        .filter(|state| !matches!(state, TranscriptState::Failed(failure) if failure.lapsed(now)));
+    match state {
         None if props.offered => html! {
             <div class="transcript">{ marker.clone().unwrap_or_default() }{ show_button(t("Show text")) }</div>
         },

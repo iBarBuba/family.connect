@@ -300,7 +300,7 @@ fn the_devices_cannot_is_final() {
         assert!(!transcript_rules::may_retry(&error));
         assert_eq!(
             said,
-            transcript_rules::failure_sentence(&error, &say, &common::days())
+            transcript_rules::failure_sentence(&error, None, &say, &common::days())
         );
     }
     assert_eq!(

@@ -137,11 +137,16 @@ public static class TranscriptRules
     /// </summary>
     /// <remarks>
     /// A paid family past this month's minutes (<c>ai_allowance_used</c>, docs/protocol.md "Paid families") says when the
-    /// allowance renews — the 1st of the next UTC month, as that UTC day in <paramref name="culture"/> (the current culture
-    /// when not given) — and is final until then.
+    /// allowance renews — <paramref name="renewsAt"/>, the day the failure took when it came
+    /// (<see cref="TranscriptLook.RenewsAt"/>), or else the 1st of the next UTC month; as that UTC day in
+    /// <paramref name="culture"/> (the current culture when not given) — and is final until then.
     /// </remarks>
     public static string FailureSentence(
-        ApiError error, IStringCatalog say, CultureInfo? culture = null, DateTimeOffset? now = null)
+        ApiError error,
+        IStringCatalog say,
+        CultureInfo? culture = null,
+        DateTimeOffset? now = null,
+        DateTimeOffset? renewsAt = null)
     {
         ArgumentNullException.ThrowIfNull(error);
         ArgumentNullException.ThrowIfNull(say);
@@ -152,7 +157,7 @@ public static class TranscriptRules
             {
                 ErrorCodes.TranscriptRefused => say.Get("The assistant's provider refused this recording."),
                 ErrorCodes.AiAllowanceUsed => PaidFamilies.AiAllowanceUsed(
-                    PaidFamilies.NextMonthUtc(clock), say, culture ?? CultureInfo.CurrentCulture, clock),
+                    renewsAt ?? PaidFamilies.NextMonthUtc(clock), say, culture ?? CultureInfo.CurrentCulture, clock),
                 // What this device could not do with the file, in the words the other three clients use.
                 TranscriptSound.TooLongCode => say.Get("This recording is too long to turn into text."),
                 TranscriptSound.UnreadableCode => say.Get("Couldn't read the sound in this file."),
@@ -199,12 +204,36 @@ public enum TranscriptPhase
 /// <param name="Phase">Where it stands.</param>
 /// <param name="Text">What was said, while <see cref="TranscriptPhase.Open"/>; <c>""</c> is silence.</param>
 /// <param name="Error">Why the last ask failed, while <see cref="TranscriptPhase.Failed"/>.</param>
-public sealed record TranscriptLook(TranscriptPhase Phase, string? Text = null, ApiError? Error = null)
+/// <param name="RenewsAt">
+/// A used-up month's failure: when the month renews, taken when the refusal came — the day the sentence names however late
+/// it is drawn again, and when the failure runs out (<see cref="Lapsed"/>).
+/// </param>
+public sealed record TranscriptLook(
+    TranscriptPhase Phase, string? Text = null, ApiError? Error = null, DateTimeOffset? RenewsAt = null)
 {
     public static readonly TranscriptLook Closed = new(TranscriptPhase.Closed);
 
     /// <summary>The answer was silence, drawn as "No speech".</summary>
     public bool NoSpeech => Phase == TranscriptPhase.Open && string.IsNullOrWhiteSpace(Text);
+
+    /// <summary>
+    /// The last ask failed at <paramref name="now"/>, for this reason: a used-up month (<c>ai_allowance_used</c>) takes the
+    /// day it renews, the 1st after <paramref name="now"/>.
+    /// </summary>
+    public static TranscriptLook FailedAt(ApiError error, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(error);
+        return new TranscriptLook(
+            TranscriptPhase.Failed,
+            Error: error,
+            RenewsAt: error.Code == ErrorCodes.AiAllowanceUsed ? PaidFamilies.NextMonthUtc(now) : null);
+    }
+
+    /// <summary>
+    /// Whether this failure has run out by <paramref name="now"/>. Only a used-up month does, when it renews: the server
+    /// takes the request again from then (docs/protocol.md, "Transcripts on request").
+    /// </summary>
+    public bool Lapsed(DateTimeOffset now) => RenewsAt is { } renewsAt && now >= renewsAt;
 }
 
 /// <summary>
@@ -250,12 +279,15 @@ public sealed class TranscriptModel(ApiClient api, TranscriptStore store, Func<D
     /// <summary>A recording's look changed: the attachment id. May be raised off the UI thread.</summary>
     public event Action<long>? Changed;
 
-    /// <summary>How this recording's text is drawn now.</summary>
+    /// <summary>
+    /// How this recording's text is drawn now. A failure that has run out (<see cref="TranscriptLook.Lapsed"/>) is drawn
+    /// closed again: "Show text", from the 1st on.
+    /// </summary>
     public TranscriptLook Look(long attachmentId)
     {
         lock (gate)
         {
-            return looks.TryGetValue(attachmentId, out var look) ? look : TranscriptLook.Closed;
+            return looks.TryGetValue(attachmentId, out var look) && !look.Lapsed(now()) ? look : TranscriptLook.Closed;
         }
     }
 
@@ -376,8 +408,7 @@ public sealed class TranscriptModel(ApiClient api, TranscriptStore store, Func<D
             }
             else
             {
-                Set(attachmentId, new TranscriptLook(
-                    TranscriptPhase.Failed, Error: outcome.Error ?? ApiError.Transport("no answer")), mine);
+                Set(attachmentId, TranscriptLook.FailedAt(outcome.Error ?? ApiError.Transport("no answer"), now()), mine);
             }
         }
         finally

@@ -599,6 +599,16 @@ pub fn renews_on() -> String {
     crate::time::utc_day_in_sentence(&fc_text::paid::next_month_utc(now), now)
 }
 
+/// A transcript refused for the month: the day it renews, taken when the
+/// refusal came, so the line names that day however late it is drawn — and
+/// lets go of it then (docs/protocol.md, "Transcripts on request").
+fn transcript_allowance_used() -> fc_text::transcript::Failure {
+    fc_text::transcript::Failure::AllowanceUsed {
+        renews_on: renews_on(),
+        renews_at_ms: fc_text::paid::next_month_utc_ms(js_sys::Date::now()),
+    }
+}
+
 /// What to tell somebody whose change to the sticker pack did not go in —
 /// said to the person, like `board_full`: the limits are the family's, and
 /// a sticker that silently did not appear is one its adder goes looking
@@ -2254,9 +2264,7 @@ impl Actions {
                             // A paid family's minutes for the month are
                             // used: the line names the day they renew.
                             transcript::Next::AllowanceUsed => {
-                                let failure = transcript::Failure::AllowanceUsed {
-                                    renews_on: renews_on(),
-                                };
+                                let failure = transcript_allowance_used();
                                 live.update(session, |state| {
                                     state.store.transcripts.failed(attachment_id, failure)
                                 });
@@ -3516,13 +3524,7 @@ mod tests {
             (403, "transcripts_unavailable", Failure::NotAvailable),
             // A paid family's minutes used up: the day they renew, the 1st
             // of next month (docs/protocol.md, "Paid families").
-            (
-                403,
-                "ai_allowance_used",
-                Failure::AllowanceUsed {
-                    renews_on: renews_on(),
-                },
-            ),
+            (403, "ai_allowance_used", transcript_allowance_used()),
             (500, "internal", Failure::TryAgain),
         ] {
             agree(&actions);

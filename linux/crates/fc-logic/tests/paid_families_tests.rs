@@ -650,10 +650,20 @@ fn a_transcript_or_a_backdrop_past_the_allowance_says_so() {
     let sentence =
         "This family has used this month’s assistant allowance. It renews on November 1.";
     assert_eq!(
-        transcript_rules::failure_sentence(&used, &say, &days),
+        transcript_rules::failure_sentence(&used, None, &say, &days),
         sentence
     );
     assert!(!transcript_rules::may_retry(&used));
+    // A failure that took its day when it came names that day, however late it is drawn.
+    assert_eq!(
+        transcript_rules::failure_sentence(
+            &used,
+            Some(datetime!(2026-12-01 00:00 UTC)),
+            &say,
+            &days
+        ),
+        "This family has used this month’s assistant allowance. It renews on December 1."
+    );
     assert_eq!(
         note_sheet_text::backdrop_failure(&used, &say, &days),
         sentence

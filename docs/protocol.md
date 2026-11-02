@@ -2548,7 +2548,10 @@ and each turned off by `0`. The defaults:
   `POST /attachments` for a family at or past it is **`storage_allowance_used` (403)**, decided from
   the `Content-Length` before the body is read. This is a different refusal from
   `storage_full` (507): that one says the SERVER's disk is full, this one says the FAMILY's
-  allowance is used.
+  allowance is used. *Amended 2026-11-02:* an upload still streaming counts at its `Content-Length`
+  until it is stored, so uploads running at once cannot pass the allowance between them; one sent
+  with no `Content-Length` is let in while the family is under the allowance, and counts at
+  `[limits] max_attachment_bytes` until it ends.
 - **The assistant, per UTC calendar month:** 2 000 000 tokens (prompt plus completion), 30 pictures
   and 120 minutes of transcripts. Usage is the family's own, counted exactly as "Family statistics"
   counts it, from the 1st of the month. The web-search cap stays the daily one it always was
@@ -5099,6 +5102,11 @@ server's; these are the clients', so that the four of them agree:
   "This recording is too long to turn into text."; no sound track, or one the device cannot
   decode, is "Couldn't read the sound in this file.". "Not available for this message." is kept for
   the server's own refusals, because it reads as one.
+- **A month's minutes used up lasts only until they renew** (amended 2026-11-02, #89). The line
+  under the player says `ai_allowance_used` with the 1st of the next UTC month after the refusal
+  ARRIVED, and keeps that day however often it is drawn again. It offers no "Show text" until that
+  moment. From then on the line is back to "Show text", as though nothing had been asked, because the
+  server takes the request again.
 - **An answer belongs to the account that asked.** A device keeps what it was given, per
   attachment, and wipes it at sign-out; an answer that arrives after the member signed out — the
   request was still out — is dropped, not kept and not drawn, so the next account on the device is

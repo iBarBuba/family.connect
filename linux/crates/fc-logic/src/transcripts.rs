@@ -13,8 +13,10 @@ use std::task::Poll;
 use fc_core::protocol::{ApiClient, ApiError, TranscriptDto, error_codes};
 use fc_core::rt::{Cancel, Clock, Event};
 use fc_core::store::{KeptTranscript, StoreResult, TranscriptStore};
+use time::OffsetDateTime;
 
 use crate::consented_ask::{self, Outcome};
+use crate::paid_families;
 use crate::transcript_sound::{self, SoundSource, SuppliedSound, TranscriptForm};
 
 /// Who may ask for the text of which recording, and what a failed ask says (docs/protocol.md,
@@ -46,6 +48,7 @@ use crate::transcript_sound::{self, SoundSource, SuppliedSound, TranscriptForm};
 pub mod transcript_rules {
     use fc_core::protocol::{ApiError, AssistantDto, AttachmentDto, FamilyDto, error_codes};
     use fc_core::text::string_catalog::StringCatalog;
+    use time::OffsetDateTime;
 
     use crate::assistant_consent;
     use crate::paid_families::{self, Days};
@@ -168,12 +171,20 @@ pub mod transcript_rules {
 
     /// What a failed ask says under the player. The provider's refusal says so, and is final; a
     /// paid family past this month's transcript minutes says when they renew (docs/protocol.md,
-    /// "Paid families"), and is final until then; a refusal of THIS recording or THIS member is
-    /// "not available", and is final too; anything that says nothing about the request — no
-    /// connection, the deadline, the provider's own failure — asks to try again.
-    pub fn failure_sentence(error: &ApiError, say: &dyn StringCatalog, days: &Days<'_>) -> String {
+    /// "Paid families") — `renews_at`, the day the failure took when it came
+    /// ([`TranscriptLook::renews_at`]), or next month's when it took none — and is final until
+    /// then; a refusal of THIS recording or THIS member is "not available", and is final too;
+    /// anything that says nothing about the request — no connection, the deadline, the provider's
+    /// own failure — asks to try again.
+    pub fn failure_sentence(
+        error: &ApiError,
+        renews_at: Option<OffsetDateTime>,
+        say: &dyn StringCatalog,
+        days: &Days<'_>,
+    ) -> String {
         if error.code == error_codes::AI_ALLOWANCE_USED {
-            return paid_families::assistant_allowance_used(Some(days.next_month()), say, days);
+            let renews_at = renews_at.unwrap_or_else(|| days.next_month());
+            return paid_families::assistant_allowance_used(Some(renews_at), say, days);
         }
         let sentence = if may_retry(error) {
             say.get("Couldn't get the text. Try again.")
@@ -234,6 +245,10 @@ pub struct TranscriptLook {
     pub phase: TranscriptPhase,
     pub text: Option<String>,
     pub error: Option<ApiError>,
+    /// A used-up month's failure: when the month renews, taken when the refusal came — the day the
+    /// sentence names however late it is drawn again, and when the failure runs out
+    /// ([`lapsed`](Self::lapsed)).
+    pub renews_at: Option<OffsetDateTime>,
 }
 
 impl TranscriptLook {
@@ -243,6 +258,7 @@ impl TranscriptLook {
             phase,
             text: text.map(str::to_string),
             error,
+            renews_at: None,
         }
     }
 
@@ -264,6 +280,23 @@ impl TranscriptLook {
     /// The last ask failed, for this reason.
     pub fn failed(error: ApiError) -> Self {
         TranscriptLook::new(TranscriptPhase::Failed, None, Some(error))
+    }
+
+    /// The last ask failed at `now`, for this reason: a used-up month (`ai_allowance_used`) takes
+    /// the day it renews, the 1st after `now`.
+    pub fn failed_at(error: ApiError, now: OffsetDateTime) -> Self {
+        let renews_at = (error.code == error_codes::AI_ALLOWANCE_USED)
+            .then(|| paid_families::next_month_start(now));
+        TranscriptLook {
+            renews_at,
+            ..TranscriptLook::failed(error)
+        }
+    }
+
+    /// Whether this failure has run out by `now`. Only a used-up month does, when it renews: the
+    /// server takes the request again from then (docs/protocol.md, "Transcripts on request").
+    pub fn lapsed(&self, now: OffsetDateTime) -> bool {
+        self.renews_at.is_some_and(|renews_at| now >= renews_at)
     }
 
     /// The answer was silence, drawn as "No speech".
@@ -339,11 +372,13 @@ impl TranscriptModel {
         &self.changed
     }
 
-    /// How this recording's text is drawn now.
+    /// How this recording's text is drawn now. A failure that has run out
+    /// ([`TranscriptLook::lapsed`]) is drawn closed again: "Show text", from the 1st on.
     pub fn look(&self, attachment_id: i64) -> TranscriptLook {
         self.looks
             .borrow()
             .get(&attachment_id)
+            .filter(|look| !look.lapsed(self.clock.now()))
             .cloned()
             .unwrap_or_else(TranscriptLook::closed)
     }
@@ -487,7 +522,11 @@ impl TranscriptModel {
             let error = outcome
                 .error
                 .unwrap_or_else(|| ApiError::transport("no answer"));
-            self.set(attachment_id, TranscriptLook::failed(error), Some(mine));
+            self.set(
+                attachment_id,
+                TranscriptLook::failed_at(error, self.clock.now()),
+                Some(mine),
+            );
         }
         Ok(())
     }

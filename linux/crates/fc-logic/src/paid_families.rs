@@ -87,15 +87,20 @@ impl<'a> Days<'a> {
     /// again (docs/protocol.md, "Paid families": "a month is the UTC calendar month") — the day a
     /// REST `ai_allowance_used` names, as its answer carries none.
     pub fn next_month(&self) -> OffsetDateTime {
-        let now = self.now.to_offset(time::UtcOffset::UTC);
-        let (year, month) = match now.month() {
-            Month::December => (now.year() + 1, Month::January),
-            month => (now.year(), month.next()),
-        };
-        Date::from_calendar_date(year, month, 1)
-            .map(|first| PrimitiveDateTime::new(first, Time::MIDNIGHT).assume_utc())
-            .unwrap_or(now)
+        next_month_start(self.now)
     }
+}
+
+/// [`Days::next_month`] from `now`: the 1st of the month after it, at midnight UTC.
+pub fn next_month_start(now: OffsetDateTime) -> OffsetDateTime {
+    let now = now.to_offset(time::UtcOffset::UTC);
+    let (year, month) = match now.month() {
+        Month::December => (now.year() + 1, Month::January),
+        month => (now.year(), month.next()),
+    };
+    Date::from_calendar_date(year, month, 1)
+        .map(|first| PrimitiveDateTime::new(first, Time::MIDNIGHT).assume_utc())
+        .unwrap_or(now)
 }
 
 // ---- the family door ----------------------------------------------------------------------------

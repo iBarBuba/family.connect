@@ -6419,7 +6419,7 @@ public sealed partial class ChatsView : UserControl
                 var error = look.Error ?? ApiError.Transport("no answer");
                 var line = new TextBlock
                 {
-                    Text = TranscriptRules.FailureSentence(error, say, services.Culture),
+                    Text = TranscriptRules.FailureSentence(error, say, services.Culture, renewsAt: look.RenewsAt),
                     FontSize = 12,
                     TextWrapping = TextWrapping.Wrap,
                     Opacity = 0.85,

@@ -1444,7 +1444,9 @@ pub async fn push_family_plan(
 /// No block gate: a deadline is nobody's words or actions. Only a socket
 /// that understood the `family_plan` frame stands in for the push — an app
 /// from before paid families was sent nothing it could show, and its device
-/// is woken.
+/// is woken. `families=1` is how such a socket is known: several families
+/// (#88) and paid families (#89) ship together in 1.3, so no released app
+/// negotiates the one without understanding the other.
 pub async fn push_family_plan_to(
     state: &AppState,
     family_id: i64,

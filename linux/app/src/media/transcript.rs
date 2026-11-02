@@ -288,6 +288,7 @@ fn fill(
             );
             root.append(&note(&transcript_rules::failure_sentence(
                 &error,
+                look.renews_at,
                 say.as_ref(),
                 &days,
             )));

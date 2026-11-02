@@ -542,6 +542,27 @@ struct TranscriptStoreTests {
         #expect(await store.ask(chatID: 1, messageID: 2, attachmentID: 3) == .failed(.notAvailable))
     }
 
+    @Test("a used-up month lasts until the renewal it named, then the row asks again")
+    func allowanceRunsOut() async {
+        let host = "transcript-store-allowance.test"
+        defer { StubURLProtocol.unregister(host: host) }
+        let client = api(host: host) { _ in .json(403, F.error("ai_allowance_used")) }
+        let store = TranscriptStore(api: client, directory: directory())
+
+        let outcome = await store.ask(chatID: 1, messageID: 2, attachmentID: 3)
+        guard case .failed(.allowanceUsed(let renewsAt)) = outcome else {
+            Issue.record("expected a used-up allowance, got \(String(describing: outcome))")
+            return
+        }
+        // The day is taken when the refusal came, and a redraw keeps it.
+        let before = renewsAt.addingTimeInterval(-1)
+        #expect(store.activity(for: 3, now: before) == .failed(.allowanceUsed(renewsAt: renewsAt)))
+        #expect(store.menuRow(for: 3, door: .open, now: before) == nil)
+        // From the 1st the server takes it again: back to "Show text".
+        #expect(store.activity(for: 3, now: renewsAt) == .idle)
+        #expect(store.menuRow(for: 3, door: .open, now: renewsAt) == .show)
+    }
+
     @Test("one request per recording at a time")
     func singleFlight() async throws {
         let host = "transcript-store-flight.test"

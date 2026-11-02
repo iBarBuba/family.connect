@@ -15,6 +15,7 @@ use common::{TestServer, assert_error, spawn_server, spawn_server_with_config};
 use family_connect::push_payload::{PlanStage, PushEvent};
 use family_connect::subscriptions::{self, SweepReport};
 use family_connect::vault::Lookup;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -899,6 +900,70 @@ async fn a_paid_family_is_held_to_its_storage_allowance() {
         .await
         .unwrap();
     assert_eq!(upload(&[9u8; 600]).await.status(), 201);
+}
+
+/// Uploads running at once are held to the allowance together: one still
+/// streaming counts at its `Content-Length`, so a second that fits only
+/// beside the stored bytes is refused, and the room comes back when the
+/// first is stored.
+#[tokio::test]
+async fn uploads_in_flight_count_against_the_storage_allowance() {
+    let chain = Chain::new();
+    let ts = paid_server_with(&chain, |cfg| cfg.subscriptions.storage_bytes = 1_000).await;
+    let (owner, _, family_id, _) = subscribed_owner(&ts, &chain, "anna").await;
+    let url = ts.url(&format!(
+        "/attachments?kind=file&name=a.bin&family_id={family_id}"
+    ));
+    let upload = |bytes: Vec<u8>| {
+        ts.client
+            .post(&url)
+            .bearer_auth(&owner)
+            .header("content-type", "application/octet-stream")
+            .body(bytes)
+            .send()
+    };
+    assert_eq!(upload(vec![1; 600]).await.expect("upload").status(), 201);
+
+    // 300 bytes declared, 100 sent, the rest held back until `release`.
+    let (release, held_back) = tokio::sync::oneshot::channel::<()>();
+    let slow = futures_util::stream::once(async { Ok::<_, std::io::Error>(vec![2u8; 100]) }).chain(
+        futures_util::stream::once(async move {
+            let _ = held_back.await;
+            Ok(vec![2u8; 200])
+        }),
+    );
+    let streaming = tokio::spawn(
+        ts.client
+            .post(&url)
+            .bearer_auth(&owner)
+            .header("content-type", "application/octet-stream")
+            .header("content-length", "300")
+            .body(reqwest::Body::wrap_stream(slow))
+            .send(),
+    );
+    let holds = &ts.state.storage_holds;
+    for _ in 0..500 {
+        if holds.held(family_id) == 300 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(holds.held(family_id), 300, "the slow upload was let in");
+
+    // 600 stored + 300 in flight + 300 is past 1 000.
+    assert_error(
+        upload(vec![3; 300]).await.expect("upload"),
+        403,
+        "storage_allowance_used",
+    )
+    .await;
+
+    release.send(()).expect("the slow upload is still waiting");
+    let stored = streaming.await.expect("joined").expect("upload");
+    assert_eq!(stored.status(), 201);
+    assert_eq!(holds.held(family_id), 0, "a stored upload holds nothing");
+    // 900 stored: the last 100 fit exactly.
+    assert_eq!(upload(vec![4; 100]).await.expect("upload").status(), 201);
 }
 
 #[tokio::test]

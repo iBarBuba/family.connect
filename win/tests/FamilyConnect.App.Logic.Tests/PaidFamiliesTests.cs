@@ -431,6 +431,11 @@ public class PaidFamiliesTests : IDisposable
         Assert.Equal(
             "This family has used this month’s assistant allowance. It renews on 1 January 2027.",
             TranscriptRules.FailureSentence(used, Say, British, lateWest));
+        // A failure that took its day when it came names that day, however late it is drawn.
+        Assert.Equal(
+            Renews,
+            TranscriptRules.FailureSentence(
+                used, Say, British, lateWest, renewsAt: new DateTimeOffset(2026, 12, 1, 0, 0, 0, TimeSpan.Zero)));
         Assert.Equal(Renews, NoteSheetText.BackdropFailure(used, Say, British, new DateTimeOffset(2026, 11, 30, 18, 0, 0, TimeSpan.FromHours(-5))));
         // The year is UTC's too: on 31 December at 20:00 five hours behind, it is already 2027 in UTC.
         Assert.Equal(

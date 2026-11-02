@@ -20,6 +20,7 @@
 
 package me.nettrash.familyconnect.ui.chat
 
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -29,6 +30,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import me.nettrash.familyconnect.data.net.dto.AttachmentDto
+import me.nettrash.familyconnect.data.repo.PaidFamilies
 import me.nettrash.familyconnect.data.repo.TranscriptOutcome
 
 class TranscriptRequests(
@@ -39,6 +41,8 @@ class TranscriptRequests(
     private val fetch: suspend (Ask) -> TranscriptOutcome,
     /** POST /me/assistant-consent `{granted: true}`; whether it was recorded. */
     private val agree: suspend () -> Boolean,
+    /** Epoch milliseconds: when a used-up month was refused, and whether it has renewed since. */
+    private val clock: () -> Long = System::currentTimeMillis,
 ) {
     /**
      * Which recording, and where it lives on the server. [attachment] says
@@ -74,7 +78,8 @@ class TranscriptRequests(
 
         /**
          * A paid family has used this month's transcript minutes: the
-         * sentence names the 1st of next month (UTC). No retry.
+         * sentence names the 1st of the next month (UTC) after the refusal,
+         * [renewsAt]. No retry until then ([statusAt]).
          */
         ALLOWANCE_USED,
     }
@@ -83,6 +88,32 @@ class TranscriptRequests(
 
     /** Per attachment id; absent means nothing to say beyond what the database holds. */
     val status: StateFlow<Map<Long, Status>> = _status.asStateFlow()
+
+    /**
+     * When each [Status.ALLOWANCE_USED] line's month renews, in epoch
+     * milliseconds. Written before the status that needs it, so whoever
+     * reads that status finds it here.
+     */
+    private val renewals = ConcurrentHashMap<Long, Long>()
+
+    /**
+     * The day an [Status.ALLOWANCE_USED] line names: the 1st after the
+     * refusal CAME, so a redraw a month later still names the same day
+     * (docs/protocol.md, "Transcripts on request").
+     */
+    fun renewsAt(attachmentId: Long): Long? = renewals[attachmentId]
+
+    /**
+     * What [attachmentId]'s line says at [now], from [statuses] as collected:
+     * the same, except that a used-up month lasts only until it renews.
+     * From then the server takes the request again, and the line is back to
+     * "Show text" — under the player and in the menu alike.
+     */
+    fun statusAt(statuses: Map<Long, Status>, attachmentId: Long, now: Long = clock()): Status? {
+        val status = statuses[attachmentId]
+        val renews = renewals[attachmentId]
+        return if (status == Status.ALLOWANCE_USED && renews != null && now >= renews) null else status
+    }
 
     private val waiting = MutableStateFlow<Ask?>(null)
 
@@ -130,7 +161,8 @@ class TranscriptRequests(
             TranscriptOutcome.Failed -> set(ask, Status.FAILED)
             TranscriptOutcome.TooLong -> set(ask, Status.TOO_LONG)
             TranscriptOutcome.Unreadable -> set(ask, Status.UNREADABLE)
-            TranscriptOutcome.AllowanceUsed -> set(ask, Status.ALLOWANCE_USED)
+            TranscriptOutcome.AllowanceUsed ->
+                set(ask, Status.ALLOWANCE_USED, renewsAt = PaidFamilies.nextMonthStartUtc(clock()))
             TranscriptOutcome.ConsentRequired ->
                 // The server's answer outranks this device's stamp: ask,
                 // and request again on a yes — unless the assistant cannot
@@ -150,9 +182,11 @@ class TranscriptRequests(
         waiting.value = ask
     }
 
-    private fun set(ask: Ask, value: Status?) {
+    private fun set(ask: Ask, value: Status?, renewsAt: Long? = null) {
+        if (renewsAt != null) renewals[ask.attachmentId] = renewsAt
         _status.update { current ->
             if (value == null) current - ask.attachmentId else current + (ask.attachmentId to value)
         }
+        if (renewsAt == null) renewals.remove(ask.attachmentId)
     }
 }

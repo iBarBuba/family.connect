@@ -63,7 +63,7 @@ fun TranscriptLine(
     val saved by remember(attachment.id) { transcripts.saved(attachment.id) }
         .collectAsStateWithLifecycle(initialValue = null)
     val statuses by transcripts.status.collectAsStateWithLifecycle()
-    val status = statuses[attachment.id]
+    val status = transcripts.statusAt(statuses, attachment.id)
     val offered = context.offers(chatKind, messageServerId, senderId, attachment)
     val held = saved
 
@@ -138,14 +138,16 @@ fun TranscriptLine(
                 color = quiet,
                 modifier = Modifier.padding(vertical = 6.dp),
             )
-            // A paid family's minutes are used up until the 1st of next
+            // A paid family's minutes are used up until the 1st of the next
             // month (docs/protocol.md, "Paid families"), named in UTC, where
-            // the month turns.
+            // the month turns — the 1st after the refusal, however late the
+            // line is drawn again.
             status == TranscriptRequests.Status.ALLOWANCE_USED -> Text(
                 text = stringResource(
                     R.string.e_ai_allowance_used,
                     TimeFormat.calendarDay(
-                        PaidFamilies.nextMonthStartUtc(System.currentTimeMillis()),
+                        transcripts.renewsAt(attachment.id)
+                            ?: PaidFamilies.nextMonthStartUtc(System.currentTimeMillis()),
                         zone = ZoneOffset.UTC,
                     ),
                 ),
@@ -236,7 +238,7 @@ fun rememberTranscriptMenuAction(
     val statuses by transcripts.status.collectAsStateWithLifecycle()
     return TranscriptRules.menuAction(
         held = saved?.let { !it.hidden },
-        status = statuses[attachment.id],
+        status = transcripts.statusAt(statuses, attachment.id),
         offered = context.offers(chatKind, messageServerId, senderId, attachment),
         canAsk = messageServerId != null,
         reveal = { transcripts.reveal(attachment.id) },

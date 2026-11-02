@@ -12,6 +12,9 @@
 //! no plan on the wire, no ceiling beyond the operator's, no deadlines and
 //! no allowance.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use serde::Serialize;
 use sqlx::{PgConnection, PgPool, Row};
 use time::{Date, Duration, Month, OffsetDateTime, Time};
@@ -614,23 +617,103 @@ pub async fn may_spend(state: &AppState, family_id: i64, spend: Spend) -> Result
     Ok(used < limit)
 }
 
-/// May `incoming` more bytes be stored for this family? `None` when the
-/// size is not known yet: then only a family already at its limit is
-/// refused.
-pub async fn may_store(
+/// The bytes a paid family's uploads still streaming will add, so uploads
+/// running at once cannot pass the storage allowance between them
+/// (docs/protocol.md, "Paid families"). An upload's row holds no size until
+/// its last byte is written, so without this every upload started before
+/// the first one finished would be let in on the same total.
+///
+/// In memory, like the calls and the transcriptions: a restart ends every
+/// upload it counts.
+#[derive(Debug, Default)]
+pub struct StorageHolds {
+    /// Held across the read of what is stored and the hold that follows,
+    /// so two uploads are never let in on the same total.
+    admitting: tokio::sync::Mutex<()>,
+    /// Family id → the bytes its uploads in flight hold.
+    held: std::sync::Mutex<HashMap<i64, i64>>,
+}
+
+impl StorageHolds {
+    /// What this family's uploads in flight hold now.
+    pub fn held(&self, family_id: i64) -> i64 {
+        self.lock().get(&family_id).copied().unwrap_or(0)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<i64, i64>> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One upload's share of [`StorageHolds`], given back when it is dropped:
+/// stored, refused and abandoned alike. Empty for an upload no allowance
+/// applies to.
+#[derive(Debug)]
+#[must_use = "the upload counts against the allowance only while its hold lives"]
+pub struct StorageHold(Option<(Arc<StorageHolds>, i64, i64)>);
+
+impl Drop for StorageHold {
+    fn drop(&mut self) {
+        let Some((holds, family_id, bytes)) = self.0.take() else {
+            return;
+        };
+        let mut held = holds.lock();
+        if let Some(total) = held.get_mut(&family_id) {
+            *total -= bytes;
+            if *total <= 0 {
+                held.remove(&family_id);
+            }
+        }
+    }
+}
+
+/// May an upload of `incoming` bytes be stored for this family? `None`
+/// when it may not. `incoming` is its `Content-Length`, or `None` when it
+/// gave none: then only a family already at its limit is refused, and the
+/// upload holds the attachment cap, the most it can write.
+///
+/// The hold counts the upload against the allowance until it is dropped,
+/// which the caller does once the row holds its real size — the overlap
+/// counts it twice for a moment, never not at all.
+pub async fn admit_upload(
     state: &AppState,
     family_id: i64,
     incoming: Option<u64>,
-) -> Result<bool, ApiError> {
+) -> Result<Option<StorageHold>, ApiError> {
     let Some(limit) = state.cfg.subscriptions.storage_limit() else {
-        return Ok(true);
+        return Ok(Some(StorageHold(None)));
     };
     if !is_paid(&state.pool, &state.cfg, family_id).await? {
-        return Ok(true);
+        return Ok(Some(StorageHold(None)));
     }
-    let used = storage_used(&state.pool, family_id).await?;
-    let incoming = i64::try_from(incoming.unwrap_or(0)).unwrap_or(i64::MAX);
-    Ok(used < limit && used.saturating_add(incoming) <= limit)
+    let (checked, holding) = match incoming {
+        Some(bytes) => {
+            let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+            (bytes, bytes)
+        }
+        None => (
+            0,
+            i64::try_from(state.cfg.limits.max_attachment_bytes).unwrap_or(i64::MAX),
+        ),
+    };
+    let holds = &state.storage_holds;
+    let _admitting = holds.admitting.lock().await;
+    let used = storage_used(&state.pool, family_id)
+        .await?
+        .saturating_add(holds.held(family_id));
+    if !(used < limit && used.saturating_add(checked) <= limit) {
+        return Ok(None);
+    }
+    let mut held = holds.lock();
+    let total = held.entry(family_id).or_default();
+    *total = total.saturating_add(holding);
+    Ok(Some(StorageHold(Some((
+        Arc::clone(holds),
+        family_id,
+        holding,
+    )))))
 }
 
 /// The `allowance` block of Family Statistics, for a paid family only.

@@ -137,8 +137,15 @@ final class TranscriptStore {
         return value
     }
 
-    func activity(for attachmentID: Int64) -> TranscriptActivity {
-        activities[attachmentID] ?? .idle
+    /// What the row is doing at `now`. A failure that has run out
+    /// (`TranscriptFailure.holds`) is idle again — redrawn after the 1st, a
+    /// used-up month offers "Show text" without anybody asking first.
+    func activity(for attachmentID: Int64, now: Date = .now) -> TranscriptActivity {
+        switch activities[attachmentID] {
+        case .failed(let failure) where !failure.holds(at: now): .idle
+        case let activity?: activity
+        case nil: .idle
+        }
     }
 
     /// "Show text" chosen from a message's menu rather than under it (#79):
@@ -156,12 +163,12 @@ final class TranscriptStore {
     /// nothing while a request is out or when the door is shut.
     nonisolated enum MenuRow: Equatable, Sendable { case show, hide }
 
-    func menuRow(for attachmentID: Int64, door: TranscriptDoor) -> MenuRow? {
+    func menuRow(for attachmentID: Int64, door: TranscriptDoor, now: Date = .now) -> MenuRow? {
         if let kept = kept(attachmentID) {
             return kept.hidden ? .show : .hide
         }
         guard door.isOffered else { return nil }
-        switch activity(for: attachmentID) {
+        switch activity(for: attachmentID, now: now) {
         case .idle: return .show
         case .asking: return nil
         case .failed(let failure): return failure.offersRetry ? .show : nil

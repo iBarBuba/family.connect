@@ -2009,6 +2009,7 @@ mod tests {
             (
                 Failure::AllowanceUsed {
                     renews_on: "1 December".into(),
+                    renews_at_ms: fc_text::paid::next_month_utc_ms(js_sys::Date::now()),
                 },
                 "This family has used this month’s assistant allowance. It renews on 1 December.",
             ),
@@ -2020,6 +2021,24 @@ mod tests {
             handle.destroy();
             root.remove();
         }
+
+        // ...until the month renews: drawn after that, the line is "Show
+        // text" again, and nothing of the refusal is left on it.
+        let (props, actions) = drawn(State::Failed(Failure::AllowanceUsed {
+            renews_on: "1 December".into(),
+            renews_at_ms: 0,
+        }));
+        let (root, handle) = render(props).await;
+        assert!(!text(&root).contains("assistant allowance"));
+        let show = show_buttons(&root);
+        assert_eq!(show[0].text_content().as_deref(), Some("Show text"));
+        show[0].click();
+        assert!(actions.borrow().iter().any(|action| matches!(
+            action,
+            Action::ShowTranscript { attachment, .. } if attachment.id == 34
+        )));
+        handle.destroy();
+        root.remove();
     }
 
     fn video(id: i64) -> crate::model::Attachment {
