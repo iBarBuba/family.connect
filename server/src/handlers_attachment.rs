@@ -448,6 +448,23 @@ pub async fn upload_attachment(
     // family, and the file belongs to the family that received it.
     let family_id = uploader_family(&auth, &params)?;
 
+    // A PAID family's own allowance (protocol.md, "Paid families"), decided
+    // like the floor above — from `Content-Length`, before a byte is read.
+    // Its own code: `storage_full` says the SERVER is out of room, and this
+    // is one family having used what it is given.
+    let incoming = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    // Uploads in flight count too, so two at once cannot pass it between
+    // them: the hold lasts until the row below holds its real size.
+    let Some(hold) = crate::subscriptions::admit_upload(&state, family_id, incoming).await? else {
+        return Err(ApiError::forbidden(
+            codes::STORAGE_ALLOWANCE_USED,
+            "this family has used its storage allowance",
+        ));
+    };
+
     // The file has a key of its own, and the row keeps it sealed under the
     // family's — as it keeps the name and the waveform — until a message
     // claims it (#59).
@@ -585,6 +602,8 @@ pub async fn upload_attachment(
     .bind(&final_file_key)
     .fetch_one(&state.pool)
     .await?;
+    // The row counts the bytes now.
+    drop(hold);
 
     Ok((
         StatusCode::CREATED,

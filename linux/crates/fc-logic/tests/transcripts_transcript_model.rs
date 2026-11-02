@@ -14,6 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::{Ready, ready};
 use std::rc::Rc;
+use std::time::Duration;
 
 use fc_core::protocol::{ApiError, error_codes};
 use fc_core::rt::LocalBoxFuture;
@@ -422,6 +423,47 @@ fn a_failed_ask_can_be_asked_again() -> StoreResult<()> {
     Ok(())
 }
 
+/// A used-up month lasts until it renews (docs/protocol.md, "Transcripts on request"): the failure
+/// takes its day when it comes, keeps it however late it is drawn again, and offers no retry until
+/// then — and from the 1st it is "Show text" again, which asks again.
+#[test]
+fn a_used_up_month_lasts_until_it_renews() -> StoreResult<()> {
+    let rig = Rig::new()?;
+    let server = Server::new();
+    server.then(
+        PATH,
+        &[
+            (
+                403,
+                Some(r#"{"error": {"code": "ai_allowance_used", "message": "month"}}"#),
+            ),
+            (200, Some(SAID)),
+        ],
+    );
+    let model = rig.model(&server);
+
+    rig.show(&model, false)?;
+    let look = model.look(34);
+    assert_eq!(TranscriptPhase::Failed, look.phase);
+    assert_eq!(Some(datetime!(1970-02-01 00:00 UTC)), look.renews_at);
+    assert!(!transcript_rules::may_retry(
+        look.error.as_ref().expect("why")
+    ));
+
+    // The last second of January: the same failure, the same day.
+    rig.clock
+        .advance(Duration::from_secs(31 * 24 * 3600) - Duration::from_secs(1));
+    assert_eq!(look, model.look(34));
+
+    // The 1st: back to "Show text", and a click asks again.
+    rig.clock.advance(Duration::from_secs(1));
+    assert_eq!(TranscriptLook::closed(), model.look(34));
+    rig.show(&model, false)?;
+    assert_eq!(TranscriptPhase::Open, model.look(34).phase);
+    assert_eq!(2, server.asked().len());
+    Ok(())
+}
+
 /// A 2xx THIS CLIENT CANNOT READ IS NOT AN ANSWER — no transcript, a transcript with no `text`, a
 /// `text` of null or of the wrong type: not kept (the next click asks again), never drawn as "No
 /// speech" (that is only ever what the provider ANSWERED, as `""`), and said as the generic
@@ -455,7 +497,7 @@ fn an_answer_with_no_text_is_a_failure_and_not_kept() -> StoreResult<()> {
         assert!(transcript_rules::may_retry(&error), "{body}");
         assert_eq!(
             "Couldn't get the text. Try again.",
-            transcript_rules::failure_sentence(&error, &common::english()),
+            transcript_rules::failure_sentence(&error, None, &common::english(), &common::days()),
             "{body}"
         );
         // Not kept, so the next click asks again — and a readable answer then is kept.

@@ -98,6 +98,13 @@ class Transcripts(
     /** What each attachment's line says while there is no text to draw. */
     val status: StateFlow<Map<Long, TranscriptRequests.Status>> = requests.status
 
+    /** One line's [status] now: a used-up month is lifted once it renews ([TranscriptRequests.statusAt]). */
+    fun statusAt(statuses: Map<Long, TranscriptRequests.Status>, attachmentId: Long): TranscriptRequests.Status? =
+        requests.statusAt(statuses, attachmentId)
+
+    /** The day a used-up month's line names ([TranscriptRequests.renewsAt]). */
+    fun renewsAt(attachmentId: Long): Long? = requests.renewsAt(attachmentId)
+
     /** The text this device holds for one attachment, live. */
     fun saved(attachmentId: Long): Flow<TranscriptEntity?> = repository.observe(attachmentId)
 

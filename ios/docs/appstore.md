@@ -111,33 +111,35 @@ the reason the Description leaves the assistant out altogether: whether it is co
 live server is not known in this repository, and naming a feature the customer cannot see is
 worse than never mentioning it.*
 
-## Description (3985/4000 chars)
+## Description (3983/4000 chars)
 
 Family Connect is a private messenger for one family and nobody else — no feed, no discovery, no directory of users. The only people who can reach you are the ones your family's owner let in.
 
-It works out of the box: install, pick a username — no email address, no phone number — then create your family and become its owner, or join one with an invite code. The owner decides whether that code admits people instantly, needs approval, or admits nobody, and can rotate it, cap the membership, or remove someone.
+It works out of the box: install, pick a username — no email, no phone number — then start your family and become its owner, or join one free with an invite code. The owner decides whether that code admits people instantly, needs approval, or admits nobody, and can rotate it, cap the membership, or remove someone.
 
-What makes Family Connect different is where your messages live. There is no vendor cloud: every installation talks to one Family Connect server. Out of the box that is the default server we operate — and on it, we hold your family's messages and files. But the server software is free and open source (MIT, written in Rust), and "Change server" on the sign-in screen points the app at any other one. Put it on your own hardware and your conversations exist in exactly two places: your server and your family's devices.
+What makes Family Connect different is where your messages live. There is no vendor cloud: every installation talks to one Family Connect server. Out of the box that is the default server we operate — and on it, we hold your family's messages and files. But the server software is free and open source (MIT, Rust), and "Change server" on the sign-in screen points the app at any other. Put it on your own hardware and your conversations exist in exactly two places: your server and your family's devices.
+
+On our server, a new family needs its owner's Family Hosting subscription, monthly or yearly, renewing until cancelled in your App Store account. Members never pay, and your own server needs none. Terms of Use: https://www.apple.com/legal/internet-services/itunes/dev/stdeula/
 
 Day to day it works like any modern messenger:
 
 - One shared chat for the whole family, and a private one-to-one chat with any member of it
-- Photos, videos, voice notes and files of any kind — up to ten on a message, drawn as one album you swipe through and pinch to zoom; uploads carry on in the background
+- Photos, videos, voice notes and files — up to ten on a message, drawn as one album you swipe and pinch to zoom; uploads carry on in the background
 - Take a photo or video without leaving the chat, or send one in from another app
 - Your location sent once, drawn on a map, only when you choose — never continuously, never in the background
 - Polls in the family chat, with every open one a tap away; a board anyone can move of notes, photos, events with who is going, and task lists
-- Replies, threads you can open on their own, @mentions of anyone in the family, editing what you have sent, and reactions from a picker of hundreds of emoji
+- Replies, threads you can open on their own, @mentions of anyone in the family, editing what you have sent, and reactions from hundreds of emoji
 - One-to-one voice and video calls that ring on the lock screen and land in the Phone app's Recents; link a member to a contact and call from their card — that link never leaves your device
-- Real-time delivery with typing indicators, read receipts in one-to-one chats, and unread counts that agree on every device
-- Notifications when messages arrive while the app is closed — and none while you are already reading
-- History kept on the device, so you can read it back with no signal
-- Report a message or a member to your family's owner, who can remove them — a report about the owner goes to whoever runs the server instead
+- Typing indicators, read receipts in one-to-one chats, and unread counts that agree on every device
+- Notifications while the app is closed — and none for the chat you are reading
+- History kept on the device, readable with no signal
+- Report a message or a member to your family's owner, who can remove them — a report about the owner goes to whoever runs the server
 - Block anyone: their messages fold behind a row you can tap, their chat leaves your list, their calls never ring you
-- Eight languages in nine localisations, Serbian in both alphabets
+- Eight languages, Serbian in both alphabets
 
-What it does not have: ads, analytics, tracking, crash reporting, or the attribution SDKs a free messenger usually arrives with. The one piece of third-party code in it is Google's open-source WebRTC library, (BSD), which carries calls and nothing else.
+No ads, analytics, tracking or crash reporting. Its one piece of third-party code, Google's open-source WebRTC library (BSD), carries calls and nothing else.
 
-And the honest limits. This is not end-to-end encryption, and we will not imply it is: messages and attachments travel encrypted to the server your family chose — plain http only for a server on your own network — and are stored there readable, so whoever runs it can read them. Calls are different: picture and sound go straight between the two devices wherever the network allows; where it does not, the call connects only if your server's operator runs a relay, which forwards it encrypted and cannot read it. Some things necessarily reach past your server: the map under a shared location and link previews, both switchable in Settings; a public STUN server, asked for your address when you place a call; and Apple's push service, which carries the message text into a notification unless your server's operator turns that off. There is no message search yet, and how long old messages are kept is the server operator's setting.
+And the honest limits. This is not end-to-end encryption, and we will not imply it is: messages and attachments travel encrypted to the server your family chose — plain http only for a server on your own network — and whoever runs it can read them. Calls are different: picture and sound go straight between the two devices wherever the network allows; where it does not, the call connects only if your server's operator runs a relay, which forwards it encrypted and cannot read it. Some things reach past your server: the map under a shared location and link previews, both switchable in Settings; a public STUN server, asked for your address when you place a call; and Apple's push service, which carries the message text into a notification unless your server's operator turns that off. There is no message search yet, and how long old messages are kept is the server operator's setting.
 
 If you want your family's conversations off big-tech servers — and, when you are ready, on hardware you own — this is what Family Connect is for.
 
@@ -147,7 +149,52 @@ chat,messenger,private,self-hosted,server,calls,video,voice,photos,relatives,gra
 
 *("family" and "connect" are left out on purpose — the app name is meant to carry them. Confirm the App Store Connect name first: the icon and the app itself are called "Family", and if the store listing is named that too, "connect" is indexed nowhere and should take "group"'s place here; the five free characters are held for exactly that. "kids" is dropped deliberately — a keyword implying a child audience invites a Guideline 1.3 and age-rating question this app cannot answer.)*
 
-## Notes for App Review (paste verbatim — 3981 as written, 3997 with the placeholders filled / 4000)
+## In-App Subscription — Family Hosting
+
+*Monetization → Subscriptions. Paid families (#89) sell one thing: an auto-renewable subscription
+in one group, bought only in this app — iPhone, iPad and Mac, one purchase
+(`docs/paid-families-2026-10-30.md`, D1). The rest of the console work — the Paid Applications
+Agreement, Family Sharing OFF, the grace period, the notification URL, App Privacy, and WHEN the
+server's switch goes on — is `docs/operations.md` §9; this section is only the words. App Store
+Connect allows a display name of 2 to 30 characters and a description of at most 45. The counts
+in brackets were measured in characters, not bytes; `count-appstore.py` skips tables, so measure
+again by hand after changing one.*
+
+| Product ID | Reference name | Duration | Level |
+| --- | --- | --- | --- |
+| `me.nettrash.FamilyConnect.family.yearly` | Family hosting (yearly) | 1 year | 1 |
+| `me.nettrash.FamilyConnect.family.monthly` | Family hosting (monthly) | 1 month | 2 |
+
+The group: reference name `Family hosting` (seen only in App Store Connect), and App Name Display
+Options → **Use App Name**, so Manage Subscriptions shows the app's name above the group's.
+
+| Language | Group display name | Monthly display name | Yearly display name | Description (both products) |
+| --- | --- | --- | --- | --- |
+| English (U.S.) — primary | Family Hosting (14) | Family Hosting, Monthly (23) | Family Hosting, Yearly (22) | Hosts your family. Members join for free. (41) |
+| German | Familien-Hosting (16) | Familien-Hosting, monatlich (27) | Familien-Hosting, jährlich (26) | Hostet deine Familie, Beitritt kostenlos. (41) |
+| Spanish (Spain), Spanish (Mexico) | Alojamiento familiar (20) | Alojamiento familiar, mensual (29) | Alojamiento familiar, anual (27) | Aloja a tu familia. Unirse es gratis. (37) |
+| French, French (Canada) | Hébergement familial (20) | Hébergement familial, mensuel (29) | Hébergement familial, annuel (28) | Hébergez votre famille. Adhésion gratuite. (42) |
+| Japanese | ファミリーホスティング (11) | ファミリーホスティング（月額） (15) | ファミリーホスティング（年額） (15) | ファミリーをホスト。メンバーは無料で参加できます。 (25) |
+| Russian | Хостинг семьи (13) | Хостинг семьи на месяц (22) | Хостинг семьи на год (20) | Ваша семья на сервере. Участникам бесплатно. (44) |
+| Chinese (Simplified) | 家庭托管 (4) | 家庭托管（月度） (8) | 家庭托管（年度） (8) | 托管您的家庭，成员免费加入。 (14) |
+
+*Why the words are these. The in-app screen is Apple's `SubscriptionStoreView` under the app's
+own heading, "Host Your Family", and lists the products by these display names; the translations
+follow that heading and its sentence in `Localizable.xcstrings`, informal "du" in German included.
+No limit appears — 25 members, 10 GiB, the assistant allowance — because each is a server setting
+and the screen already shows the live values from `paid_family_limits`; a number typed here goes
+stale the first time an operator changes one. No price or period either: Apple's sheet shows both.
+And never "family plan" or "share with your family": it reads as Family Sharing, which is off for
+these products and cannot be turned off again once on. "Members join for free" is the true shape —
+only the owner pays.*
+
+*App Store Connect has no Serbian, so `sr` and `sr-Latn` devices, like any language without a row
+here, see the primary language. Each product also needs a review screenshot of that screen, from a
+TestFlight or development build against a server with the switch on. `ios/FamilyConnect.storekit`
+carries the English row, so a local test purchase reads the same; it pins its own `_locale` to
+`en_US`, which is why the other languages are not copied into it.*
+
+## Notes for App Review (paste verbatim — 3984 as written, 3995 with the placeholders filled / 4000)
 
 DEMO SERVER: https://fc.nettrash.me — compiled in, nothing to configure.
 
@@ -156,17 +203,19 @@ DEMO ACCOUNTS.
 - Second: [DEMO_USER_2] / [DEMO_PASS_2], same family — sign in on a second device for typing indicators, read receipts and a call.
 - Invite code [INVITE_CODE]. Support [SUPPORT_EMAIL].
 
-NEW IN 1.2. Voice message: the microphone in an empty message box. Video message: the video button there. Stickers: beside the paperclip. Show text: under a voice or video message.
+NEW IN 1.3. Groups: Chats → New Chat → New Group. Several families: Settings → Family.
 
-WHAT IT IS. A client for a small open-source (MIT, Rust) chat server. No vendor cloud: each installation talks to one server, and a family's messages live in its database and on the family's devices. On the device the app is named Family; the store record is Family Connect. Two modes: (1) the default server above, online throughout the review; (2) "Change server…" for a self-hosted one. Review needs mode 1.
+SUBSCRIPTION (3.1.2). A NEW family here needs its owner's subscription; existing ones, the review family included, stay free. [DEMO_USER] already owns a family, so to buy: Log Out → Register → "Create a family" (Sandbox).
 
-CONTACT IS CONTAINED (guideline 1.2). No public feed, no discovery, no directory, no user search — nothing is posted publicly. Registration is open (username, display name, password; no email, no phone), but an account in no family can start nothing: one-to-one chats, reports, blocks and calls are refused server-side unless both share a family. The only ways in are creating a family or presenting an 8-character invite code; a new family defaults to "Need approval", so the owner admits each member, may rotate the code, cap it, close joining or remove anyone.
+WHAT IT IS. A client for a small open-source (MIT, Rust) chat server. No vendor cloud: each installation talks to one server. On the device the app is named Family; the store record is Family Connect. Review uses the default server above, online throughout; "Change server…" is for a self-hosted one.
+
+CONTACT IS CONTAINED (guideline 1.2). No public feed, discovery, directory or user search — nothing is posted publicly. Registration is open (username, display name, password; no email, no phone), but an account in no family can start nothing: one-to-one chats, reports, blocks and calls are refused server-side unless both share a family. The only ways in are creating a family or presenting an 8-character invite code; a new family defaults to "Need approval", so the owner admits each member, may rotate the code, cap it, close joining or remove anyone.
 
 REPORT AND BLOCK. Long-press a message → "Safety" → "Report…" or "Block"; a person can also be reported or blocked from their Manage Family row the same way. Four fixed reasons. The moderator is the family owner: reports arrive in Settings → Family → Manage Family → Reports, and push them. A report naming the owner is never listed to them; that sheet shows the server's support contact instead — [SUPPORT_EMAIL], monitored by us.
 
-DELETE ACCOUNT (5.1.1(v)). Settings → last section, beside Log Out. It asks for the account password (a live session is not proof) and a confirmation, then runs at once, irreversibly. It erases the username (freeing it), display name, password, avatar, birthday, sessions and push tokens. One-to-one chats go for both people; family-chat messages, notes and reactions stay as "Deleted account". Ownership passes to the longest-standing member.
+DELETE ACCOUNT (5.1.1(v)). Settings → last section, beside Log Out. It asks for the account password (a live session is not proof) and a confirmation, then runs at once, irreversibly. It erases the username (freeing it), display name, password, avatar, birthday, sessions and push tokens. It also flags a live subscription. One-to-one chats go for both people; family-chat messages, notes and reactions stay as "Deleted account". Ownership passes to the longest-standing member.
 
-NOT END-TO-END ENCRYPTED, and the app does not claim to be. Message text, photos, files and locations are stored readable in the chosen server's database and filesystem; on the default server the developer is the operator. Call media (WebRTC, DTLS-SRTP) is peer to peer, or goes via a relay that forwards the encrypted stream without reading it.
+NOT END-TO-END ENCRYPTED, and the app does not claim to be. Message text, photos, files and locations are readable by the chosen server's operator — on the default server, the developer. Call media (DTLS-SRTP) is peer to peer, or goes via a relay that forwards the encrypted stream without reading it.
 
 AI ASSISTANT — CONSENT (5.1.1(i), 5.1.2(i)). The optional assistant is the only feature sending anything to third parties: [AI_PROCESSOR], and the lookup services its screen names (web search, Open-Meteo, Wikipedia). Before a member's first message reaches it, that screen names each recipient and all that travels — the message; in the family chat only an @ai message, with the last 30 days / 200 messages (others' words, names, times) while history is on; a photo only when attached and allowed; a recording's sound only when its text is asked for (another member's only with the owner's switch and their consent); to lookups only the short query the assistant writes, after a second agreement. Nothing is sent until "I Agree", the server refuses (403) until then, and Settings → Assistant withdraws it. [DEMO_USER] has NOT agreed, so the screen appears on its first message; [DEMO_USER_2] has. Policy: nettrash.me/appstore/familyconnect/privacy.html
 
@@ -595,8 +644,10 @@ Each item is tagged **[code]** (a change in this repository) or **[nettrash]** (
 - [ ] **[nettrash]** Set `[server] support_contact` in the live config and fill `[SUPPORT_EMAIL]`. It ships commented out at `config.example.toml:24` and is therefore unset by default, and it is the only escalation path the app draws for a report about the family owner — which is the answer Apple will want when it asks who moderates the moderator. Note that the app surfaces it in exactly one place, the report sheet, so if it is unset that sheet has no escalation line at all.
 - [ ] **[nettrash]** Read the live server's `config.toml` and write the answers into the review notes rather than assuming defaults. Six values matter and none of them is in this repo: is `[ai]` enabled (and `ai_history` left at its default true) — the one that gates three other answers; are `[calls] enabled` and `video_enabled` on, without which the reviewer never sees a call button; what is `retention_days` actually set to (the shipped default of 100 permanently deletes messages and their media server-side); is `stun_urls` still Google's public STUN (`config.example.toml:214`); do `turn_urls` and `turn_secret` actually point at the coturn 4.6.1 already deployed alongside the server, since an unconfigured `turn_urls` is empty by default and calls that cannot connect directly then simply fail; is `[push] include_message_body` still true (`:135`), which puts plaintext message bodies on lock screens via APNs and FCM. Confirm too that APNs credentials are installed, or push silently logs and never arrives.
 - [ ] **[nettrash]** In App Store Connect: paste the Support URL and Privacy Policy URL, enter the owner demo credentials in App Review Information, and upload the two screenshot sets.
+- [ ] **[nettrash]** Paid families (#89) in App Store Connect: `docs/operations.md` §9, steps 0 to 5, with the products, names and descriptions from **In-App Subscription — Family Hosting** above. The subscriptions go to review WITH the app version that sells them, and `[subscriptions] enabled` goes on at fc.nettrash.me when that version is SUBMITTED, not once it is out — App Review buys in Sandbox against that server and sees the subscription screen only while the switch is on.
+- [x] **[code]** DONE 2026-11-02, for 1.3 — the version that sells paid families. Both Notes for App Review blocks now carry NEW IN 1.3 (groups, several families) and a SUBSCRIPTION paragraph that sends the reviewer through a NEW account — Log Out → Register → "Create a family" — because an account that owns a family is never offered "New Family…" (`Families.offersNewFamily`), so `[DEMO_USER]` cannot reach the screen; DELETE ACCOUNT says it flags a live subscription, which it does. Both Descriptions gained the paragraph guideline 3.1.2(c) asks for: what is sold, that it renews until cancelled, and Apple's standard EULA as the Terms of Use link (a custom EULA filed under App Information → License Agreement would replace that link). "Create your family" became "start your family … or join one free". All of it was paid for by trimming wording, never a guideline answer; "stored there readable" became "whoever runs it can read them", which is also what is true since #59 encrypted the server's storage with keys the server holds. Two conditions keep the words true: the review family must exist BEFORE `[subscriptions] enabled` goes on, because a family made after is paid (`family-connect families plan <id> free` moves it back), and `[families] registration` must stay true. Still unwritten for 1.3: What's New, and a Description line for groups.
 - [x] **[nettrash]** Export compliance is answered: **NO**, decided 2026-08-31. The basis is written up under **Export compliance** below — read it before repeating the answer anywhere else, because the reason the sibling apps' answer does not simply transfer is the one fact that makes this non-trivial.
-- [ ] **[nettrash]** Complete the age-rating questionnaire. The honest inputs are: user-generated content yes, person-to-person messaging with media yes, both bounded to a single family whose membership an owner controls, with in-app reporting, blocking, an owner report inbox and member removal. Web access is restricted: there is no in-app browser — tapped links hand off to the system browser through `openURL` — though the app does fetch metadata from linked hosts for previews. No gambling, contests, purchases or ads. No parental controls and no age verification, since birthdays carry no year. The open judgement is the assistant: if `[ai]` is enabled it writes model output into the shared family chat, and whether that moves the rating is a policy call that cannot be made until the item above resolves.
+- [ ] **[nettrash]** Complete the age-rating questionnaire. The honest inputs are: user-generated content yes, person-to-person messaging with media yes, both bounded to a single family whose membership an owner controls, with in-app reporting, blocking, an owner report inbox and member removal. Web access is restricted: there is no in-app browser — tapped links hand off to the system browser through `openURL` — though the app does fetch metadata from linked hosts for previews. No gambling, contests or ads. One purchase exists since #89: the optional Family Hosting subscription, sold only in this app and only while the server's `[subscriptions] enabled` is on. No parental controls and no age verification, since birthdays carry no year. The open judgement is the assistant: if `[ai]` is enabled it writes model output into the shared family chat, and whether that moves the rating is a policy call that cannot be made until the item above resolves.
 - [x] **[nettrash]** DECIDED 2026-09-17: **iPad kept**, reversing the 2026-09-16 decision to drop it — and the reversal is the interesting half. The question put to you was: "`TARGETED_DEVICE_FAMILY` is 1,2 but there is no size-class adaptation anywhere — the iPad is a stretched iPhone. Either adapt the layout, or drop to 1 and drop the iPad screenshot slot." That claim was written on 2026-08-28 and was already two weeks stale when it was acted on: `5e66173` (#43, 2026-09-03) had given the iPad a `NavigationSplitView` — chat list as sidebar, conversation in the detail column, chosen by idiom — with adaptations in `BoardView`, `AttachmentView`, `AlbumStackView`, `CallVideoView` and `UnreadDivider`. Verified on 2026-09-17 by restoring 1,2 and shooting the 13" set: it is a genuine two-column iPad app. The lesson for this file: a claim about the CODE has to be re-read from the code before a release decision rests on it.
 - [ ] **[nettrash]** Decide which name leads the App Store record. The app's on-device display name is "Family"; the product and this document are called "Family Connect", and the Siri vocabulary teaches "Call Anna on Family".
 - [ ] **[nettrash]** Decide whether open registration on fc.nettrash.me is acceptable at launch. There is no invite gate, no email, no allowlist and no config switch, so any App Store customer can create an account and a family on his box. Family isolation bounds the exposure — a new account sees nobody and reaches nobody — but storage (100 MB per attachment), server load and his own position as the operator of record are real. A `[registration]` switch on the server is the obvious follow-up.
@@ -716,6 +767,14 @@ labels rather than against this list.
   Statistics screen derives from them. A behavioural record of how someone uses the app, not
   content, and not to be folded into User Content. Typing indicators are **not** collected — they
   are relayed live over the socket and never stored.
+- **Purchases → `NSPrivacyCollectedDataTypePurchaseHistory`**, since paid families (#89). For each
+  App Store subscription an account presents, the server keeps the product, the environment, the
+  expiry, whether it renews or was refunded, and Apple's transaction ids, sealed under the
+  account's key (`subscriptions`, migration 0061) — that is what decides whether the account's
+  families are paid for. It goes with the account: Delete Account removes the rows. Only a server
+  whose `[subscriptions] enabled` is on collects it, but the label describes the app as shipped
+  against fc.nettrash.me, as every entry here does. Apple learns nothing about the account from
+  the purchase: it carries only `appAccountToken`, a random UUID the server made.
 - **Not collected: Contacts.** The contact-link feature persists the picked card's identifier,
   name, phone numbers and email addresses (`ContactLinks.swift:35-43`), but in this app's own
   `UserDefaults` only — none of it is ever transmitted, the picker runs out of process, and the app
@@ -724,8 +783,8 @@ labels rather than against this list.
   `includesCallsInRecents = true` and reports calls with a phone-number handle. That is on-device
   and not collection by the developer, but it is where the number visibly surfaces.
 - **Also not collected:** email address, phone number, physical address, health, fitness,
-  financial, browsing history, search history, purchases, advertising data, crash and performance
-  data. There is no analytics, no crash reporting, no attribution SDK and no IDFA anywhere in the
+  financial, browsing history, search history, advertising data, crash and performance data.
+  There is no analytics, no crash reporting, no attribution SDK and no IDFA anywhere in the
   build; the only third-party binary is WebRTC, which carries call media.
 
 **Required-reason APIs** are declared in the same manifest, and one of them was previously wrong:
@@ -887,33 +946,35 @@ drew outside its window (#67). Both are fixed, and both are what a Mac customer 
 noticed. Nothing here may claim a quit Mac is notified or rung — see the variants in the Mac
 checklist below.*
 
-### macOS Description (3937/4000 chars)
+### macOS Description (3977/4000 chars)
 
 Family Connect is a private messenger for one family and nobody else — no feed, no discovery, no directory of users. The only people who can reach you are the ones your family's owner let in.
 
 On the Mac it is a Mac app, not a phone screen made wide: conversations in a sidebar beside the one you are reading, any opened in a window of its own, a window each for the board and a call, and an icon in the menu bar that keeps listening with every window closed.
 
-It works out of the box: install, pick a username — no email address, no phone number — then create your family and become its owner, or join one with an invite code. The owner decides whether that code admits people instantly, needs approval, or admits nobody, and can rotate it, cap the membership, or remove someone.
+It works out of the box: install, pick a username — no email, no phone number — then start your family and become its owner, or join one free with an invite code. The owner decides whether that code admits people instantly, needs approval, or admits nobody, and can rotate it, cap the membership, or remove someone.
 
-What makes Family Connect different is where your messages live. There is no vendor cloud: every installation talks to one Family Connect server. Out of the box that is the default server we operate — and on it, we hold your family's messages and files. But the server software is free and open source (MIT, written in Rust), and "Change server" on the sign-in screen points the app at any other one. Put it on your own hardware and your conversations exist in exactly two places: your server and your family's devices.
+What makes Family Connect different is where your messages live. There is no vendor cloud: every installation talks to one Family Connect server. Out of the box that is the default server we operate — and on it, we hold your family's messages and files. But the server software is free and open source (MIT, Rust), and "Change server" on the sign-in screen points the app at any other. Put it on your own hardware and your conversations exist in exactly two places: your server and your family's devices.
+
+On our server, a new family needs its owner's Family Hosting subscription, monthly or yearly, renewing until cancelled in your App Store account. Members never pay, and your own server needs none. Terms of Use: https://www.apple.com/legal/internet-services/itunes/dev/stdeula/
 
 Day to day it works like any modern messenger:
 
 - One shared chat for the whole family, and a private one-to-one chat with any member of it
-- Photos, videos, files, stickers, and voice and round video messages — up to ten attachments on a message; a message's photos become one album in its own window
+- Photos, videos, files, stickers, and voice and round video messages — up to ten on a message; photos become one album in its own window
 - One-to-one voice and video calls, in their own window
 - Your location sent once, drawn on a map, only when you choose — never continuously, never in the background
 - Polls in the family chat, with every open one a click away; a board anyone can move of notes, photos, events with who is going, and task lists
 - Replies, threads you can open on their own, @mentions of anyone in the family, editing what you have sent, and reactions from hundreds of emoji
-- Real-time delivery, typing indicators, read receipts in one-to-one chats, and unread counts that agree on every device
-- History kept on the Mac, so you can read it back offline
+- Typing indicators, read receipts in one-to-one chats, and unread counts that agree on every device
+- History kept on the Mac, readable offline
 - Report a message or a member to your family's owner, who can remove them — a report about the owner goes to whoever runs the server
 - Block anyone: their messages fold behind a row you can click, their chat leaves your list, their calls never reach you
-- Eight languages in nine localisations, Serbian in both alphabets
+- Eight languages, Serbian in both alphabets
 
-What it does not have: ads, analytics, tracking, crash reporting, or the attribution SDKs a free messenger usually arrives with. The one piece of third-party code in it is Google's open-source WebRTC library, (BSD), which carries calls and nothing else.
+No ads, analytics, tracking or crash reporting. Its one piece of third-party code, Google's open-source WebRTC library (BSD), carries calls and nothing else.
 
-And the honest limits. A Mac rings for a call only while the app is running — closing the window leaves it listening in the menu bar — and a quit Mac's notifications say who wrote, never what. This is not end-to-end encryption, and we will not imply it is: messages and attachments travel encrypted to the server your family chose — plain http only for a server on your own network — and are stored there readable, so whoever runs it can read them. Calls are different: picture and sound go straight between the two devices wherever the network allows; where it does not, the call connects only if your server's operator runs a relay, which forwards it encrypted and cannot read it. Some things necessarily reach past your server: the map under a shared location and link previews, both switchable in Settings, and a public STUN server asked for your address on a call. There is no message search yet, and how long old messages are kept is the server operator's setting.
+And the honest limits. A Mac rings for a call only while the app is running — closing the window leaves it listening in the menu bar — and a quit Mac's notifications say who wrote, never what. This is not end-to-end encryption, and we will not imply it is: messages and attachments travel encrypted to the server your family chose — plain http only for a server on your own network — and whoever runs it can read them. Calls are different: picture and sound go straight between the two devices wherever the network allows; where it does not, the call connects only if your server's operator runs a relay, which forwards it encrypted and cannot read it. Some things reach past your server: the map under a shared location and link previews, both switchable in Settings, and a public STUN server asked for your address on a call. There is no message search yet, and how long old messages are kept is the server operator's setting.
 
 If you want your family's conversations off big-tech servers — and, when you are ready, on hardware you own — this is what Family Connect is for.
 
@@ -923,7 +984,7 @@ chat,messenger,private,self-hosted,server,calls,video,voice,photos,relatives,gra
 
 *("family" and "connect" are left out for the same reason as on iOS — the app name carries them, and if the record is named "Family" rather than "Family Connect", "connect" belongs here in place of "desktop". The iOS list's "group" is dropped: on a Mac the search that matters is for a desktop messenger, and there are no group calls to index. "mac" is deliberately absent — every app in this store is a Mac app, so the word buys nothing. "kids" stays out on both platforms: a keyword implying a child audience invites a Guideline 1.3 and age-rating question this app cannot answer.)*
 
-## macOS — Notes for App Review (paste verbatim — 3962 as written, 3990 with the placeholders filled / 4000)
+## macOS — Notes for App Review (paste verbatim — 3967 as written, 3990 with the placeholders filled / 4000)
 
 DEMO SERVER: [DEMO_SERVER_URL] — compiled in; nothing to configure.
 
@@ -932,23 +993,25 @@ DEMO ACCOUNTS.
 - Second: [DEMO_USER_2] / [DEMO_PASS_2], same family — on a second Mac for typing, read receipts and a call.
 - Invite code [INVITE_CODE]. Support [SUPPORT_EMAIL].
 
-NEW IN 1.2. Voice and video messages: the microphone and video buttons in an empty message box. Stickers: beside the paperclip. Menu bar: close the main window.
+NEW IN 1.3. Groups: New Group in the toolbar. Several families: in Settings.
 
-WHAT IT IS. The macOS build (named Family on the Mac): native, macOS 14+, not Catalyst, same app and bundle id as iOS. A client for a small open-source chat server; each installation talks to one server, no vendor cloud. We keep it online throughout the review. Toolbar: Board, Family, Settings (also Command-comma).
+SUBSCRIPTION (3.1.2). A NEW family here needs its owner's subscription; existing ones, the review family included, stay free. [DEMO_USER] already owns a family, so to buy: Log Out → Register → "Create a family" (Sandbox).
 
-CONTACT IS CONTAINED (guideline 1.2). No public feed, no discovery, no directory, no user search. Registration is open (username, display name, password; no email, no phone), but an account in no family can start nothing: one-to-one chats, reports, blocks and calls are refused server-side unless both share a family. The only ways in are creating a family or an 8-character invite code; a new family defaults to "Need approval", so the owner admits each member, may rotate the code, cap it, close joining or remove anyone.
+WHAT IT IS. A native macOS 14+ build (named Family), not Catalyst; same app and bundle id as iOS. A client for an open-source chat server, online throughout the review. Toolbar: Board, Family, Settings (also Command-comma).
+
+CONTACT IS CONTAINED (guideline 1.2). No public feed, discovery, directory or user search. Registration is open (username, display name, password; no email, no phone), but an account in no family can start nothing: one-to-one chats, reports, blocks and calls are refused server-side unless both share a family. The only ways in are creating a family or an 8-character invite code; a new family defaults to "Need approval", so the owner admits each member, may rotate the code, cap it, close joining or remove anyone.
 
 REPORT AND BLOCK. Right-click a message → "Safety", or "Safety" on a member's row in the Family sheet. Four fixed reasons. The moderator is the family owner: reports arrive in that sheet, under Reports, and push them. A report naming the owner is never listed to them: the sheet shows [SUPPORT_EMAIL], which we monitor.
 
-DELETE ACCOUNT (5.1.1(v)). Settings in the toolbar → last section, beside Log Out. It asks for the account password (a live session is not proof) and a confirmation, then runs at once, irreversibly, erasing the username, display name, password, avatar, birthday and every token. One-to-one chats go for both people; family-chat messages, notes and reactions stay as "Deleted account".
+DELETE ACCOUNT (5.1.1(v)). Settings in the toolbar → last section, beside Log Out. It asks for the account password (a live session is not proof) and a confirmation, then runs at once, irreversibly, erasing the username, display name, password, avatar, birthday and every token. It also flags a live subscription. One-to-one chats go for both people; family-chat messages, notes and reactions stay as "Deleted account".
 
-NOT END-TO-END ENCRYPTED, and the app does not claim to be. Message text, photos, files and locations are stored readable on the chosen server; on the default server the developer is the operator. Call media (DTLS-SRTP) is peer to peer, or relayed by our server still encrypted.
+NOT END-TO-END ENCRYPTED, and the app does not claim to be. Message text, photos, files and locations are readable by the chosen server's operator — on the default server, the developer. Call media (DTLS-SRTP) is peer to peer, or relayed by our server still encrypted.
 
 com.apple.security.network.server. Calls are peer to peer: the WebRTC connection binds UDP sockets and the far side's ICE checks and media arrive on them — inbound traffic the sandbox counts as serving, so network.client alone leaves calls unconnected. Nothing else uses it: no listening port, no embedded server, no Bonjour.
 
 AI ASSISTANT — CONSENT (5.1.1(i), 5.1.2(i)). The optional assistant is the only feature sending anything to third parties: [AI_PROCESSOR], and the lookup services its screen names (web search, Open-Meteo, Wikipedia). Before a member's first message reaches it, that screen names each recipient and all that travels — the message; in the family chat only an @ai message, with the last 30 days / 200 messages (others' words, names, times) while history is on; a photo only when attached and allowed; a recording's sound only when its text is asked for (another member's only with the owner's switch and their consent); to lookups only the short query the assistant writes, after a second agreement. Nothing is sent until "I Agree", the server refuses (403) until then, and Settings → Assistant withdraws it. [DEMO_USER] has NOT agreed, so it appears on its first message. Policy: nettrash.me/appstore/familyconnect/privacy.html
 
-CALLS NEED THE APP RUNNING. Closing the main window leaves Family running in the menu bar. A call arrives as an alert with Answer and Decline while it runs; a quit Mac gets message notifications (who wrote, never what) but is never rung — deliberate. On one Wi-Fi network, allow Local Network access when macOS asks during a call.
+CALLS NEED THE APP RUNNING. Closing the main window leaves Family running in the menu bar. While it runs a call arrives as an alert; a quit Mac gets message notifications (who wrote, never what) but is never rung. On one Wi-Fi, allow Local Network access when macOS asks.
 
 ## macOS — Reviewer walkthrough (supporting detail — not pasted into App Store Connect)
 

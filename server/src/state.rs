@@ -17,6 +17,7 @@ use crate::lookups::WeatherCache;
 use crate::push::PushSender;
 use crate::registry::Registry;
 use crate::storage::Storage;
+use crate::subscriptions::StorageHolds;
 
 /// Everything a request handler needs. All fields are shared handles, so
 /// `Clone` is a few `Arc` bumps.
@@ -51,6 +52,10 @@ pub struct AppState {
     /// coordinates for Open-Meteo's courtesy (docs/protocol.md, "Looking
     /// things up"). Never search results, and never a place name.
     pub lookup_cache: Arc<WeatherCache>,
+    /// The bytes paid families' uploads in flight hold against their
+    /// storage allowance (docs/protocol.md, "Paid families"). In memory
+    /// only: a restart ends the uploads it counts.
+    pub storage_holds: Arc<StorageHolds>,
 }
 
 impl AppState {
@@ -84,6 +89,7 @@ impl AppState {
             keys,
             transcriptions: Arc::new(Transcriptions::default()),
             lookup_cache: Arc::new(WeatherCache::default()),
+            storage_holds: Arc::new(StorageHolds::default()),
         }
     }
 }
