@@ -21,6 +21,17 @@
 //    xcrun xcresulttool export attachments \
 //      --path /tmp/shots.xcresult --output-path /tmp/shots
 //
+//  Sign in by TOKEN where the keyboard drops the password (trap 5), and
+//  give `sam`'s for the subscription review shot — each is the `token` of
+//  `POST /api/v1/auth/login` with password123 on the fixture:
+//
+//      TEST_RUNNER_FC_UITEST_STORE_TOKEN=<nora's>
+//      TEST_RUNNER_FC_UITEST_SUBSCRIBER_TOKEN=<sam's>
+//
+//  Add `-parallel-testing-enabled NO`, or the scheme runs the class on a
+//  clone of the simulator, which does not have a status bar set with
+//  `xcrun simctl status_bar <UDID> override --time 9:41 …`.
+//
 //  NEVER pass CODE_SIGNING_ALLOWED=NO to this test (#45). An unsigned
 //  build carries no application-identifier entitlement, so every keychain
 //  write fails with OSStatus -34018 and the login dies as "Something went
@@ -130,6 +141,10 @@ final class StoreScreenshotUITests: XCTestCase {
     private let threadReplyPrefix = "Sunday works. What time do you want us?"
     /// The seeded poll's question, which the open-polls sheet lists.
     private let pollQuestion = "Sunday lunch — what are we doing?"
+    /// A session token for `nora`, when one is given: the set then signs in
+    /// without the keyboard (see `testCaptureStoreScreenshots`), and every
+    /// relaunch carries it.
+    private var storeToken: String?
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -140,6 +155,14 @@ final class StoreScreenshotUITests: XCTestCase {
         guard let server = ProcessInfo.processInfo.environment["FC_UITEST_SERVER"] else {
             throw XCTSkip("set TEST_RUNNER_FC_UITEST_SERVER to a seeded server URL")
         }
+
+        // A TOKEN SIGNS IN WITHOUT THE KEYBOARD, and is the way to a set
+        // when the simulator drops a secure field's keystrokes — trap 5,
+        // measured again on 2026-11-04: 0 of 11 characters, three attempts,
+        // two runs. Without one, the keyboard login below runs as before.
+        //
+        //   TEST_RUNNER_FC_UITEST_STORE_TOKEN=<nora's session token>
+        storeToken = ProcessInfo.processInfo.environment["FC_UITEST_STORE_TOKEN"]
 
         let app = XCUIApplication()
         app.launchArguments = [
@@ -152,10 +175,14 @@ final class StoreScreenshotUITests: XCTestCase {
             // the only symptom is a login that never happens.
             "-AppleLanguages", "(en)",
             "-AppleLocale", "en_US",
-        ]
+        ] + (storeToken.map { ["-v1.sessionToken", $0] } ?? [])
         app.launch()
 
-        try logIn(app, username: "nora", password: "password123")
+        if storeToken == nil {
+            try logIn(app, username: "nora", password: "password123")
+        } else {
+            dismissNotificationPrompt(app)
+        }
 
         // RELAUNCH IMMEDIATELY AFTER THE LOGIN, and keep the session (no
         // --uitest-reset). This is the fix for #55, not a precaution: a
@@ -302,6 +329,71 @@ final class StoreScreenshotUITests: XCTestCase {
         } else {
             XCTFail("the family roster row was not reachable — the set is incomplete")
         }
+    }
+
+    /// The review screenshot App Store Connect asks for on each subscription
+    /// (Review Information → Screenshot): the subscription screen with both
+    /// products, reached the way App Review reaches it — an account in no
+    /// family, "Create a family", a name, Go. One image serves both
+    /// products. Not a store-listing shot; it is filed under its own name.
+    ///
+    /// Needs the seeded server RESTARTED with `[subscriptions] enabled =
+    /// true`, and a session token of `sam`, the account in no family —
+    /// signed in by token, as ComposerAuditUITests does, so no keyboard and
+    /// no AutoFill stand between the launch and the screen:
+    ///
+    ///   TEST_RUNNER_FC_UITEST_SUBSCRIBER_TOKEN=<sam's token>
+    ///
+    /// THE PRODUCTS ARE APP STORE CONNECT'S, not `FamilyConnect.storekit`'s:
+    /// a test run attaches no StoreKit configuration, so the simulator asks
+    /// the App Store sandbox, which serves the names, descriptions and
+    /// prices as App Store Connect holds them (measured 2026-11-04: an
+    /// `SKTestSession` in this runner changed nothing in the app). That is
+    /// what makes the shot fit for filing — and why it needs the network
+    /// and both products past "Missing Metadata".
+    @MainActor
+    func testCaptureSubscriptionReviewScreenshot() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let server = environment["FC_UITEST_SERVER"],
+              let token = environment["FC_UITEST_SUBSCRIBER_TOKEN"] else {
+            throw XCTSkip("set TEST_RUNNER_FC_UITEST_SERVER and TEST_RUNNER_FC_UITEST_SUBSCRIBER_TOKEN")
+        }
+
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "--uitest-reset", "-v1.serverURL", server, "-v1.sessionToken", token,
+            "-AppleLanguages", "(en)",
+            "-AppleLocale", "en_US",
+        ]
+        app.launch()
+        dismissNotificationPrompt(app)
+        settle()
+
+        let create = app.staticTexts["Create a family"].firstMatch
+        XCTAssertTrue(create.waitForExistence(timeout: 20),
+                      "an account in no family should land on the family gate")
+        create.tap()
+        let name = app.textFields["The Smiths"].firstMatch
+        XCTAssertTrue(name.waitForExistence(timeout: 10), "\"Create a family\" did not open the name screen")
+        name.tap()
+        // Go submits, through the field's own `onSubmit` — the button is
+        // the one a hardware keyboard would leave half under the software one.
+        name.typeText("The Wrens\n")
+
+        XCTAssertTrue(app.staticTexts["Host Your Family"].waitForExistence(timeout: 20),
+                      "the create did not present the subscription screen — is the server's switch on?")
+        // The heading is ours and draws at once; the products are the App
+        // Store's and arrive later. Both, or the frame shows a spinner. They
+        // are counted, not named: the names are whatever App Store Connect
+        // holds, and the shot is how a wrong one gets seen.
+        let products = app.buttons.matching(identifier: "Subscription Store View Default Picker Item")
+        let loaded = XCTNSPredicateExpectation(predicate: NSPredicate(format: "count == 2"),
+                                               object: products)
+        XCTAssertEqual(XCTWaiter().wait(for: [loaded], timeout: 30), .completed,
+                       "the two products never appeared — is the sandbox reachable, are both past Missing Metadata?")
+        XCTAssertFalse(app.keyboards.firstMatch.exists, "the keyboard is over the subscription screen")
+        sleep(2)
+        capture("subscription-review")
     }
 
     // MARK: - Navigation
@@ -521,7 +613,7 @@ final class StoreScreenshotUITests: XCTestCase {
             "-v1.serverURL", server,
             "-AppleLanguages", "(en)",
             "-AppleLocale", "en_US",
-        ]
+        ] + (storeToken.map { ["-v1.sessionToken", $0] } ?? [])
         app.launch()
         // Recorded, not asserted: the window count is the number that
         // explains a swallowed tap (#55), and it is not this test's
@@ -529,6 +621,23 @@ final class StoreScreenshotUITests: XCTestCase {
         XCTContext.runActivity(
             named: "after relaunch: \(app.windows.count) window(s), \(app.alerts.count) alert(s)"
         ) { _ in }
+    }
+
+    /// The notification prompt belongs to SpringBoard and blocks every tap;
+    /// a login by token meets it at once, with no relaunch in between.
+    @MainActor
+    private func dismissNotificationPrompt(_ app: XCUIApplication) {
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline {
+            for host in [app, springboard] {
+                for label in ["Allow", "Not Now"] where host.buttons[label].exists {
+                    host.buttons[label].tap()
+                    return
+                }
+            }
+            usleep(500_000)
+        }
     }
 
     /// iOS offers to save the password it just saw. The alert lives in its

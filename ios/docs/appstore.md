@@ -1,10 +1,11 @@
 # App Store Connect — Family Connect
 
-Every text the App Store listing needs, written against the shipped 1.1 feature set and checked
+Every text the App Store listing needs, written against the shipped feature set — 1.3 since
+2026-11-04 — and checked
 line by line against the code. Fill every `[PLACEHOLDER]` before submission — they mark the demo
 accounts and support address, which live on the server and not in this repository.
 
-**1.1 goes out on three platforms: iPhone, iPad and Mac.** iPhone and iPad share this listing
+**1.3 goes out on three platforms: iPhone, iPad and Mac.** iPhone and iPad share this listing
 and one binary — the iPad screenshots ARE uploaded (the earlier decision to hold iPad was
 reversed, see the checklist) — and the Mac ships from the same target and bundle id with its own
 copy, screenshots and review notes in the macOS section at the end. Nothing in the iOS listing
@@ -51,7 +52,45 @@ at 75 characters, and the 25 freed are better spent on terms the listing carries
 
 A private messenger for one family. Messages, photos, voice notes and calls. Start on our server, move to your own whenever you like. No ads, no analytics, no tracking.
 
+## What's New in 1.3 (2295/4000 chars)
+
+GROUPS. Start a chat for part of your family: New Chat, then New Group, give it a name and choose who is in it. Only its members see it, and it does what the family chat does — photos, polls, threads, stickers, voice and video messages. Whoever started it can rename it, add or remove people, or delete it; anyone can leave.
+
+SEVERAL FAMILIES. One account can now belong to more than one family — your parents' and your own, say. Start a family of your own or join another with its invite code from Settings, and switch between them with the family's name at the top of your chats. An owner can invite members of their other families, who accept or decline.
+
+FAMILY HOSTING. On our server, starting a new family now takes its owner's Family Hosting subscription, monthly or yearly. Families already here stay free, members never pay, and a family on your own server needs none.
+
+FORMULAS, DIAGRAMS AND GRAPHS. Write maths between $ signs, or put a diagram or a graph in a code block tagged math, mermaid, dot or plot, and it is drawn right in the message, for everyone.
+
+EMOJI AS YOU TYPE. :) becomes 😊 and :fire: becomes 🔥 as you type; Backspace straight after puts back what you typed.
+
+ANIMATIONS. A GIF or animated WebP you send plays in the chat as a short silent loop, and animated stickers now move in the sticker panel and the family's pack too. With Reduce Motion on, they hold still.
+
+MORE ROOM TO TYPE. The sticker button now sits inside the message box, so fewer buttons stand before it. On iPad a conversation uses more of the screen, and with a keyboard attached, Return sends.
+
+CALLS IN RECENTS. A call from a member you have linked to a contact is listed under that contact in Recents, not under Unknown Callers — and, like a phone call from them, follows that contact's settings, such as Focus.
+
+VIDEOS WITH SOUND. A video plays its sound with the phone set to silent, as in other video apps, and a video you send keeps its sound when it is made smaller.
+
+QUICKER. A chat with many new messages opens faster, and animated stickers scroll smoothly.
+
+STORED ENCRYPTED. On our server, what your family sends is now stored encrypted, so a backup or a copy of its disk opens nothing without the server's key. It is still not end-to-end encryption: the server can read what it stores.
+
+*Per-platform in App Store Connect, so the Mac has its own further down. Written on 2026-11-04
+against what the `ios/` tree gained since the v1.2 tag — #107 groups (`NewChatView` → New Group,
+`GroupViews`), #88 several families (`FamilySwitcher`, the Family section's New Family… / Join
+Another Family…), #89 Family Hosting, #97 rich blocks, #101 `EmojiTyping` (`:)` is U+1F60A), #96
+animations, #106 the message row and the iPad's wide column, #92 `CallKitController` naming a
+linked member's call by the contact's handle, #98 `AttachmentViewer` taking the playback session,
+the October performance pass — and #59, which is the SERVER's: true of fc.nettrash.me since its
+1.3 deploy on 2026-11-04. Left out as before, because it exists only where an operator configures
+it: the assistant, and with it everything 1.3 gave it — `@ai` in groups, "Show text" in direct
+chats and groups, the monthly allowance of a paid family. Assumes 1.2 is what the App Store
+carries; if it never went out, paste the 1.2 text below this one as well.*
+
 ## What's New in 1.2 (1883/4000 chars)
+
+*History: the 1.2 field, superseded by 1.3 above and kept as written — paste it only where the 1.3 note says to.*
 
 VOICE AND VIDEO MESSAGES. With nothing typed, the Send button is a microphone: tap it to record a voice message hands-free, stop to listen back, then send or delete it. Voice messages show their waveform, play at 1×, 1.5× or 2×, and mark the ones you have not heard yet. Video messages are short round videos recorded in the app — tap the video button in an empty message box — and play right in the chat. Nothing recorded is lost to a call or an interruption: it waits for you as "not sent".
 
@@ -111,26 +150,27 @@ the reason the Description leaves the assistant out altogether: whether it is co
 live server is not known in this repository, and naming a feature the customer cannot see is
 worse than never mentioning it.*
 
-## Description (3983/4000 chars)
+## Description (3991/4000 chars)
 
 Family Connect is a private messenger for one family and nobody else — no feed, no discovery, no directory of users. The only people who can reach you are the ones your family's owner let in.
 
 It works out of the box: install, pick a username — no email, no phone number — then start your family and become its owner, or join one free with an invite code. The owner decides whether that code admits people instantly, needs approval, or admits nobody, and can rotate it, cap the membership, or remove someone.
 
-What makes Family Connect different is where your messages live. There is no vendor cloud: every installation talks to one Family Connect server. Out of the box that is the default server we operate — and on it, we hold your family's messages and files. But the server software is free and open source (MIT, Rust), and "Change server" on the sign-in screen points the app at any other. Put it on your own hardware and your conversations exist in exactly two places: your server and your family's devices.
+What makes Family Connect different is where your messages live. No vendor cloud: every installation talks to one Family Connect server. Out of the box that is our default server — and on it, we hold your family's messages and files. But the server software is free and open source (MIT, Rust), and "Change server" on the sign-in screen points the app at any other. Put it on your own hardware and your conversations exist in exactly two places: your server and your family's devices.
 
 On our server, a new family needs its owner's Family Hosting subscription, monthly or yearly, renewing until cancelled in your App Store account. Members never pay, and your own server needs none. Terms of Use: https://www.apple.com/legal/internet-services/itunes/dev/stdeula/
 
 Day to day it works like any modern messenger:
 
-- One shared chat for the whole family, and a private one-to-one chat with any member of it
-- Photos, videos, voice notes and files — up to ten on a message, drawn as one album you swipe and pinch to zoom; uploads carry on in the background
+- One shared chat for the whole family, groups for part of it, and a one-to-one chat with any member
+- One account in several families — your parents' and your own
+- Photos, videos, voice notes and files — up to ten on a message, one album you swipe and zoom; uploads carry on in the background
 - Take a photo or video without leaving the chat, or send one in from another app
 - Your location sent once, drawn on a map, only when you choose — never continuously, never in the background
 - Polls in the family chat, with every open one a tap away; a board anyone can move of notes, photos, events with who is going, and task lists
-- Replies, threads you can open on their own, @mentions of anyone in the family, editing what you have sent, and reactions from hundreds of emoji
+- Replies, threads, @mentions, editing, reactions from hundreds of emoji, and formulas, diagrams and graphs drawn in the message
 - One-to-one voice and video calls that ring on the lock screen and land in the Phone app's Recents; link a member to a contact and call from their card — that link never leaves your device
-- Typing indicators, read receipts in one-to-one chats, and unread counts that agree on every device
+- Typing indicators, one-to-one read receipts, and unread counts that agree on every device
 - Notifications while the app is closed — and none for the chat you are reading
 - History kept on the device, readable with no signal
 - Report a message or a member to your family's owner, who can remove them — a report about the owner goes to whoever runs the server
@@ -142,6 +182,11 @@ No ads, analytics, tracking or crash reporting. Its one piece of third-party cod
 And the honest limits. This is not end-to-end encryption, and we will not imply it is: messages and attachments travel encrypted to the server your family chose — plain http only for a server on your own network — and whoever runs it can read them. Calls are different: picture and sound go straight between the two devices wherever the network allows; where it does not, the call connects only if your server's operator runs a relay, which forwards it encrypted and cannot read it. Some things reach past your server: the map under a shared location and link previews, both switchable in Settings; a public STUN server, asked for your address when you place a call; and Apple's push service, which carries the message text into a notification unless your server's operator turns that off. There is no message search yet, and how long old messages are kept is the server operator's setting.
 
 If you want your family's conversations off big-tech servers — and, when you are ready, on hardware you own — this is what Family Connect is for.
+
+*1.3, 2026-11-04: groups, several families and the formulas, diagrams and graphs went into the
+list, paid for in wording only — "There is no vendor cloud" became "No vendor cloud", "the default
+server we operate" became "our default server", and the album and reply lines lost their asides.
+No guideline answer was touched.*
 
 ## Keywords (95/100 chars)
 
@@ -193,6 +238,57 @@ here, see the primary language. Each product also needs a review screenshot of t
 TestFlight or development build against a server with the switch on. `ios/FamilyConnect.storekit`
 carries the English row, so a local test purchase reads the same; it pins its own `_locale` to
 `en_US`, which is why the other languages are not copied into it.*
+
+### Review Information, both subscriptions
+
+*App Store Connect → the subscription → Review Information. The SCREENSHOT is one file for both:
+`ios/docs/subscription/review-screenshot.png`, 1320x2868, the subscription screen as App Review
+reaches it, shot by `StoreScreenshotUITests.testCaptureSubscriptionReviewScreenshot` against the
+store fixture (see that test for the run). The products in it are App Store Connect's own — a
+test run attaches no StoreKit configuration, so the simulator loads them from the sandbox — which
+is how the first 2026-11-04 shot caught the YEARLY product's English display name reading
+"Family Hosting, Monthly". Fixed in App Store Connect the same evening; the shot in the repo was
+taken after, and shows Monthly at $10.00/month and Yearly at $100.00/year. Re-shoot it after any
+change to a name, a description or a price. The REVIEW NOTES below are one per product, pasted
+into each.*
+
+#### Subscription Review Notes — Monthly
+
+FAMILY HOSTING, MONTHLY (me.nettrash.FamilyConnect.family.monthly). Keeps a family on our server, fc.nettrash.me, for as long as its owner's subscription lasts, billed monthly. One subscription covers every family its owner owns. Members never pay, and every family that existed before subscriptions did stays free — the review family in the version's notes included.
+
+WHERE TO BUY IT. It is offered only when a NEW family is started, and the demo owner already owns one, so: Log Out → Register (any username and password, no email) → "Create a family" → type a name → Create Family. The subscription screen opens with both plans; buy either in Sandbox. The family is created as soon as the server has checked Apple's signature on the purchase.
+
+AFTERWARDS. Settings shows the subscription, with Manage Subscription (Apple's own management). Restore Purchases is on the subscription screen. If the subscription ends, every member is told, and the family is deleted 14 days later unless its owner renews; Delete Account warns about a live subscription.
+
+ONE PURCHASE, THREE PLATFORMS. The same app sells it on iPhone, iPad and Mac.
+
+#### Subscription Review Notes — Yearly
+
+FAMILY HOSTING, YEARLY (me.nettrash.FamilyConnect.family.yearly). Keeps a family on our server, fc.nettrash.me, for as long as its owner's subscription lasts, billed yearly. One subscription covers every family its owner owns. Members never pay, and every family that existed before subscriptions did stays free — the review family in the version's notes included.
+
+WHERE TO BUY IT. It is offered only when a NEW family is started, and the demo owner already owns one, so: Log Out → Register (any username and password, no email) → "Create a family" → type a name → Create Family. The subscription screen opens with both plans; buy either in Sandbox. The family is created as soon as the server has checked Apple's signature on the purchase.
+
+AFTERWARDS. Settings shows the subscription, with Manage Subscription (Apple's own management). Restore Purchases is on the subscription screen. If the subscription ends, every member is told, and the family is deleted 14 days later unless its owner renews; Delete Account warns about a live subscription.
+
+ONE PURCHASE, THREE PLATFORMS. The same app sells it on iPhone, iPad and Mac.
+
+*Both checked against the code on 2026-11-04: the path is `FamilyGateView` → `CreateFamilyView`,
+whose Create Family presents `SubscriptionSheet` when `needsSubscriptionToCreate`; the family is
+made after `PUT /me/subscription` (`SubscriptionScreen.complete`); the Settings rows are
+`SubscriptionSettingsSection`; "14 days" is `[subscriptions] unpaid_days` at its default — change
+it here if fc.nettrash.me's config does.*
+
+### App Store Promotion images
+
+*`ios/docs/subscription/promo-monthly.png` and `promo-yearly.png`, 1024x1024, RGB with no alpha,
+drawn by `ios/scripts/make-subscription-images.py` (re-run it after a change; it needs Pillow):
+the icon's blue, a house holding the icon's family, and a calendar of one month or twelve — no
+words, no price, since App Store Connect shows the name and price beside the image in the
+customer's language. ONE CAUTION: the image is what lets a subscription be promoted on the
+product page, and a purchase started THERE opens the app with a purchase intent, which this app
+does not handle (there is no `PurchaseIntent` listener). Upload the images if you like, but keep
+both subscriptions out of the product page's promoted purchases until the app handles one — a
+promoted purchase that does nothing is a guideline 2.1 rejection waiting to happen.*
 
 ## Notes for App Review (paste verbatim — 3984 as written, 3995 with the placeholders filled / 4000)
 
@@ -637,6 +733,23 @@ Each item is tagged **[code]** (a change in this repository) or **[nettrash]** (
 
 ### Only nettrash can do these
 
+- [ ] **[nettrash]** **1.3 — App Store Connect, 2026-11-04.**
+  - Paste **What's New in 1.3** and the **Description** (both platforms; the Descriptions now list
+    groups, several families and formulas/diagrams/graphs).
+  - Upload the iPhone 6.9" and iPad 13" sets: **re-shot for 1.3 on 2026-11-04**, the same eight
+    names, with the 1.3 message row, a group in `01-chats` ("Ellie's birthday 🎂", seeded now) and
+    Join Another Family… in `08-settings`. The status bar reads 9:41 (`simctl status_bar`), and
+    the fixture's times are nine minutes apart, so the thread reads as one evening.
+  - The Mac set is still 1.1's and shows the old message row. It is shot by
+    `ios/scripts/capture-mac-screenshot.sh`, which drives the Mac app itself, so it is yours to
+    run or to skip; nothing in the old set is untrue.
+  - Each subscription: **Review Information** (the shared screenshot and its own notes block,
+    under **In-App Subscription — Family Hosting**), and, if wanted, its promotion image — read
+    the caution there first.
+  - The YEARLY subscription's English display name read "Family Hosting, Monthly" in the sandbox
+    on 2026-11-04; corrected the same evening, and the review screenshot re-shot after it. Worth a
+    look at its other languages, which no shot shows.
+
 - [ ] **[nettrash]** Set `[ai] processor` in the live server config to the operator's own words for who answers — e.g. "Microsoft — Azure OpenAI (Sweden Central)". It is REQUIRED for the assistant to exist at all on a 1.1 server: a section with an endpoint, a deployment and a key but no `processor` behaves exactly like one that is switched off, the `assistant` object disappears from `GET /families/mine`, and every client stops offering the feature. Deploying the new server without it turns the assistant off for the whole family, silently.
 - [ ] **[nettrash]** Replace `[AI_PROCESSOR]` in the notes above with that exact string, and check it is what the app actually shows on the consent screen — the app prints `assistant.processor` verbatim, so the two cannot be allowed to differ.
 - [ ] **[nettrash]** Leave `[DEMO_USER]` UN-consented and grant consent on `[DEMO_USER_2]`, so the reviewer sees both halves: `UPDATE users SET assistant_consent_at = NULL WHERE username = '[DEMO_USER]';`, or Settings → Assistant → Stop Sending My Messages on the demo phone, which is the same thing through the door a person uses.
@@ -898,7 +1011,43 @@ keyword-overlap consequence: dropping "private", "chat" and "server" leaves
 
 A private messenger for one family, native on the Mac: a sidebar, chats in their own windows, photos, voice notes and calls. Start on our server, move to your own.
 
+### macOS What's New in 1.3 (2308/4000 chars)
+
+GROUPS. Start a chat for part of your family with New Group in the toolbar: give it a name and choose who is in it. Only its members see it, and it does what the family chat does — photos, polls, threads, stickers, voice and video messages. Whoever started it can rename it, add or remove people, or delete it; anyone can leave.
+
+SEVERAL FAMILIES. One account can now belong to more than one family — your parents' and your own, say. Start a family of your own or join another with its invite code from Settings, and switch between them with the family menu at the top of the sidebar. An owner can invite members of their other families, who accept or decline.
+
+FAMILY HOSTING. On our server, starting a new family now takes its owner's Family Hosting subscription, monthly or yearly — one purchase for iPhone, iPad and Mac. Families already here stay free, members never pay, and a family on your own server needs none.
+
+NEW LINES YOUR WAY. Return sends; Return with Shift, Option, Command or Control starts a new line, whichever one your hands learned elsewhere.
+
+CAPITAL LETTERS. A sentence you type now starts with a capital letter, as on a phone, while "Capitalize words automatically" is on in your Mac's keyboard settings.
+
+FORMULAS, DIAGRAMS AND GRAPHS. Write maths between $ signs, or put a diagram or a graph in a code block tagged math, mermaid, dot or plot, and it is drawn right in the message, for everyone.
+
+EMOJI AS YOU TYPE. :) becomes 😊 and :fire: becomes 🔥 as you type; Delete straight after puts back what you typed.
+
+ANIMATIONS. A GIF or animated WebP you send plays in the chat as a short silent loop, and animated stickers now move in the sticker panel and the family's pack too. With Reduce Motion on, they hold still.
+
+MORE ROOM. The sticker button now sits inside the message box, and in a wide window a conversation uses more of it.
+
+ONE WINDOW. Clicking a notification brings forward the window you have open, showing that chat, instead of opening another.
+
+QUICKER. A chat with many new messages opens faster, and animated stickers scroll smoothly.
+
+STORED ENCRYPTED. On our server, what your family sends is now stored encrypted, so a backup or a copy of its disk opens nothing without the server's key. It is still not end-to-end encryption: the server can read what it stores.
+
+*The Mac's own, written on 2026-11-04 with the iOS field: the same features, plus what only the
+Mac gained — #95 `NewLineKeys` (any of ⇧ ⌥ ⌘ ⌃ with Return), #97's desktop capitalisation (the
+Mac follows the system's "Capitalize words automatically"), #93 one main window per notification
+click (docs/mac-menu-bar-2026-10-07.md) — and without the phone's Recents, silent-switch and iPad
+lines. New Group is the toolbar's (`MacChatView`), the switcher the menu in the chat list's header.
+Nothing here may claim a quit Mac is rung. If 1.2 never went out on the Mac, paste the 1.2 text
+below this one as well.*
+
 ### macOS What's New in 1.2 (1957/4000 chars)
+
+*History: the 1.2 field, superseded by 1.3 above and kept as written — paste it only where the 1.3 note says to.*
 
 IN THE MENU BAR. Closing the window no longer closes the conversation: Family keeps running as an icon in the menu bar, so messages and calls still reach you, and the Dock icon appears only while a window is open. Click the icon to bring the window back, right-click it for Settings and Quit, or press Control-Option-Command-F from any app. Open at Login starts it in the menu bar. Settings, Menu Bar, switches each of these.
 
@@ -946,27 +1095,28 @@ drew outside its window (#67). Both are fixed, and both are what a Mac customer 
 noticed. Nothing here may claim a quit Mac is notified or rung — see the variants in the Mac
 checklist below.*
 
-### macOS Description (3977/4000 chars)
+### macOS Description (3995/4000 chars)
 
 Family Connect is a private messenger for one family and nobody else — no feed, no discovery, no directory of users. The only people who can reach you are the ones your family's owner let in.
 
-On the Mac it is a Mac app, not a phone screen made wide: conversations in a sidebar beside the one you are reading, any opened in a window of its own, a window each for the board and a call, and an icon in the menu bar that keeps listening with every window closed.
+On the Mac it is a Mac app, not a phone screen made wide: conversations in a sidebar beside the one you are reading, any opened in a window of its own, a window each for the board and a call, and a menu bar icon that keeps listening with every window closed.
 
 It works out of the box: install, pick a username — no email, no phone number — then start your family and become its owner, or join one free with an invite code. The owner decides whether that code admits people instantly, needs approval, or admits nobody, and can rotate it, cap the membership, or remove someone.
 
-What makes Family Connect different is where your messages live. There is no vendor cloud: every installation talks to one Family Connect server. Out of the box that is the default server we operate — and on it, we hold your family's messages and files. But the server software is free and open source (MIT, Rust), and "Change server" on the sign-in screen points the app at any other. Put it on your own hardware and your conversations exist in exactly two places: your server and your family's devices.
+What makes Family Connect different is where your messages live. No vendor cloud: every installation talks to one Family Connect server. Out of the box that is our default server — and on it, we hold your family's messages and files. But the server software is free and open source (MIT, Rust), and "Change server" on the sign-in screen points the app at any other. Put it on your own hardware and your conversations exist in exactly two places: your server and your family's devices.
 
 On our server, a new family needs its owner's Family Hosting subscription, monthly or yearly, renewing until cancelled in your App Store account. Members never pay, and your own server needs none. Terms of Use: https://www.apple.com/legal/internet-services/itunes/dev/stdeula/
 
 Day to day it works like any modern messenger:
 
-- One shared chat for the whole family, and a private one-to-one chat with any member of it
+- One shared chat for the whole family, groups for part of it, and a one-to-one chat with any member
+- One account in several families — your parents' and your own
 - Photos, videos, files, stickers, and voice and round video messages — up to ten on a message; photos become one album in its own window
 - One-to-one voice and video calls, in their own window
 - Your location sent once, drawn on a map, only when you choose — never continuously, never in the background
 - Polls in the family chat, with every open one a click away; a board anyone can move of notes, photos, events with who is going, and task lists
-- Replies, threads you can open on their own, @mentions of anyone in the family, editing what you have sent, and reactions from hundreds of emoji
-- Typing indicators, read receipts in one-to-one chats, and unread counts that agree on every device
+- Replies, threads, @mentions, editing, reactions from hundreds of emoji, and formulas, diagrams and graphs drawn in the message
+- Typing indicators, one-to-one read receipts, and unread counts that agree on every device
 - History kept on the Mac, readable offline
 - Report a message or a member to your family's owner, who can remove them — a report about the owner goes to whoever runs the server
 - Block anyone: their messages fold behind a row you can click, their chat leaves your list, their calls never reach you
@@ -977,6 +1127,11 @@ No ads, analytics, tracking or crash reporting. Its one piece of third-party cod
 And the honest limits. A Mac rings for a call only while the app is running — closing the window leaves it listening in the menu bar — and a quit Mac's notifications say who wrote, never what. This is not end-to-end encryption, and we will not imply it is: messages and attachments travel encrypted to the server your family chose — plain http only for a server on your own network — and whoever runs it can read them. Calls are different: picture and sound go straight between the two devices wherever the network allows; where it does not, the call connects only if your server's operator runs a relay, which forwards it encrypted and cannot read it. Some things reach past your server: the map under a shared location and link previews, both switchable in Settings, and a public STUN server asked for your address on a call. There is no message search yet, and how long old messages are kept is the server operator's setting.
 
 If you want your family's conversations off big-tech servers — and, when you are ready, on hardware you own — this is what Family Connect is for.
+
+*1.3, 2026-11-04: groups, several families and the formulas, diagrams and graphs went into the
+list, paid for in wording only — "There is no vendor cloud" became "No vendor cloud", "the default
+server we operate" became "our default server", and the album and reply lines lost their asides.
+No guideline answer was touched.*
 
 ### macOS Keywords (97/100 chars)
 

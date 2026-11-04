@@ -48,6 +48,9 @@ struct SubscriptionScreen: View {
             marketing
         }
         .storeButton(.hidden, for: .restorePurchases)
+        // The screen only ever sits in `SubscriptionSheet`, whose Cancel
+        // closes it; the view's own ✕ beside that was a second close.
+        .storeButton(.hidden, for: .cancellation)
         .subscriptionStorePolicyDestination(url: PaidFamilies.privacyPolicyURL, for: .privacyPolicy)
         .subscriptionStorePolicyDestination(url: PaidFamilies.termsOfUseURL, for: .termsOfService)
         // The account's token rides on the purchase, so the server can tell

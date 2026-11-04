@@ -36,15 +36,19 @@ STAND_INS = {
 FIELDS = [
     ("Subtitle", 30),
     ("Promotional Text", 170),
+    ("What's New in 1.3", 4000),
     ("What's New in 1.2", 4000),
     ("What's New in 1.1", 4000),
     ("Description", 4000),
     ("Keywords", 100),
+    ("Subscription Review Notes — Monthly", 4000),
+    ("Subscription Review Notes — Yearly", 4000),
     ("Notes for App Review", 4000),
     ("Beta App Description", 4000),
     ("What to Test", 4000),
     ("macOS Subtitle", 30),
     ("macOS Promotional Text", 170),
+    ("macOS What's New in 1.3", 4000),
     ("macOS What's New in 1.2", 4000),
     ("macOS What's New in 1.1", 4000),
     ("macOS Description", 4000),
@@ -65,7 +69,7 @@ def body(text: str, heading: str) -> str | None:
     field as nothing.
     """
     found = re.search(
-        r"(?ms)^#{2,3} " + re.escape(heading) + r"[^\n]*\n(.*?)(?=^#{2,3} |\Z)", text)
+        r"(?ms)^#{2,4} " + re.escape(heading) + r"[^\n]*\n(.*?)(?=^#{2,4} |\Z)", text)
     if not found:
         return None
     lines = found[1].split("\n")

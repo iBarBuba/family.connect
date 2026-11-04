@@ -12,3 +12,8 @@ database = "family_connect_dev"
 # /tmp keeps the fixture disposable like the database above.
 [storage]
 attachments_dir = "/tmp/fc-uitest-attachments"
+# Since #59 the server will not start without its storage key. A throwaway
+# one: the seed scripts make it the first time and the database is dropped
+# on every run, so no data ever outlives the key. Outside the attachments
+# directory, which the server insists on.
+key_file = "/tmp/fc-uitest-storage.key"
