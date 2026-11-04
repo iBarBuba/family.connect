@@ -117,6 +117,12 @@ struct MediaUploadTests {
 
     /// A landscape 1080p60 MP4 — sendable as it is, and never within the
     /// profile: the short side is 1080 and it runs at 60.
+    ///
+    /// Making it is a real H.264 encode, and a test's `.timeLimit` counts it:
+    /// every test that calls this gets three minutes, not one. On a busy CI
+    /// runner the encode alone ran a one-minute test out of time (2026-11-04,
+    /// "the AVFoundation transcoder does not start for a task already
+    /// cancelled" — whose own work takes milliseconds).
     private func landscape1080p60(seconds: Double = 1) async throws -> URL {
         try await MediaFixtures.write(.init(
             width: 1920, height: 1080, frameRate: 60, seconds: seconds, bitrate: 8_000_000,
@@ -700,7 +706,7 @@ struct MediaUploadTests {
 
     // MARK: - Rule C: a failure sends what 1.1 would have sent
 
-    @Test("a video transcode that fails sends the original untouched (rule C)", .timeLimit(.minutes(1)))
+    @Test("a video transcode that fails sends the original untouched (rule C)", .timeLimit(.minutes(3)))
     func failedVideoTranscodeSendsTheOriginal() async throws {
         let source = try await landscape1080p60()
         defer { remove(source) }
@@ -749,7 +755,7 @@ struct MediaUploadTests {
     /// THROW — promptly — because rule C can only send the original if the
     /// transcode comes back.
     @Test("the AVFoundation transcoder throws when its writer cannot start, and rule C sends the original",
-          .timeLimit(.minutes(1)))
+          .timeLimit(.minutes(3)))
     func realTranscoderFailureIsRuleC() async throws {
         let source = try await landscape1080p60()
         defer { remove(source) }
@@ -861,7 +867,7 @@ struct MediaUploadTests {
     /// from before `ftyp`, which 1.1 sent as a FILE — so a result that came
     /// out bigger is still the only VIDEO there is.
     @Test("a bigger result is still used when the source could not have gone as a video (rule D)",
-          .timeLimit(.minutes(1)))
+          .timeLimit(.minutes(3)))
     func biggerResultIsUsedWhenTheSourceIsNotSendable() async throws {
         let source = try await oldQuickTimeMovie()
         defer { remove(source) }
@@ -1009,7 +1015,7 @@ struct MediaUploadTests {
     /// Somebody takes a clip off the strip mid-transcode. Rule C is for a
     /// transcode that FAILED; a cancelled one sends nothing and leaves
     /// nothing behind.
-    @Test("a cancelled transcode throws CancellationError and leaves nothing in tmp", .timeLimit(.minutes(1)))
+    @Test("a cancelled transcode throws CancellationError and leaves nothing in tmp", .timeLimit(.minutes(3)))
     func cancelledTranscodeSendsNothing() async throws {
         let source = try await landscape1080p60()
         defer { remove(source) }
@@ -1033,7 +1039,7 @@ struct MediaUploadTests {
         #expect(!exists(output))
     }
 
-    @Test("the AVFoundation transcoder does not start for a task already cancelled", .timeLimit(.minutes(1)))
+    @Test("the AVFoundation transcoder does not start for a task already cancelled", .timeLimit(.minutes(3)))
     func transcoderHonoursCancellation() async throws {
         let source = try await landscape1080p60()
         defer { remove(source) }
