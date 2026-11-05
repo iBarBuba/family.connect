@@ -41,11 +41,28 @@ public sealed record ChatRow(
     RowTimeKind When,
     DateTimeOffset? At)
 {
-    public bool IsFamily => Chat.Kind == "family";
+    public bool IsFamily => Chat.Kind == ChatKinds.Family;
 
-    public bool IsDirect => Chat.Kind == "direct";
+    public bool IsDirect => Chat.Kind == ChatKinds.Direct;
 
-    public bool IsAssistant => Chat.Kind == "ai";
+    public bool IsAssistant => Chat.Kind == ChatKinds.Assistant;
+
+    /// <summary>A group (docs/protocol.md, "Groups"): listed below the family chat, by its last message like any chat.</summary>
+    public bool IsGroup => ChatKinds.IsGroup(Chat.Kind);
+
+    /// <summary>What its circle shows.</summary>
+    public ChatFace Face => ChatFaces.For(Chat.Kind);
+}
+
+/// <summary>Which circle a chat is drawn with, by its kind — the list's rows and the conversation's header alike.</summary>
+public static class ChatFaces
+{
+    public static ChatFace For(string? kind) => kind switch
+    {
+        ChatKinds.Family => ChatFace.House,
+        ChatKinds.Group => ChatFace.People,
+        _ => ChatFace.Initials,
+    };
 }
 
 /// <summary>
@@ -76,10 +93,16 @@ public sealed class ChatListModel(ChatStore chats, Func<long> me, IStringCatalog
 {
     private readonly IStringCatalog say = words ?? EnglishCatalog.Instance;
 
+    /// <summary>
+    /// Every chat on the list as the last <see cref="Rows"/> read it — of EVERY family, before the shown one was picked out —
+    /// so the family switcher can count each family's unread without reading the list a second time.
+    /// </summary>
+    public IReadOnlyList<ChatRowDto> Held { get; private set; } = [];
+
     /// <summary>The rows, as of <paramref name="now"/> — which only the times depend on.</summary>
     /// <remarks>
-    /// THE FAMILY CHAT IS FIRST, always, and everything else follows it newest conversation
-    /// first. It is the room everybody is in and the one a reader looks for — Apple pins it, the
+    /// THE FAMILY CHAT IS FIRST, always, and everything else — groups included (docs/protocol.md,
+    /// "Groups") — follows it newest conversation first. It is the room everybody is in and the one a reader looks for — Apple pins it, the
     /// web pins it, and a list that let it slide under a busy direct chat would be a different
     /// app on Windows. The rest go by the id of their newest message rather than by its time: ids
     /// are monotonic, where a stamp can be moved by a server's clock and is deliberately NOT
@@ -89,7 +112,12 @@ public sealed class ChatListModel(ChatStore chats, Func<long> me, IStringCatalog
     {
         var rows = new List<ChatRow>();
         var newestId = new Dictionary<long, long>();
-        foreach (var held in chats.Chats())
+        // The family shown: its chats and no other family's (docs/protocol.md, "Several families") — so "the family chat"
+        // pinned first below is the shown family's, and so is the assistant's. A chat with no family_ids is the home family's.
+        var shown = chats.Family;
+        var home = chats.Home;
+        Held = chats.Chats();
+        foreach (var held in Held.Where(row => FamilyRules.Lists(row.Chat, shown, home)))
         {
             var newest = chats.Newest(held.Chat.Id);
             newestId[held.Chat.Id] = newest?.Id ?? 0;
@@ -112,8 +140,8 @@ public sealed class ChatListModel(ChatStore chats, Func<long> me, IStringCatalog
     }
 
     /// <summary>
-    /// The name on the row. The wire's title is the family's name, the peer's display name or the
-    /// assistant's, recomputed by the server on every read — so it wins; the roster is the
+    /// The name on the row. The wire's title is the family's name, the peer's display name, the
+    /// assistant's or the group's, recomputed by the server on every read — so it wins; the roster is the
     /// fallback for a direct chat whose title arrived empty, and "Chat" is the floor, because a
     /// row with no name at all is a row nobody can tap with intent.
     /// </summary>
@@ -163,6 +191,12 @@ public sealed class ChatListModel(ChatStore chats, Func<long> me, IStringCatalog
         {
             // Asked BEFORE "Video" (S5.7): a circle is a video on the wire and a video message to the reader.
             return say.Get("Video message");
+        }
+        if (message.AnimationVideo is not null)
+        {
+            // An animation says "GIF" where a video says "Video" (docs/protocol.md, "Animations") — and its caption first,
+            // as any video's row does.
+            return say.Get("GIF");
         }
         return media[0].Kind switch
         {

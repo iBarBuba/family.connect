@@ -59,8 +59,8 @@ impl Server<'_> {
 /// Who asks about whose message, and where.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Asking<'a> {
-    /// `family` | `direct` | `ai` — a thread's replies live in the chat of
-    /// their root, so a family-chat thread is `family`.
+    /// `family` | `direct` | `ai` | `group` — a thread's replies live in the
+    /// chat of their root, so a family-chat thread is `family`.
     pub chat_kind: &'a str,
     pub sender_id: i64,
     pub my_user_id: i64,
@@ -82,13 +82,16 @@ pub struct Recording<'a> {
 /// The server's allowed rule, as far as a client can know it.
 ///
 /// A member may ask about a message they sent themselves, in any chat they
-/// are in, direct chats included; about another member's message only in
-/// the family chat (its threads included), and only while the family's
-/// `ai_transcripts` is on; never about another member's message in a direct
-/// chat; never about the assistant's own. The server also asks whether the
-/// SENDER has agreed to the assistant, which no client can see — it answers
-/// `transcript_not_allowed` then, and that is drawn as "Not available for
-/// this message.".
+/// are in, direct chats included; about the other person's in a direct chat
+/// (amended 2026-10-21 — no owner's switch reaches a direct chat), and about
+/// another member's in a GROUP by the same rule (amended 2026-10-22, D4 of
+/// docs/groups-2026-10-21.md — the owner's switch is about the family chat
+/// and does not reach a group); about another member's message in the
+/// family chat (its threads included) only
+/// while the family's `ai_transcripts` is on; never about the assistant's
+/// own. The server also asks whether the SENDER has agreed to the
+/// assistant, which no client can see — it answers `transcript_not_allowed`
+/// then, and that is drawn as "Not available for this message.".
 pub fn may_ask(asking: &Asking) -> bool {
     if asking.my_user_id <= 0 {
         return false;
@@ -99,7 +102,8 @@ pub fn may_ask(asking: &Asking) -> bool {
     if asking.sender_id == asking.my_user_id {
         return true;
     }
-    asking.chat_kind == "family" && asking.family_allows
+    matches!(asking.chat_kind, "direct" | "group")
+        || (asking.chat_kind == "family" && asking.family_allows)
 }
 
 /// Whether the server sends this attachment's STORED bytes as they are: a
@@ -186,7 +190,7 @@ impl Transcript {
 }
 
 /// Why there is no text to show.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
     /// `internal`, a timeout, no connection, or anything this client has
     /// not learned: transient, and offered again.
@@ -203,31 +207,54 @@ pub enum Failure {
     /// it is in a format this device cannot read, or it needed re-encoding
     /// and this device has no AAC encoder. Never sent.
     Unreadable,
+    /// `ai_allowance_used`: a paid family has used this month's transcript
+    /// minutes (docs/protocol.md, "Paid families"). Terminal until the
+    /// allowance renews on `renews_on` — the UTC calendar day, the 1st,
+    /// already written in the reader's language, because only the client
+    /// can write one. `renews_at_ms` is the same moment in milliseconds
+    /// since 1970, when the failure runs out ([`Failure::lapsed`]).
+    AllowanceUsed {
+        renews_on: String,
+        renews_at_ms: i64,
+    },
 }
 
 impl Failure {
-    pub fn sentence(self) -> &'static str {
+    pub fn sentence(&self) -> String {
         match self {
-            Failure::TryAgain => t("Couldn't get the text. Try again."),
-            Failure::Refused => t("The assistant's provider refused this recording."),
-            Failure::NotAvailable => t("Not available for this message."),
-            Failure::TooLong => t("This recording is too long to turn into text."),
-            Failure::Unreadable => t("Couldn't read the sound in this file."),
+            Failure::TryAgain => t("Couldn't get the text. Try again.").to_string(),
+            Failure::Refused => t("The assistant's provider refused this recording.").to_string(),
+            Failure::NotAvailable => t("Not available for this message.").to_string(),
+            Failure::TooLong => t("This recording is too long to turn into text.").to_string(),
+            Failure::Unreadable => t("Couldn't read the sound in this file.").to_string(),
+            Failure::AllowanceUsed { renews_on, .. } => crate::paid::ai_allowance_used(renews_on),
         }
     }
 
     /// Whether asking again could change the answer.
-    pub fn may_retry(self) -> bool {
-        self == Failure::TryAgain
+    pub fn may_retry(&self) -> bool {
+        *self == Failure::TryAgain
+    }
+
+    /// Whether this failure has run out by `now_ms`. Only a used-up month
+    /// does, when it renews: the server takes the request again from then,
+    /// and the line is back to "Show text" (docs/protocol.md, "Transcripts
+    /// on request").
+    pub fn lapsed(&self, now_ms: f64) -> bool {
+        matches!(self, Failure::AllowanceUsed { renews_at_ms, .. } if now_ms >= *renews_at_ms as f64)
     }
 }
 
 /// What a refusal leads to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
     /// `assistant_consent_required`: nothing was sent, and the answer is
     /// the consent screen — after which the member asks again.
     AskConsent,
+    /// `ai_allowance_used`: the month's minutes are used. The line under
+    /// the player names the day they renew, which the client writes and
+    /// fails the row with as [`Failure::AllowanceUsed`].
+    AllowanceUsed,
     /// A line under the player.
     Fail(Failure),
 }
@@ -238,6 +265,7 @@ pub enum Next {
 pub fn after_refusal(code: Option<&str>) -> Next {
     match code {
         Some("assistant_consent_required") => Next::AskConsent,
+        Some("ai_allowance_used") => Next::AllowanceUsed,
         Some("transcript_refused") => Next::Fail(Failure::Refused),
         Some("not_transcribable" | "transcript_not_allowed" | "transcripts_unavailable") => {
             Next::Fail(Failure::NotAvailable)
@@ -403,18 +431,27 @@ mod tests {
             ("family", ME, true, true),
             ("direct", ME, false, true),
             ("ai", ME, false, true),
-            // Another member's: the family chat (and its threads), with
-            // the switch on — and nowhere else.
+            // The other person's in a direct chat: whatever the switch
+            // says — the server asks the sender's consent (2026-10-21).
+            ("direct", ANNA, true, true),
+            ("direct", ANNA, false, true),
+            // Another member's in the family chat (and its threads): with
+            // the switch on.
             ("family", ANNA, true, true),
             ("family", ANNA, false, false),
-            ("direct", ANNA, true, false),
-            ("direct", ANNA, false, false),
             ("ai", ANNA, true, false),
             // The assistant's own: never.
             ("family", AI, true, false),
             ("ai", AI, true, false),
+            // Another member's in a group: the direct chat's rule — the
+            // sender's consent alone, whatever the owner's switch says
+            // (2026-10-22, D4). Your own there, as anywhere.
+            ("group", ANNA, true, true),
+            ("group", ANNA, false, true),
+            ("group", ME, false, true),
+            ("group", AI, true, false),
             // A chat kind from a newer server is not the family chat.
-            ("group", ANNA, true, false),
+            ("channel", ANNA, true, false),
         ] {
             assert_eq!(
                 may_ask(&asking(chat, sender, switch)),
@@ -564,7 +601,7 @@ mod tests {
         // The rule says no.
         assert!(!offers_show_text(
             &SERVER,
-            &asking("direct", ANNA, true),
+            &asking("family", ANNA, false),
             &note
         ));
         // Bytes the server does not send as they are are still offered:
@@ -596,9 +633,9 @@ mod tests {
         let sending = Recording { id: -4, ..video };
         assert!(!offers_show_text(&SERVER, &mine, &sending));
         // The rule holds for a video as for a voice note.
-        assert!(!offers_show_text(
+        assert!(offers_show_text(
             &SERVER,
-            &asking("direct", ANNA, true),
+            &asking("direct", ANNA, false),
             &video
         ));
         assert!(offers_show_text(
@@ -687,6 +724,11 @@ mod tests {
             after_refusal(Some("transcript_refused")),
             Next::Fail(Failure::Refused)
         );
+        assert_eq!(
+            after_refusal(Some("ai_allowance_used")),
+            Next::AllowanceUsed,
+            "a paid family's month is used up"
+        );
         for code in [
             "not_transcribable",
             "transcript_not_allowed",
@@ -712,6 +754,10 @@ mod tests {
             Failure::NotAvailable,
             Failure::TooLong,
             Failure::Unreadable,
+            Failure::AllowanceUsed {
+                renews_on: "1 December".into(),
+                renews_at_ms: 1_796_083_200_000,
+            },
         ] {
             assert!(!terminal.may_retry(), "{terminal:?}");
         }
@@ -739,6 +785,28 @@ mod tests {
             Failure::Unreadable.sentence(),
             "Couldn't read the sound in this file."
         );
+        assert_eq!(
+            Failure::AllowanceUsed {
+                renews_on: "1 December".into(),
+                renews_at_ms: 1_796_083_200_000,
+            }
+            .sentence(),
+            "This family has used this month’s assistant allowance. It renews on 1 December."
+        );
+    }
+
+    #[test]
+    fn a_used_up_month_runs_out_when_it_renews() {
+        let used = Failure::AllowanceUsed {
+            renews_on: "1 December".into(),
+            renews_at_ms: 1_796_083_200_000,
+        };
+        assert!(!used.lapsed(1_796_083_199_999.0));
+        assert!(used.lapsed(1_796_083_200_000.0));
+        assert!(!used.may_retry(), "no retry while it holds");
+        for other in [Failure::Refused, Failure::NotAvailable, Failure::TooLong] {
+            assert!(!other.lapsed(f64::MAX), "{other:?} never runs out");
+        }
     }
 
     #[test]

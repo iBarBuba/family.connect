@@ -62,6 +62,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineDispatcher
+import me.nettrash.familyconnect.di.ComputeDispatcher
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CoroutineScope
@@ -71,6 +73,8 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
@@ -87,6 +91,7 @@ import me.nettrash.familyconnect.data.net.dto.AttachmentDto
 import me.nettrash.familyconnect.data.net.dto.ReplyToDto
 import me.nettrash.familyconnect.util.resolvedDisplayName
 import me.nettrash.familyconnect.util.MemberMention
+import me.nettrash.familyconnect.util.GroupRules
 import me.nettrash.familyconnect.data.net.dto.MentionDto
 import me.nettrash.familyconnect.calls.CallStarter
 import me.nettrash.familyconnect.calls.CallState
@@ -116,6 +121,7 @@ import me.nettrash.familyconnect.data.repo.VoiceRecorder
 import me.nettrash.familyconnect.data.repo.Waveform
 import kotlinx.coroutines.Job
 import me.nettrash.familyconnect.data.repo.LocationProvider
+import me.nettrash.familyconnect.data.repo.AnimationSend
 import me.nettrash.familyconnect.data.repo.MediaPrep
 import me.nettrash.familyconnect.data.repo.MessageBody
 import me.nettrash.familyconnect.data.repo.MessageRepository
@@ -123,6 +129,7 @@ import me.nettrash.familyconnect.data.repo.PastedMedia
 import me.nettrash.familyconnect.data.repo.ShareStash
 import android.content.ClipData
 import me.nettrash.familyconnect.data.settings.SettingsRepository
+import me.nettrash.familyconnect.data.settings.SettingsState
 import me.nettrash.familyconnect.data.net.dto.PollCodec
 import me.nettrash.familyconnect.util.OpenPollsBadge
 import me.nettrash.familyconnect.di.AppScope
@@ -135,6 +142,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import me.nettrash.familyconnect.data.repo.FamilyRepository
 import me.nettrash.familyconnect.data.net.ApiResult
 import me.nettrash.familyconnect.data.repo.roundVideoLimits
+import me.nettrash.familyconnect.data.repo.observeCurrentActiveMembers
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @HiltViewModel
@@ -175,6 +183,18 @@ class ChatViewModel @Inject constructor(
     @param:AppScope private val appScope: CoroutineScope,
     memberDao: MemberDao,
     connectivity: ConnectivityObserver,
+    /**
+     * Where the thread's rows are BUILT ([items]): off the main thread.
+     *
+     * Every Room emission rebuilds the whole window — grouping, day pills,
+     * reactions, polls — and a chat opened after a long absence takes
+     * hundreds of them in a row while the catch-up lands. On the main
+     * thread that was work competing with the very scroll it was feeding.
+     * Injected rather than named here so the tests can hand in their own
+     * scheduler: a real background thread would make every assertion on
+     * [items] a race. Not defaulted, so a test cannot forget it.
+     */
+    @param:ComputeDispatcher private val computeDispatcher: CoroutineDispatcher,
     /**
      * Defaulted so the tests can build the ViewModel by hand; Dagger
      * ignores the default and injects CallManager (the same trick
@@ -358,7 +378,7 @@ class ChatViewModel @Inject constructor(
     fun startCall(video: Boolean): Boolean {
         val current = chat.value ?: return false
         val peer = current.peerUserId ?: return false
-        if (current.kind != "direct") return false
+        if (!GroupRules.offersCalls(current.kind)) return false
         return callStarter.startCall(current.id, peer, video)
     }
 
@@ -384,7 +404,7 @@ class ChatViewModel @Inject constructor(
      * like the name map it sits beside: `items` is built on it, and a
      * lazily started flow would hand the first build a zero.
      */
-    val familyMemberCount: StateFlow<Int> = memberDao.observeActiveMembers()
+    val familyMemberCount: StateFlow<Int> = memberDao.observeCurrentActiveMembers(settings)
         .map { it.size }
         .stateIn(viewModelScope, SharingStarted.Eagerly, 0)
 
@@ -440,6 +460,16 @@ class ChatViewModel @Inject constructor(
      */
     val openAnchor: StateFlow<OpenAnchor?> = _openAnchor
 
+    /**
+     * What [items] last published, for [reuseUnchangedItems]. Touched only
+     * on the builder's flow. Declared ABOVE [items] so it is initialised
+     * before anything could collect it.
+     */
+    @Volatile private var lastItems: List<ChatListItem> = emptyList()
+
+    /** The bubble-body pre-render in flight; a newer window replaces it. */
+    private var prewarm: Job? = null
+
     val items: StateFlow<List<ChatListItem>> = combine(
         visibleLimit.flatMapLatest { messageRepository.observeMessages(chatId, it) },
         chat,
@@ -453,13 +483,16 @@ class ChatViewModel @Inject constructor(
         val (memberCount, anchor) = memberCountAndAnchor
         buildChatItems(
             messagesNewestFirst = messages,
-            isFamilyChat = chatEntity?.kind == "family",
+            // Sender names wherever several people write: the family chat
+            // and a group (docs/protocol.md, "Groups").
+            isFamilyChat = GroupRules.showsSenderNames(chatEntity?.kind),
             myUserId = settingsState.myUserId ?: -1L,
             memberNames = members,
             nowMillis = clock.now(),
             assistantUserId = settingsState.assistantUserId,
             assistantName = settingsState.assistantName,
-            familyMemberCount = memberCount,
+            // A poll's "3 of 5" counts the GROUP's members in a group.
+            familyMemberCount = GroupRules.pollAudience(chatEntity?.kind, chatEntity?.memberIds.orEmpty(), memberCount),
             firstUnreadServerId = (anchor as? OpenAnchor.Message)?.serverId,
             newMessageCount = (anchor as? OpenAnchor.Message)?.newCount ?: 0,
             // Rides in on `settings.state`, which is already the third
@@ -467,7 +500,28 @@ class ChatViewModel @Inject constructor(
             blockedUserIds = settingsState.blockedUserIds,
         )
     }
-        .onEach { _initialLoadSettled.value = true }
+        // The rows that did not change come back as the instances the list
+        // already drew, so their bubbles skip (reuseUnchangedItems says
+        // why identity is what Compose compares here). Still on the
+        // builder's thread: comparing a window of rows is not main-thread
+        // work either.
+        .map { built -> reuseUnchangedItems(lastItems, built).also { lastItems = it } }
+        // Built off the main thread (see [computeDispatcher]), and only the
+        // NEWEST answer is kept: while a catch-up writes page after page,
+        // a build that finishes after a newer one has started is not worth
+        // drawing — the list only ever shows the latest state anyway, which
+        // is all the StateFlow below would keep of it.
+        .conflate()
+        .flowOn(computeDispatcher)
+        .onEach { built ->
+            _initialLoadSettled.value = true
+            // Pre-render the bodies the bubbles are about to ask for, on
+            // the same background thread, so a row scrolling in finds its
+            // markdown and links done (BubbleBodies). Launched, not
+            // awaited: the list does not wait for it.
+            prewarm?.cancel()
+            prewarm = viewModelScope.launch(computeDispatcher) { BubbleBodies.prewarm(built) }
+        }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     /**
@@ -561,13 +615,14 @@ class ChatViewModel @Inject constructor(
     /**
      * Whether this chat may hold a poll at all.
      *
-     * The family chat only: a poll is a family deciding something
-     * together, and anywhere else the server answers `invalid_poll`
-     * (docs/protocol.md, "Polls"). The attach menu hides the item rather
-     * than offering an affordance that can only fail.
+     * The family chat or a group: a poll is (some of) a family deciding
+     * something together, and anywhere else the server answers
+     * `invalid_poll` (docs/protocol.md, "Polls", amended 2026-10-22). The
+     * attach menu hides the item rather than offering an affordance that
+     * can only fail.
      */
     val canCreatePoll: StateFlow<Boolean> = chat
-        .map { it?.kind == "family" }
+        .map { GroupRules.offersPolls(it?.kind) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     // -- Pictures -----------------------------------------------------------------
@@ -624,9 +679,10 @@ class ChatViewModel @Inject constructor(
     val canAskForPicture: StateFlow<Boolean> =
         combine(chat, settings.state) { chatEntity, settingsState ->
             settingsState.assistantImages &&
-                when (chatEntity?.kind) {
-                    "ai" -> true
-                    "family" -> settingsState.assistantUserId != null
+                when {
+                    chatEntity?.kind == GroupRules.AI -> true
+                    // A group answers `@ai` as the family chat does.
+                    GroupRules.answersAssistantMention(chatEntity?.kind) -> settingsState.assistantUserId != null
                     else -> false
                 }
         }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
@@ -659,7 +715,7 @@ class ChatViewModel @Inject constructor(
     fun insertDrawToken() {
         if (!canAskForPicture.value) return
         if (_editTarget.value != null) return
-        val inFamilyChat = chat.value?.kind == "family"
+        val inFamilyChat = GroupRules.answersAssistantMention(chat.value?.kind)
         val rewritten = AssistantMention.withDraw(inputState.text.toString(), inFamilyChat)
         inputState.setTextAndPlaceCursorAtEnd(rewritten)
     }
@@ -674,6 +730,13 @@ class ChatViewModel @Inject constructor(
      */
     val failedAssistantAnswers: StateFlow<Map<Long, AssistantFailure>> =
         messageRepository.failedAssistantAnswers
+
+    /**
+     * Why a send that failed for good was refused, by client message id —
+     * what the "Message not sent" dialog says when it has words for it
+     * ([SendRefusals]).
+     */
+    val sendRefusals: StateFlow<Map<String, String>> = messageRepository.sendRefusals
 
     /** Open the poll sheet on a fresh draft — two empty options, no question. */
     fun beginPoll() {
@@ -998,40 +1061,69 @@ class ChatViewModel @Inject constructor(
     // -- Member mentions (docs/protocol.md, "Mentioning a member") ---------
 
     /** Everybody a mention may name: the active roster, by the name the app calls them. */
-    private val mentionRoster: StateFlow<List<MentionDto>> = memberDao.observeActiveMembers()
+    private val mentionRoster: StateFlow<List<MentionDto>> = memberDao.observeCurrentActiveMembers(settings)
         .map { members -> members.map { MentionDto(it.userId, it.resolvedDisplayName(appContext)) } }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     /**
-     * What the strip above the composer offers: the roster narrowed to the
-     * `@prefix` being typed — never the reader themself, never the
-     * blocked, and never the assistant, which is not in the roster and has
-     * its own button. Empty outside the family chat and outside a token.
+     * What the strip above the composer offers: the assistant FIRST, then
+     * the roster — in a group, THAT GROUP's members only — narrowed to the
+     * `@prefix` being typed, never the reader themself and never the
+     * blocked. Empty outside the family chat and groups, and outside a
+     * token.
+     *
+     * The assistant is offered since #106 took its button out of the
+     * composer row (docs/protocol.md, "Mentioning a member", amended
+     * 2026-10-20) — exactly where `@ai` may be written at all, which is
+     * [offersAssistantMention]'s rule, under the name the server gave it.
      */
-    val mentionCandidates: StateFlow<List<MentionDto>> = combine(
+    val mentionCandidates: StateFlow<List<MemberMention.Suggestion>> = combine(
         draftText,
         mentionRoster,
         chat,
         settings.state,
     ) { draft, roster, chatEntity, settingsState ->
-        if (chatEntity?.kind != "family") return@combine emptyList()
-        val query = MemberMention.query(draft) ?: return@combine emptyList()
-        MemberMention.candidates(
-            roster,
-            query,
+        if (!GroupRules.offersMemberMentions(chatEntity?.kind)) return@combine emptyList()
+        MemberMention.suggestions(
+            draft = draft,
+            roster = GroupRules.mentionRoster(roster, chatEntity?.kind, chatEntity?.memberIds.orEmpty()),
             excluding = settingsState.blockedUserIds + setOfNotNull(settingsState.myUserId),
+            assistantName = if (offersAssistantMention(chatEntity?.kind, settingsState)) {
+                settingsState.assistantName?.takeIf { it.isNotBlank() }
+                    ?: appContext.getString(R.string.s_assistant)
+            } else {
+                null
+            },
+            assistantUserId = settingsState.assistantUserId,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    /** A name picked from the strip: the trailing `@prefix` becomes `@Name `. */
-    fun acceptMention(name: String) {
-        inputState.setTextAndPlaceCursorAtEnd(MemberMention.accept(inputState.text.toString(), name))
+    /** [AssistantConsent.offersMention], asked of this chat and these settings. */
+    private fun offersAssistantMention(chatKind: String?, settingsState: SettingsState): Boolean =
+        AssistantConsent.offersMention(
+            chatKind = chatKind,
+            hasAssistant = settingsState.assistantUserId != null,
+            processor = settingsState.assistantProcessor,
+        )
+
+    /**
+     * A chip picked from the strip: the trailing `@prefix` becomes `@Name `
+     * — or `@ai ` for the assistant, never its display name.
+     */
+    fun acceptMention(suggestion: MemberMention.Suggestion) {
+        inputState.setTextAndPlaceCursorAtEnd(MemberMention.accept(inputState.text.toString(), suggestion))
     }
 
-    /** The members the text names, resolved at send — family chat only. */
+    /**
+     * The members the text names, resolved at send — the family chat and
+     * groups only, and in a group only its members: the server refuses
+     * anybody else (docs/protocol.md, "Mentioning a member").
+     */
     private fun resolvedMentions(body: String): List<MentionDto>? {
-        if (chat.value?.kind != "family") return null
-        return MemberMention.resolve(body, mentionRoster.value).takeIf { it.isNotEmpty() }
+        val current = chat.value ?: return null
+        if (!GroupRules.offersMemberMentions(current.kind)) return null
+        val roster = GroupRules.mentionRoster(mentionRoster.value, current.kind, current.memberIds)
+        return MemberMention.resolve(body, roster).takeIf { it.isNotEmpty() }
     }
 
     /**
@@ -1084,7 +1176,7 @@ class ChatViewModel @Inject constructor(
     val mentionPictureNotice: StateFlow<MentionPictureNotice?> =
         combine(chat, draftText, staged, quotedAttachments, settings.state) {
                 chatEntity, draft, items, quoted, settingsState ->
-            if (chatEntity?.kind != "family") {
+            if (!GroupRules.answersAssistantMention(chatEntity?.kind)) {
                 null
             } else {
                 AiPictureNotice.forMention(
@@ -1123,7 +1215,7 @@ class ChatViewModel @Inject constructor(
             PictureDescriptionHint.inComposer(
                 draft = draft,
                 picturesOffered = offered,
-                inFamilyChat = chatEntity?.kind == "family",
+                inFamilyChat = GroupRules.answersAssistantMention(chatEntity?.kind),
                 editing = editing != null,
             )
         }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
@@ -1462,7 +1554,15 @@ class ChatViewModel @Inject constructor(
         appScope.launch {
             items.forEachIndexed { index, (uri, isVideo) ->
                 val prepared = try {
-                    if (isVideo) mediaPrep.prepareVideo(uri) else mediaPrep.preparePhoto(uri)
+                    when {
+                        isVideo -> mediaPrep.prepareVideo(uri)
+                        // The assistant is shown a photograph (#96): its
+                        // chat keeps the picker's photo path, frame zero.
+                        inAssistantChat -> mediaPrep.preparePhoto(uri)
+                        // An animated GIF, WebP or PNG becomes an animation,
+                        // a still GIF or WebP a file — never a flattened JPEG.
+                        else -> mediaPrep.preparePickedPicture(uri)
+                    }
                 } catch (_: MediaPrep.TooLargeAfterCompression) {
                     // The one failure the user can act on, so it says what
                     // would help rather than just refusing. What was
@@ -1575,8 +1675,17 @@ class ChatViewModel @Inject constructor(
         // App scope, not viewModelScope: the staging and the first upload
         // must not be cancelled by navigating away.
         appScope.launch {
-            val queued =
-                messageRepository.sendMedia(prepared, caption, chatId, quote, resolvedMentions(caption))
+            // An animation goes AS one only alone (#96: the flag is refused on
+            // more than one attachment). Beside other items it travels in the
+            // member's set as the ordinary video it is — the set is never split.
+            val queued = messageRepository.sendMedia(
+                prepared,
+                caption,
+                chatId,
+                quote,
+                resolvedMentions(caption),
+                animation = AnimationSend.sendsAsAnimation(prepared),
+            )
             if (queued == null) {
                 // Only when not one item could be staged — a full disk, or
                 // a file that vanished between picking and sending.
@@ -1592,6 +1701,9 @@ class ChatViewModel @Inject constructor(
             }
         }
     }
+
+    /** Whether this is the assistant's chat, whose model is shown photographs, not animations (#96). */
+    private val inAssistantChat: Boolean get() = chat.value?.kind == "ai"
 
     /**
      * Hold prepared media in the composer until the user presses Send.
@@ -1629,8 +1741,9 @@ class ChatViewModel @Inject constructor(
             if (current.size >= AttachmentDto.MAX_PER_MESSAGE) {
                 if (!keepRefused) prepared.file.delete()
                 _mediaState.value = MediaSendState.Failed(
-                    appContext.getString(
-                        R.string.e_attachment_limit,
+                    appContext.resources.getQuantityString(
+                        R.plurals.e_attachment_limit,
+                        AttachmentDto.MAX_PER_MESSAGE,
                         AttachmentDto.MAX_PER_MESSAGE,
                     ),
                 )
@@ -2053,7 +2166,7 @@ class ChatViewModel @Inject constructor(
     /**
      * Whether the video recorder may open from this composer now — asked by
      * every way in (S3.1): the video button, the paperclip, the microphone's
-     * menu and its TalkBack action. Family and direct chats only, never
+     * menu and its TalkBack action. Family and direct chats and groups only, never
      * mid-edit. During a call (row 7) or while an attachment is busy (row 8)
      * it SAYS why instead, in the composer's notice line — dimmed is not
      * disabled (S1.3, S1.4, S1.6). Row 9 (a voice message not sent) opens it:
@@ -2062,7 +2175,7 @@ class ChatViewModel @Inject constructor(
      */
     fun mayOpenVideoRecorder(): Boolean {
         val kind = chat.value?.kind
-        if ((kind != "family" && kind != "direct") || _editTarget.value != null) return false
+        if (!GroupRules.offersVideoMessages(kind) || _editTarget.value != null) return false
         if (callLive.value) {
             notice(R.string.e_record_after_the_call)
             return false
@@ -2183,7 +2296,6 @@ class ChatViewModel @Inject constructor(
         // scope is already cancelled; the writes go out on the app's.
         covers.uncover(coveredChat)
         leave(duringCall = false)
-        super.onCleared()
     }
 
     /** Send a "Voice message not sent" — with ITS reply and caption, and nothing else (S2.8). */
@@ -2997,6 +3109,11 @@ class ChatViewModel @Inject constructor(
             uris.forEachIndexed { index, uri ->
                 val declared = providerType(uri).orEmpty()
                 val prepared = try {
+                    // An animated GIF, WebP or PNG becomes an animation (#96),
+                    // outside the assistant's chat; null for everything else —
+                    // and for one that cannot be made — which goes exactly as
+                    // it did.
+                    (if (inAssistantChat) null else mediaPrep.prepareIfAnimated(uri)) ?:
                     // Audio the server's magic check knows gets a player rather
                     // than a document row, and so does audio the audio rules
                     // re-encode into a type it knows (FLAC); anything else it
@@ -3149,7 +3266,19 @@ class ChatViewModel @Inject constructor(
             try {
                 targets.forEachIndexed { index, target ->
                     val prepared = try {
-                        when (target.kind) {
+                        // An animated picture becomes an animation (#96)
+                        // outside the assistant's chat. Null for everything
+                        // else — and for one that cannot be made (rule C) —
+                        // which goes exactly as it did: a GIF a file, a PNG
+                        // a photo.
+                        val animated = if (!inAssistantChat &&
+                            (target.kind == AttachmentDto.KIND_PHOTO || target.kind == AttachmentDto.KIND_FILE)
+                        ) {
+                            mediaPrep.prepareIfAnimated(target.uri)
+                        } else {
+                            null
+                        }
+                        animated ?: when (target.kind) {
                             // The SAME preparation the picker uses — the
                             // downscaled photo, the poster frame, the
                             // duration. A second path would be a second set
@@ -3341,7 +3470,11 @@ class ChatViewModel @Inject constructor(
      */
     fun reportPasteTruncated() {
         _mediaState.value = MediaSendState.Failed(
-            appContext.getString(R.string.e_paste_truncated, MessageBody.MAX_CHARS),
+            appContext.resources.getQuantityString(
+                R.plurals.e_paste_truncated,
+                MessageBody.MAX_CHARS,
+                MessageBody.MAX_CHARS,
+            ),
         )
     }
 

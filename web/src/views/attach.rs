@@ -22,6 +22,7 @@ use crate::awake::ScreenAwake;
 use crate::recorder::{self, Meter};
 use crate::staged::Prepared;
 use crate::store::NotSent;
+use crate::views::composer::Tool;
 use crate::views::dialog::Confirm;
 
 /// "You can play this after recording." — what a play control says while a
@@ -103,6 +104,13 @@ pub struct MenuProps {
     pub offers_pictures: bool,
     #[prop_or_default]
     pub on_pictures: Callback<Vec<File>>,
+    /// "Ask the Assistant" is offered — the family chat, on a server with an
+    /// assistant that names who answers: the row's old `@ai` button (#106).
+    #[prop_or_default]
+    pub offers_assistant: bool,
+    /// It was chosen: `@ai ` goes into the draft.
+    #[prop_or_default]
+    pub on_assistant: Callback<()>,
 }
 
 /// The paperclip, and what it offers.
@@ -260,6 +268,7 @@ pub fn attach_menu(props: &MenuProps) -> Html {
         assistant_pictures: props.offers_pictures,
         record_voice: props.offers_record,
         record_video: props.offers_video,
+        ask_assistant: props.offers_assistant,
         poll: props.offers_poll,
     });
     let line = |item: AttachItem| match item {
@@ -283,14 +292,15 @@ pub fn attach_menu(props: &MenuProps) -> Html {
                 .clone()
                 .map(|reason| (reason, (*video_reason_id).clone())),
         ),
+        AttachItem::AskAssistant => row(item, props.on_assistant.clone(), None),
         AttachItem::Location => row(item, props.on_location.clone(), None),
         AttachItem::Poll => row(item, props.on_poll.clone(), None),
     };
     html! {
         <div class="attach">
-            <button class="tool" title={t("Attach a photo, video or file")} aria-label={t("Attach")}
+            <button type="button" class="tool" title={t("Attach a photo, video or file")} aria-label={t("Attach")}
                     aria-haspopup="menu" aria-expanded={(*open).to_string()} onclick={toggle}>
-                { "📎" }
+                { Tool::Paperclip.draw() }
             </button>
             <input ref={picker} type="file" multiple=true class="hidden-picker" onchange={picked.clone()}
                    aria-hidden="true" tabindex="-1" />
@@ -621,6 +631,9 @@ pub fn label(item: &Prepared) -> String {
             &media::time_label(item.duration_ms.unwrap_or(0) as f64 / 1000.0),
         ),
         "location" => t("Location").to_string(),
+        // An animated picture made into a looping video (#96) is what it
+        // will be drawn as.
+        "video" if item.animation => t("GIF").to_string(),
         kind => {
             let name = media::display_name(kind, item.name.as_deref()).into_owned();
             if kind == "file" || kind == "audio" {
@@ -1203,5 +1216,16 @@ mod tests {
         };
         assert_eq!(label(&photo), "Photo");
         assert_eq!(label(&Prepared::location(1.0, 2.0, None)), "Location");
+        let animation = Prepared {
+            kind: "video".into(),
+            animation: true,
+            ..Prepared::default()
+        };
+        assert_eq!(label(&animation), "GIF");
+        let video = Prepared {
+            kind: "video".into(),
+            ..Prepared::default()
+        };
+        assert_eq!(label(&video), "Video");
     }
 }

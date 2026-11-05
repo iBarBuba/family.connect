@@ -10,6 +10,21 @@
  *   {"kind": "join_request", "family_id": …}  → JoinRequests (owner-only push)
  *   {"kind": "report", "family_id": …}        → Reports (owner-only push)
  *   {"kind": "joined", "family_id": …}        → ChatList
+ *   {"kind": "invitation", "family_id": …,
+ *    "invitation_id": …}                      → Invitations — the chat
+ *                                                list, whose banner (and the
+ *                                                switcher) holds them
+ *   {"kind": "family_plan", "family_id": …,
+ *    "stage": "unpaid"|"tomorrow"|"deleted"}  → FamilyPlan — that family's
+ *                                                chat list, whose banner says
+ *                                                when; for "deleted", the
+ *                                                list of the families left
+ *                                                (docs/protocol.md, "Paid
+ *                                                families")
+ *
+ * Since several families a push also says WHICH family (`family_id`,
+ * [familyId]): the app switches to it before following the route
+ * (docs/protocol.md, "Several families" — "Pushes").
  *   {"kind": "call", "call_id": …, …}          → Call — the call screen
  *                                                (docs/protocol.md,
  *                                                "Incoming calls"); a tap
@@ -47,6 +62,23 @@ sealed interface PendingRoute {
     data object Reports : PendingRoute
     data object ChatList : PendingRoute
 
+    /**
+     * kind "invitation" — somebody invited this account into their family
+     * (docs/protocol.md, "Several families"). The chat list's banner and the
+     * switcher are where invitations are answered.
+     */
+    data object Invitations : PendingRoute
+
+    /**
+     * kind "family_plan" — a paid family's deadline (docs/protocol.md, "Paid
+     * families", added 2026-10-30): it stopped being paid for, it is deleted
+     * tomorrow, or it was [deleted]. The first two open that family's chat
+     * list, where the banner says when; a deleted one opens on the families
+     * that are left, so it carries no family to switch to. The server wrote
+     * the title and body.
+     */
+    data class FamilyPlan(val deleted: Boolean) : PendingRoute
+
     /** The call screen; [answer] when the tap was the notification's Answer button. */
     data class Call(val answer: Boolean = false) : PendingRoute
 
@@ -62,6 +94,14 @@ object PushRouteParser {
     /** Payload keys, exactly as the server writes them into `data`. */
     const val KEY_KIND = "kind"
     const val KEY_CHAT_ID = "chat_id"
+
+    /** The family a push is about — present on every family-level push since several families. */
+    const val KEY_FAMILY_ID = "family_id"
+
+    /** Where a paid family's deadline is: "unpaid", "tomorrow" or "deleted" (kind "family_plan"). */
+    const val KEY_STAGE = "stage"
+    const val KIND_FAMILY_PLAN = "family_plan"
+    const val STAGE_DELETED = "deleted"
     const val KEY_CALL_ID = "call_id"
     const val KEY_FROM_USER_ID = "from_user_id"
     const val KEY_CALLER_NAME = "caller_name"
@@ -89,7 +129,23 @@ object PushRouteParser {
         "join_request" -> PendingRoute.JoinRequests
         "report" -> PendingRoute.Reports
         "joined" -> PendingRoute.ChatList
+        "invitation" -> PendingRoute.Invitations
+        KIND_FAMILY_PLAN -> PendingRoute.FamilyPlan(deleted = data[KEY_STAGE] == STAGE_DELETED)
         KIND_CALL -> PendingRoute.Call(answer = data[KEY_CALL_ACTION] == ACTION_ANSWER)
         else -> null
+    }
+
+    /**
+     * The family a push opens in, or null when it names none — a direct
+     * chat's, which opens wherever that chat is listed, and every push from
+     * a server that predates several families.
+     *
+     * Null as well for a family that was DELETED (kind "family_plan", stage
+     * "deleted"): there is nothing left to open, and a device that has not
+     * heard yet must not switch to it on the way to finding out.
+     */
+    fun familyId(data: Map<String, String>): Long? {
+        if (data[KEY_KIND] == KIND_FAMILY_PLAN && data[KEY_STAGE] == STAGE_DELETED) return null
+        return data[KEY_FAMILY_ID]?.toLongOrNull()
     }
 }

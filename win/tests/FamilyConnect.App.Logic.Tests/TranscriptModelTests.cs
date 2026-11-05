@@ -24,12 +24,12 @@ public sealed class TranscriptModelTests : IDisposable
 
     public void Dispose() => cache.Dispose();
 
-    private TranscriptModel Model(Server server)
+    private TranscriptModel Model(Server server, Func<DateTimeOffset>? clock = null)
     {
         var model = new TranscriptModel(
             new ApiClient(new HttpClient(server), ServerUrl.Normalise("chat.example.com")!, new MemoryTokenStore("t0ken")),
             store,
-            () => DateTimeOffset.UnixEpoch);
+            clock ?? (() => DateTimeOffset.UnixEpoch));
         model.Changed += changed.Add;
         return model;
     }
@@ -198,6 +198,42 @@ public sealed class TranscriptModelTests : IDisposable
         // Never repeated by itself: a write.
         Assert.Single(server.Asked);
 
+        await ShowAsync(model);
+        Assert.Equal(TranscriptPhase.Open, model.Look(34).Phase);
+        Assert.Equal(2, server.Asked.Count);
+    }
+
+    /// <summary>
+    /// A used-up month lasts until it renews (docs/protocol.md, "Transcripts on request"): the failure takes its day when
+    /// it comes, keeps it however late it is drawn again, and offers no retry until then — and from the 1st it is "Show
+    /// text" again, which asks again.
+    /// </summary>
+    [Fact]
+    public async Task AUsedUpMonthLastsUntilItRenews()
+    {
+        var server = new Server().Then(
+            Path,
+            (HttpStatusCode.Forbidden, """{"error": {"code": "ai_allowance_used", "message": "month"}}"""),
+            (HttpStatusCode.OK, Said));
+        var now = new DateTimeOffset(2026, 10, 31, 12, 0, 0, TimeSpan.Zero);
+        var model = Model(server, () => now);
+
+        await ShowAsync(model);
+        var look = model.Look(34);
+        Assert.Equal(TranscriptPhase.Failed, look.Phase);
+        var renews = new DateTimeOffset(2026, 11, 1, 0, 0, 0, TimeSpan.Zero);
+        Assert.Equal(renews, look.RenewsAt);
+        Assert.False(TranscriptRules.MayRetry(look.Error!));
+        Assert.Equal(TextItem.None, MessageMenu.TextItemFor(look));
+
+        // The last second of October: the same failure, the same day.
+        now = renews.AddSeconds(-1);
+        Assert.Equal(look, model.Look(34));
+
+        // The 1st: back to "Show text", and a click asks again.
+        now = renews;
+        Assert.Equal(TranscriptLook.Closed, model.Look(34));
+        Assert.Equal(TextItem.Show, MessageMenu.TextItemFor(model.Look(34)));
         await ShowAsync(model);
         Assert.Equal(TranscriptPhase.Open, model.Look(34).Phase);
         Assert.Equal(2, server.Asked.Count);

@@ -14,11 +14,13 @@ use crate::time::{self, Day};
 /// Everything the layout depends on that is not the messages themselves.
 pub struct Context<'a> {
     pub my_user_id: i64,
-    /// UNDEFAULTED on purpose, in the apps and here: a new surface that
-    /// forgot to say would otherwise draw the family chat's seen ticks —
-    /// which is exactly how it shipped wrong there once.
-    pub is_family_chat: bool,
-    pub is_ai_chat: bool,
+    /// The chat's kind as the server sent it (`family` | `direct` | `ai` |
+    /// `group`), which decides sender names and seen ticks through the one
+    /// table (fc_text::groups::offers). UNDEFAULTED on purpose, in the apps
+    /// and here: a new surface that forgot to say would otherwise draw the
+    /// family chat's seen ticks — which is exactly how it shipped wrong
+    /// there once.
+    pub chat_kind: &'a str,
     pub assistant_user_id: Option<i64>,
     pub blocked: &'a HashSet<i64>,
     /// The first message the reader had not read when the chat was OPENED —
@@ -68,11 +70,14 @@ pub fn is_awaited_answer(message: &Message, context: &Context) -> bool {
     if !carries_nothing || message.sender_id == context.my_user_id || message.id == 0 {
         return false;
     }
-    context.is_ai_chat || Some(message.sender_id) == context.assistant_user_id
+    context.chat_kind == fc_text::groups::AI || Some(message.sender_id) == context.assistant_user_id
 }
 
 /// Lay a chat's messages (oldest first) out as rows.
 pub fn rows<'a>(messages: &'a [Message], context: &Context) -> Vec<Row<'a>> {
+    // A group draws as the family chat does: names, and no "seen"
+    // (docs/protocol.md, "Groups").
+    let offers = fc_text::groups::offers(context.chat_kind);
     let mut rows = Vec::with_capacity(messages.len());
     let mut current_day: Option<Day> = None;
     let mut divider_placed = false;
@@ -94,7 +99,7 @@ pub fn rows<'a>(messages: &'a [Message], context: &Context) -> Vec<Row<'a>> {
         });
 
         let hidden = is_hidden_by_block(message, context.my_user_id, context.blocked);
-        let shows_sender = context.is_family_chat
+        let shows_sender = offers.sender_names
             && message.sender_id != context.my_user_id
             && !hidden
             && previous.is_none_or(|previous| previous.sender_id != message.sender_id);
@@ -106,7 +111,7 @@ pub fn rows<'a>(messages: &'a [Message], context: &Context) -> Vec<Row<'a>> {
                 .is_some_and(|first| message.id == first);
         divider_placed |= unread_divider_above;
 
-        let seen = !context.is_family_chat
+        let seen = offers.seen
             && message.sender_id == context.my_user_id
             && message.id != 0
             && message.id <= context.peer_read_up_to;
@@ -123,6 +128,120 @@ pub fn rows<'a>(messages: &'a [Message], context: &Context) -> Vec<Row<'a>> {
         });
     }
     rows
+}
+
+/// The rows from `start` on — exactly `rows(messages, context)[start..]`,
+/// without laying out the rows above them that nobody is drawing.
+///
+/// A row's layout looks one row back (its day, and whether the sender
+/// changed) and one row forward, and carries the day along through rows
+/// with no timestamp of their own. So the walk starts at the nearest row
+/// above `start` that HAS a day — usually the one just above — which is
+/// where the full walk would have its day too, and that row is dropped. The
+/// divider needs no history: it sits over one server id, and ids are unique
+/// in a thread.
+pub fn rows_from<'a>(messages: &'a [Message], start: usize, context: &Context) -> Vec<Row<'a>> {
+    let start = start.min(messages.len());
+    let mut seed = start.saturating_sub(1);
+    while seed > 0 && time::day(&messages[seed].created_at).is_none() {
+        seed -= 1;
+    }
+    let mut laid = rows(&messages[seed..], context);
+    laid.drain(..start - seed);
+    laid
+}
+
+/// How many of a chat's newest rows its pane draws — on opening, and while
+/// its reader follows along at the bottom.
+///
+/// Every row is a bubble, with its markdown, its pictures and its menus,
+/// and a chat opened after a long absence held every message it had ever
+/// loaded — hundreds, after a catch-up — all of them laid out and drawn
+/// again on every page that arrived, while the view tried to keep up at
+/// the bottom. A reader sees a screen or two of it; the rest waits above
+/// and is drawn as they scroll up to it (`Window::grow`).
+///
+/// Far more than a screen, and comfortably more than the rows below an
+/// unread divider are allowed to be (`ANCHOR_CAP` is how far back an
+/// opening may anchor; `Window::include` takes the window that far when it
+/// does).
+pub const WINDOW: usize = 100;
+
+/// How many more rows scrolling near the top of the window draws.
+pub const WINDOW_STEP: usize = 50;
+
+/// How many rows above a row the window is taken to — the divider, a quoted
+/// message being jumped to — so it is not the very first thing drawn.
+pub const WINDOW_CONTEXT: usize = 10;
+
+/// Which of a chat's rows its pane draws: from one row down to the newest.
+///
+/// Held as the server id of the oldest row drawn rather than as a count or
+/// an index, because rows arrive at BOTH ends: a page of history lands
+/// above (and a window that started at the oldest held keeps starting
+/// there — "Earlier messages" is a request to SEE them), and a catch-up
+/// lands below (and a reader up in the history keeps every row they are
+/// reading). Only a reader following along at the bottom has the top of
+/// the window cut back, which nothing on their screen shows.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    /// The oldest row drawn, by server id — `i64::MAX` for the first
+    /// pending row — or None to draw from the oldest held.
+    top: Option<i64>,
+}
+
+impl Window {
+    /// Where drawing starts in `messages` (oldest first, pending last), for
+    /// this draw. `following` is a reader at the newest message: their
+    /// window is the newest `WINDOW` rows. Anybody else's is never fewer
+    /// than that either — a row that went (a pending bubble taken back) is
+    /// made up from above, not left as a window drawing nothing.
+    pub fn start(&mut self, messages: &[Message], following: bool) -> usize {
+        let newest = messages.len().saturating_sub(WINDOW);
+        let start = if following {
+            newest
+        } else {
+            self.held_start(messages).min(newest)
+        };
+        self.set_start(messages, start);
+        start
+    }
+
+    /// Where the window starts now, without changing it.
+    pub fn held_start(&self, messages: &[Message]) -> usize {
+        match self.top {
+            None => 0,
+            Some(top) => messages.partition_point(|held| held.id != 0 && held.id < top),
+        }
+    }
+
+    /// Take the window up to row `index`, and `WINDOW_CONTEXT` rows above
+    /// it — never down: a window already above it stays where it is.
+    pub fn include(&mut self, messages: &[Message], index: usize) {
+        let wanted = index.saturating_sub(WINDOW_CONTEXT);
+        if wanted < self.held_start(messages) {
+            self.set_start(messages, wanted);
+        }
+    }
+
+    /// `WINDOW_STEP` more rows above. Whether there was anything to draw.
+    pub fn grow(&mut self, messages: &[Message]) -> bool {
+        let start = self.held_start(messages);
+        if start == 0 {
+            return false;
+        }
+        self.set_start(messages, start.saturating_sub(WINDOW_STEP));
+        true
+    }
+
+    fn set_start(&mut self, messages: &[Message], start: usize) {
+        self.top = match messages.get(start) {
+            _ if start == 0 => None,
+            Some(message) if message.id != 0 => Some(message.id),
+            Some(_) => Some(i64::MAX),
+            None => Some(i64::MAX),
+        };
+    }
 }
 
 /// How far back from the newest row an opening may anchor. The apps render
@@ -210,8 +329,7 @@ mod tests {
     fn family<'a>(blocked: &'a HashSet<i64>) -> Context<'a> {
         Context {
             my_user_id: ME,
-            is_family_chat: true,
-            is_ai_chat: false,
+            chat_kind: "family",
             assistant_user_id: Some(ASSISTANT),
             blocked,
             first_unread_id: None,
@@ -256,7 +374,7 @@ mod tests {
         assert!(!rows[2].hidden, "my own message is never hidden");
 
         let direct = Context {
-            is_family_chat: false,
+            chat_kind: "direct",
             ..family(&blocked)
         };
         assert!(
@@ -265,6 +383,16 @@ mod tests {
                 .all(|row| !row.shows_sender),
             "a direct chat has one other person; the name is noise"
         );
+        // A group names its senders exactly as the family chat does.
+        let group = Context {
+            chat_kind: "group",
+            ..family(&blocked)
+        };
+        let in_group: Vec<bool> = super::rows(&messages, &group)
+            .iter()
+            .map(|row| row.shows_sender)
+            .collect();
+        assert_eq!(in_group, names);
     }
 
     #[wasm_bindgen_test]
@@ -361,7 +489,7 @@ mod tests {
         ];
         let blocked = HashSet::new();
         let direct = Context {
-            is_family_chat: false,
+            chat_kind: "direct",
             peer_read_up_to: 1,
             ..family(&blocked)
         };
@@ -376,6 +504,15 @@ mod tests {
             ..family(&blocked)
         };
         assert!(rows(&messages, &in_family).iter().all(|row| !row.seen));
+
+        // A group has many readers, as the family chat does: no "seen",
+        // whatever a marker says (docs/protocol.md, "Groups").
+        let in_group = Context {
+            chat_kind: "group",
+            peer_read_up_to: 99,
+            ..family(&blocked)
+        };
+        assert!(rows(&messages, &in_group).iter().all(|row| !row.seen));
     }
 
     /// The working state is a fact about the message: empty, carrying
@@ -394,8 +531,7 @@ mod tests {
 
         // In its own chat, anything not mine is the assistant's.
         let ai = Context {
-            is_family_chat: false,
-            is_ai_chat: true,
+            chat_kind: "ai",
             assistant_user_id: None,
             ..family(&blocked)
         };
@@ -408,6 +544,122 @@ mod tests {
             ..Default::default()
         }]);
         assert!(!is_awaited_answer(&empty, &family(&blocked)));
+    }
+
+    /// The rows from any row on are exactly those rows of the whole layout:
+    /// across day boundaries, runs, a hidden sender, the divider (above the
+    /// start and below it) and the pending tail.
+    #[wasm_bindgen_test]
+    fn the_rows_from_a_start_are_the_whole_layouts_rows_from_there() {
+        let mut messages: Vec<Message> = Vec::new();
+        for id in 1..=60 {
+            let sender = [ANNA, ANNA, ME, BOB, ANNA][(id % 5) as usize];
+            messages.push(message(
+                id,
+                sender,
+                at(9 + (id / 17) as i32, (id % 24) as i32),
+            ));
+        }
+        for tail in ["p1", "p2"] {
+            let mut pending = message(0, ME, String::new());
+            pending.client_msg_id = Some(tail.into());
+            messages.push(pending);
+        }
+        let blocked = HashSet::from([BOB]);
+        for first_unread_id in [None, Some(5), Some(40)] {
+            let context = Context {
+                first_unread_id,
+                peer_read_up_to: 30,
+                ..family(&blocked)
+            };
+            let whole = rows(&messages, &context);
+            for start in 0..=messages.len() {
+                assert_eq!(
+                    rows_from(&messages, start, &context),
+                    whole[start..].to_vec(),
+                    "from row {start}, divider at {first_unread_id:?}"
+                );
+            }
+        }
+    }
+
+    fn numbered(count: i64) -> Vec<Message> {
+        (1..=count).map(|id| message(id, ANNA, at(9, 10))).collect()
+    }
+
+    /// A reader following along sees the newest `WINDOW` rows, however many
+    /// arrive — and a short chat is drawn whole.
+    #[wasm_bindgen_test]
+    fn a_reader_at_the_newest_is_drawn_the_newest_window() {
+        let mut window = Window::default();
+        assert_eq!(window.start(&numbered(40), true), 0, "a short chat, whole");
+        assert_eq!(window.start(&numbered(500), true), 500 - WINDOW);
+        assert_eq!(window.start(&numbered(650), true), 650 - WINDOW);
+    }
+
+    /// Up in the history, the window keeps every row it drew while rows
+    /// arrive below — and while a page of history arrives above, a window
+    /// that started at the oldest held keeps starting there.
+    #[wasm_bindgen_test]
+    fn a_reader_in_the_history_keeps_every_row_drawn() {
+        let mut window = Window::default();
+        let held = numbered(500);
+        let start = window.start(&held, true);
+        assert_eq!(start, 400);
+        // The reader scrolls up: nothing moves while more arrive below.
+        assert_eq!(window.start(&numbered(700), false), 400);
+
+        // A window drawn from the oldest held…
+        let mut whole = Window::default();
+        let recent: Vec<Message> = (51..=130).map(|id| message(id, ANNA, at(9, 10))).collect();
+        assert_eq!(whole.start(&recent, false), 0);
+        // …still is once "Earlier messages" has put fifty above it.
+        let paged: Vec<Message> = (1..=130).map(|id| message(id, ANNA, at(9, 10))).collect();
+        assert_eq!(whole.start(&paged, false), 0, "the page is drawn");
+    }
+
+    /// Scrolling up draws `WINDOW_STEP` more at a time, down to the oldest
+    /// held; a row to be shown — the divider, a quoted message — takes the
+    /// window up to it with some context, and never down.
+    #[wasm_bindgen_test]
+    fn the_window_grows_upward_and_reaches_what_must_be_shown() {
+        let held = numbered(500);
+        let mut window = Window::default();
+        window.start(&held, true);
+        assert!(window.grow(&held));
+        assert_eq!(window.start(&held, false), 400 - WINDOW_STEP);
+        for _ in 0..20 {
+            window.grow(&held);
+        }
+        assert_eq!(window.start(&held, false), 0);
+        assert!(!window.grow(&held), "nothing left above");
+
+        let mut window = Window::default();
+        window.start(&held, true);
+        window.include(&held, 200);
+        assert_eq!(window.start(&held, false), 200 - WINDOW_CONTEXT);
+        window.include(&held, 450);
+        assert_eq!(
+            window.start(&held, false),
+            200 - WINDOW_CONTEXT,
+            "a row already drawn moves nothing"
+        );
+        window.include(&held, 3);
+        assert_eq!(window.start(&held, false), 0);
+    }
+
+    /// A window is never fewer than `WINDOW` rows: a row that goes — a
+    /// pending bubble taken back — is made up from above.
+    #[wasm_bindgen_test]
+    fn a_window_is_never_left_short() {
+        let mut held = numbered(300);
+        let mut pending = message(0, ME, String::new());
+        pending.client_msg_id = Some("p".into());
+        held.push(pending);
+        let mut window = Window::default();
+        assert_eq!(window.start(&held, true), held.len() - WINDOW);
+        held.pop();
+        assert_eq!(window.start(&held, false), held.len() - WINDOW);
     }
 
     /// A pending row has no timestamp: it stays in the section it is being

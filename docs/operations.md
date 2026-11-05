@@ -109,11 +109,142 @@ entry matters more than the manual mount.
 
 ---
 
-## 4. Backups
+## 4. Encryption at rest
+
+*Since #59 (2026-10-25).* What people wrote, said, showed or are is encrypted
+by the server before it reaches PostgreSQL or the disk (docs/protocol.md,
+"Stored encrypted"; the design is `docs/encryption-at-rest-2026-10-24.md`).
+A dump, a backup, a snapshot or a stolen disk opens nothing without **the key
+file**. It protects copies, not the running box: whoever has root there can
+read what the server reads, exactly as before.
+
+### The key file
+
+One file, 32 random bytes in base64. Every family, conversation and account
+has its own key inside the database, and this file is what unlocks them. The
+server **refuses to start** without it or with the wrong one, and says which
+fingerprint it expected; it never falls back to storing plaintext.
+
+```sh
+sudo family-connect storage-key new /etc/family-connect/storage.key   # refuses to overwrite
+sudo chown family-connect:family-connect /etc/family-connect/storage.key
+sudo chmod 0400 /etc/family-connect/storage.key
+```
+
+```toml
+# /etc/family-connect/config.toml
+[storage]
+key_file = "/etc/family-connect/storage.key"
+```
+
+> **Copy it off the box now, once, by hand** — into a password manager, or
+> printed and put away: `sudo family-connect storage-key show`. Without it
+> nothing the server ever stored can be opened again: not the database, not a
+> backup, not one photograph. It is in **no** backup, deliberately — a backup
+> that carried its own key would protect nothing.
+
+**Stronger: systemd's encrypted credentials.** The key then never sits on disk
+in the clear, and with a TPM it opens only on this machine:
+
+```sh
+sudo systemd-creds encrypt --name=storage.key \
+  /etc/family-connect/storage.key /etc/credstore.encrypted/storage.key
+sudo systemctl edit family-connect   # add the two lines below
+#   [Service]
+#   LoadCredentialEncrypted=storage.key:/etc/credstore.encrypted/storage.key
+# and in config.toml:
+#   key_file = "/run/credentials/family-connect.service/storage.key"
+sudo shred -u /etc/family-connect/storage.key   # only after the server starts with the credential
+```
+
+A TPM-bound credential cannot be opened on new hardware, so the off-box copy
+is what a rebuilt server is restored with. Keep it.
+
+### Upgrading a server that has data
+
+The first start of a version with this section converts everything already
+stored. Do it in this order:
+
+1. **Take a backup** with the old version (section 5). It holds plaintext and
+   will be deleted in step 6, but it is the only way back: **after the
+   conversion, the older version cannot read the database.**
+2. Make the key file and copy it off the box, as above.
+3. Install the new binary, the new backup script (section 5) and the
+   `key_file` line, and restart. Before it answers anything the server seals
+   the database (seconds for one family; the log counts rows, never names
+   them), then compacts the converted tables so the old plaintext rows leave
+   the table files. Then it serves, and seals the attachment files in the
+   background — `journalctl -u family-connect` shows the count. An interrupted
+   conversion continues where it stopped on the next start.
+4. Check: `sudo -u postgres psql -d family_connect -tAc "SELECT substr(body, 1, 4) FROM messages LIMIT 3"`
+   shows `\x01…`, not words. Then open the app and look at a photo.
+5. Run a backup with the new script and check that it wrote the key copy.
+6. **Delete every backup from before the upgrade** — restic snapshots, rsync
+   mirrors, local dumps, a WAL archive if you keep one. They hold plaintext and
+   always will. Free disk blocks keep old bytes until they are overwritten,
+   which is why an encrypted volume underneath (LUKS) is still worth having.
+
+### Rotating the key
+
+```sh
+sudo systemctl stop family-connect
+sudo family-connect storage-key rotate   # shows the NEW key: copy it off the box
+sudo systemctl start family-connect
+```
+
+`rotate` writes the new key beside the old one, and in one transaction
+re-wraps the per-family keys under it and recomputes the lookups that are
+keyed by it — one per username, invite code and device token. Only then does
+it move the old file to `storage.key.old` and the new one into its place,
+owned as the old one was. Nothing that was sealed is touched, so it takes a
+moment however much the family has stored. With an encrypted credential,
+decrypt it to a file first (`systemd-creds decrypt`), rotate that, and encrypt
+the new one in its place.
+
+**Keep the old key for 7 days**: the key copies in your backups from before the
+rotation are wrapped by it (section 5). After that, destroy it.
+
+### Reading the assistant reports
+
+A member's report about the assistant comes to you, not to the family owner
+(docs/protocol.md, "Reporting the assistant"), and the server logs a WARN
+line when one arrives. The row is sealed like everything else, so `psql` shows
+bytes; read them with:
+
+```sh
+sudo -u family-connect family-connect reports            # the newest 50
+sudo -u family-connect family-connect reports --limit 200
+```
+
+A report about a conversation that has since been deleted shows its reason and
+date, and `(gone with its conversation)` where the reply was — deleting a
+conversation takes its words from the reports too.
+
+### What deletion means now
+
+Deleting a family, a group, a direct or assistant chat, or an account destroys
+its key. The backup keeps key copies for **7 days**, so a week later no backup
+can open what was deleted, even with the key file. A single message, note or
+file deleted on its own (by its author or by retention) is not covered; older
+backups hold it until they expire.
+
+---
+
+## 5. Backups
 
 **A database dump is not a backup.** Attachment bytes live on disk, not in
 PostgreSQL, so a `pg_dump` alone restores a family's history with every
 photograph missing. Both halves, or neither.
+
+**And since #59 there is a third part: the keys.** The script leaves the
+per-family keys out of the main dump (`--exclude-table-data=storage_keys`) and
+writes them in the same run to a separate key copy, kept **7 days** — restic
+under the tag `family-connect-keys`, rsync under `keys/`, pruned to the same
+7 days. That separation is the whole point of a key per family: if the keys
+travelled with the data, the backup kept for a year would open every family
+deleted during that year. Do not put the keys back into the main dump, and do
+not run a plain `pg_dump` of the live database by hand and keep it. The key
+FILE is in no backup at all (section 4).
 
 Shipped in `server/ops/`:
 
@@ -168,7 +299,7 @@ the night it happens rather than on the day it is needed.
 
 ---
 
-## 5. Restoring
+## 6. Restoring
 
 **This procedure has been run end to end** (PostgreSQL 16, rsync
 destination): 500 message rows and a sharded attachment tree wiped and
@@ -183,6 +314,10 @@ checksum. Two things it turned up, both of which will bite you at 3am:
 > **`--no-owner --no-privileges`** on `pg_restore`, unless you are restoring
 > onto a box with the identical role names.
 
+*Since #59* a restore needs two more things: **the key file**, from your
+off-box copy (section 4), and **a key copy** — the one with the same stamp as
+the dump, or, when that one has expired, the newest there is.
+
 ```sh
 sudo systemctl stop family-connect
 
@@ -192,13 +327,36 @@ sudo -u postgres dropdb --if-exists family_connect
 sudo -u postgres createdb -O family-connect family_connect
 sudo -u postgres pg_restore --dbname=family_connect --no-owner --no-privileges "$DUMP"
 
+# --- the keys, as postgres: the copy with the dump's stamp, else the newest ---
+KEYS=/mnt/offbox/family-connect/keys/keys-$(basename "$DUMP" .dump | cut -d- -f2).dump
+[ -f "$KEYS" ] || KEYS=$(ls -t /mnt/offbox/family-connect/keys/keys-*.dump | head -1)
+sudo -u postgres pg_restore --dbname=family_connect --data-only --no-owner --no-privileges "$KEYS"
+
 # --- half 2: the bytes, as family-connect ---
 sudo install -d -o family-connect -g family-connect /var/lib/family-connect/attachments
 sudo -u family-connect rsync -a \
   /mnt/offbox/family-connect/attachments/ /var/lib/family-connect/attachments/
 
+# --- the key file, from your off-box copy, if this is a new box ---
+#     (section 4: owner family-connect, mode 0400)
+
 sudo systemctl start family-connect
 ```
+
+**A key copy newer than the dump** — because the dump is older than 7 days —
+is expected, and it means what was deleted after the dump stays deleted. The
+server finds the rows whose key no longer exists and **refuses to start**,
+naming how many families, conversations and accounts they are. Deleting them
+again is one command, and it is yours to run, because it is the one step of a
+restore that removes data:
+
+```sh
+sudo -u family-connect family-connect storage forget-missing
+```
+
+A key copy **older** than the dump would leave families created in between
+without keys; the same refusal names them, and the fix is a newer key copy,
+not `forget-missing`.
 
 Verify before you believe it:
 
@@ -224,7 +382,7 @@ never restored is a belief, not a plan.
 
 ---
 
-## 6. Monitoring
+## 7. Monitoring
 
 `GET /api/v1/healthz` does a real `SELECT 1`, so it fails when the database is
 gone rather than only when the process is. Nothing polls it — that is
@@ -257,7 +415,7 @@ this section.
 
 ---
 
-## 7. The web client
+## 8. The web client
 
 A browser client lives in `web/` and is served **by this same nginx, from
 this same origin** — which is not a deployment convenience but the reason
@@ -298,3 +456,111 @@ lives in `sessionStorage`, so closing the tab ends the session for that
 reader — which is what makes a shared machine safe and is worth saying to a
 family that asks why the web keeps signing them out and the phone does not.
 
+
+## 9. Paid families
+
+`[subscriptions]` lets this server host families for an App Store
+subscription (docs/protocol.md, "Paid families"; issue #89). It is off by
+default, and a server that never turns it on has nothing to do here.
+
+The subscription is sold by the app's publisher, so this section is for the
+publisher's server. Turning it on anywhere else costs that server's families
+money that goes to somebody else.
+
+### Before turning it on
+
+0. **Business → Agreements.** The Paid Applications Agreement, with its bank
+   and tax forms, must be active. Until it is, no subscription can be sold,
+   and none even loads in Sandbox.
+1. **App Store Connect → the app → Subscriptions.** Create one subscription
+   group ("Family hosting") holding the products named in `product_ids`: by
+   default `me.nettrash.FamilyConnect.family.monthly` and `….family.yearly`.
+   Give them prices, a display name and a description, and the review
+   screenshot Apple asks for. Leave **Family Sharing off**: it cannot be
+   turned off again, and the server is not built for shared purchases — one
+   subscription belongs to one account.
+2. **Billing Grace Period** (in the same place): turn it on, 16 days. While
+   Apple retries a failed payment the subscription stays active, and the
+   server counts it as active. The family's 14 days start only after that.
+3. **App Information → App Store Server Notifications.** Set the URL to
+   `https://<your server>/api/v1/appstore/notifications` for BOTH Production
+   and Sandbox, version 2. The repo's nginx config already passes it
+   through; nothing else needs a change there.
+4. **App Privacy.** Add "Purchases", linked to the user, used for app
+   functionality. The server keeps, per subscriber, Apple's transaction id,
+   the product, the environment and when it expires. Say the same on the
+   privacy policy page.
+5. **Turn it on BEFORE submitting the app that can buy, not after.** App
+   Review buys in Sandbox, on this server, in the version under review, and
+   the subscription screen appears only while the switch is on (with
+   `"Sandbox"` in `environments`, the default). A first subscription is
+   reviewed together with an app version, so submit both at once, and give
+   App Review an account in the review notes: "New Family… → subscribe".
+   Until that version is out, only TestFlight and development builds can
+   buy, so a new family on this server can only be started from them.
+   Families that already exist are unaffected: they stay free.
+
+### Turning it on
+
+Add the section, keep the defaults unless you mean to change them, and
+restart:
+
+```toml
+[subscriptions]
+enabled = true
+```
+
+Every family that exists at that moment stays FREE — yours, and any other
+already here — so nothing changes for anybody who is already using the
+server. See them, and move one if you mean to:
+
+```sh
+sudo family-connect families list
+sudo family-connect families plan 7 paid     # or: free
+```
+
+`list` prints names, so it prints to your terminal only. It never goes to
+the journal. A family moved to `paid` whose owner has no subscription starts
+its 14 days at the next hourly sweep, and every member is told. Moving one to
+`free` stops the clock.
+
+### What to watch
+
+The journal says, with ids and never names:
+
+- `subscription stored` / `subscription refused (<reason>)` — an app handing
+  over a purchase. A refusal names the check that failed (the chain, a
+  marker extension, the bundle, the product, the environment, the account
+  token). Every refusal from a real app is a bug worth reporting.
+- `app store notification applied` / `ignored` / `refused`. A burst of
+  refusals is somebody posting junk at the URL, which costs nothing. Apple's
+  own notifications should never be refused.
+- `family unpaid`, `family covered again`, `family deleted (unpaid)`.
+
+A server that was down for a while misses Apple's notifications for that
+time (Apple retries five times over several days). Nothing is lost: the
+owner's app hands over the current state on its next launch, and the 14 days
+exist to give it time to.
+
+### Testing it
+
+Use a Sandbox tester (App Store Connect → Users and Access → Sandbox) on a
+development or TestFlight build. Its monthly subscription renews every few
+minutes and stops by itself after a few renewals, so you can see the whole
+cycle in an afternoon:
+
+1. the purchase;
+2. the family starting;
+3. the subscription expiring;
+4. the banner and the push;
+5. the deletion.
+
+For step 5, shorten `unpaid_days` to 1 while you watch, and put it back.
+
+### Turning it off
+
+`enabled = false` and restart. Plans are kept but nothing reads them: no
+limits, no deadlines, and nobody is deleted. Families created while it was
+on keep their `paid` plan, and any deadline is dropped at that restart: a
+family that was unpaid gets a fresh 14 days, with fresh warnings, if the
+switch is turned on again. Move any you mean to keep free first.

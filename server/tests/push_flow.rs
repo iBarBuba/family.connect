@@ -29,6 +29,7 @@ use common::{
     write_test_service_account,
 };
 use family_connect::config::{ApnsConfig, FcmConfig, PushConfig};
+use family_connect::vault::Lookup;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
@@ -326,6 +327,9 @@ async fn an_offline_ios_member_receives_the_exact_apns_request() {
             },
             "chat_id": chat_id,
             "message_id": message_id,
+            // A family chat's push names its family since 2026-10-22
+            // (protocol.md, "Several families").
+            "family_id": family_of_chat(&ts, chat_id).await,
             "kind": "message",
         })
     );
@@ -383,6 +387,7 @@ async fn an_offline_android_member_receives_the_exact_fcm_request() {
                 "kind": "message",
                 "chat_id": chat_id.to_string(),
                 "message_id": message_id.to_string(),
+                "family_id": family_of_chat(&ts, chat_id).await.to_string(),
             },
             "android": {
                 "priority": "HIGH",
@@ -727,9 +732,10 @@ async fn a_devices_language_is_kept_cleared_and_never_refused() {
     let (token, user_id) = ts.register("owner", "Olive").await;
     let language = || async {
         sqlx::query_scalar::<_, Option<String>>(
-            "SELECT language FROM devices WHERE user_id = $1 AND push_token = 'tok'",
+            "SELECT language FROM devices WHERE user_id = $1 AND push_token_key = $2",
         )
         .bind(user_id)
+        .bind(ts.lookup(Lookup::PushToken, "tok"))
         .fetch_one(&ts.state.pool)
         .await
         .expect("the device row")
@@ -1097,6 +1103,9 @@ async fn a_live_mac_does_not_silence_the_same_users_iphone() {
             },
             "chat_id": chat_id,
             "message_id": message_id,
+            // A family chat's push names its family since 2026-10-22
+            // (protocol.md, "Several families").
+            "family_id": family_of_chat(&ts, chat_id).await,
             "kind": "message",
         })
     );
@@ -1283,8 +1292,8 @@ async fn a_live_mac_does_not_silence_the_requesters_iphone_when_approved() {
 /// database — the only way to reach a session id from a test, since the
 /// wire never carries one.
 async fn session_of_device(ts: &TestServer, push_token: &str) -> Option<i64> {
-    sqlx::query_scalar("SELECT session_id FROM devices WHERE push_token = $1")
-        .bind(push_token)
+    sqlx::query_scalar("SELECT session_id FROM devices WHERE push_token_key = $1")
+        .bind(ts.lookup(Lookup::PushToken, push_token))
         .fetch_one(&ts.state.pool)
         .await
         .expect("the device row exists")
@@ -1442,8 +1451,8 @@ async fn a_device_from_before_the_session_column_is_still_pushed() {
     // with a real token that never told anybody which session it was. It
     // must keep the benefit of the doubt — the whole reason the column is
     // nullable — and it heals the moment the app launches again.
-    sqlx::query("UPDATE devices SET session_id = NULL WHERE push_token = $1")
-        .bind("junior-ios-token")
+    sqlx::query("UPDATE devices SET session_id = NULL WHERE push_token_key = $1")
+        .bind(ts.lookup(Lookup::PushToken, "junior-ios-token"))
         .execute(&ts.state.pool)
         .await
         .expect("orphaning the device row");
@@ -1760,6 +1769,9 @@ async fn a_mention_changes_the_title_for_the_member_named_and_nobody_else() {
             },
             "chat_id": chat_id,
             "message_id": message_id,
+            // A family chat's push names its family since 2026-10-22
+            // (protocol.md, "Several families").
+            "family_id": family_of_chat(&ts, chat_id).await,
             "kind": "message",
         })
     );
@@ -1912,4 +1924,14 @@ async fn a_member_is_not_woken_by_a_mention_from_somebody_they_blocked() {
         1,
         "the blocker's phone stays dark"
     );
+}
+
+/// The family a chat is in — what a family chat's message push names since
+/// 2026-10-22 (protocol.md, "Several families").
+async fn family_of_chat(ts: &common::TestServer, chat_id: i64) -> i64 {
+    sqlx::query_scalar("SELECT family_id FROM chats WHERE id = $1")
+        .bind(chat_id)
+        .fetch_one(&ts.state.pool)
+        .await
+        .expect("the chat's family")
 }

@@ -11,9 +11,16 @@ use axum::routing::{delete, get, patch, post, put};
 use crate::state::AppState;
 use crate::{
     handlers_attachment, handlers_auth, handlers_avatar, handlers_board, handlers_call,
-    handlers_chat, handlers_device, handlers_family, handlers_pack, handlers_poll, handlers_report,
-    handlers_stats, handlers_transcript, ws,
+    handlers_chat, handlers_device, handlers_family, handlers_group, handlers_invitation,
+    handlers_pack, handlers_poll, handlers_report, handlers_stats, handlers_subscription,
+    handlers_transcript, ws,
 };
+
+/// The body ceiling of the two App Store routes (docs/protocol.md, "Paid
+/// families"): every signed value carries Apple's certificate chain, and a
+/// notification nests two of them inside a third. Fixed, and inside the
+/// repo's nginx `client_max_body_size 64k`.
+const APPSTORE_BODY_LIMIT: usize = 64 * 1024;
 
 /// Build the full application router for the given state. Used identically
 /// by the binary and by the integration tests.
@@ -52,6 +59,14 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/me/assistant-lookup-consent",
             post(handlers_auth::set_assistant_lookup_consent),
         )
+        // What the App Store signed for this account (docs/protocol.md,
+        // "Paid families"). Its own body limit: a transaction and a renewal
+        // info each carry Apple's three certificates.
+        .route(
+            "/api/v1/me/subscription",
+            put(handlers_subscription::put_subscription)
+                .layer(DefaultBodyLimit::max(APPSTORE_BODY_LIMIT)),
+        )
         .route("/api/v1/me/password", post(handlers_auth::change_password))
         // A POST rather than a DELETE /me: the request carries a body, and
         // RFC 9110 gives content on a DELETE no defined semantics
@@ -76,17 +91,29 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/users/{id}/avatar",
             get(handlers_avatar::get_avatar),
         )
-        // Families
+        // Families. Since 2026-10-22 every family endpoint has TWO forms
+        // (docs/protocol.md, "Several families"): the original, which means
+        // the caller's HOME family, and `/families/{family}/…`, where
+        // `{family}` is a family id or `mine`. One handler serves both — the
+        // `AuthUser` extractor resolves `{family}` (or the home family) into
+        // `auth.family_id` and refuses a family the caller is not in with
+        // `family_not_found` before the handler runs. The `mine` routes of
+        // before are the `{family}` routes with `mine` in them.
+        //
+        // The static segments (`join`, `leave`, `members`, `reports`,
+        // `join-requests`, `invite-code`) and `{family}` sit at the same
+        // position; the router matches a literal before a parameter, so
+        // every form without an id routes exactly as it did.
         .route("/api/v1/families", post(handlers_family::create_family))
         .route("/api/v1/families/join", post(handlers_family::join_family))
         .route(
-            "/api/v1/families/mine",
+            "/api/v1/families/{family}",
             get(handlers_family::my_family).patch(handlers_family::patch_family),
         )
         // Every member sees the same numbers — a shared curiosity, not an
         // owner's dashboard (protocol.md, "Family statistics").
         .route(
-            "/api/v1/families/mine/stats",
+            "/api/v1/families/{family}/stats",
             get(handlers_stats::family_stats),
         )
         .route(
@@ -94,7 +121,15 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers_family::rotate_invite_code),
         )
         .route(
+            "/api/v1/families/{family}/invite-code/rotate",
+            post(handlers_family::rotate_invite_code),
+        )
+        .route(
             "/api/v1/families/join-requests",
+            get(handlers_family::list_join_requests),
+        )
+        .route(
+            "/api/v1/families/{family}/join-requests",
             get(handlers_family::list_join_requests),
         )
         .route(
@@ -102,7 +137,15 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers_family::approve_join_request),
         )
         .route(
+            "/api/v1/families/{family}/join-requests/{id}/approve",
+            post(handlers_family::approve_join_request),
+        )
+        .route(
             "/api/v1/families/join-requests/{id}/reject",
+            post(handlers_family::reject_join_request),
+        )
+        .route(
+            "/api/v1/families/{family}/join-requests/{id}/reject",
             post(handlers_family::reject_join_request),
         )
         .route(
@@ -110,7 +153,15 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers_family::leave_family),
         )
         .route(
+            "/api/v1/families/{family}/leave",
+            post(handlers_family::leave_family),
+        )
+        .route(
             "/api/v1/families/members/{user_id}",
+            delete(handlers_family::remove_member),
+        )
+        .route(
+            "/api/v1/families/{family}/members/{user_id}",
             delete(handlers_family::remove_member),
         )
         .route(
@@ -118,7 +169,16 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers_family::reset_member_password),
         )
         .route(
+            "/api/v1/families/{family}/members/{user_id}/password",
+            post(handlers_family::reset_member_password),
+        )
+        .route(
             "/api/v1/families/members/{user_id}/birthday",
+            put(handlers_family::set_member_birthday)
+                .delete(handlers_family::delete_member_birthday),
+        )
+        .route(
+            "/api/v1/families/{family}/members/{user_id}/birthday",
             put(handlers_family::set_member_birthday)
                 .delete(handlers_family::delete_member_birthday),
         )
@@ -129,6 +189,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/families/members/{user_id}/block",
             put(handlers_family::block_member).delete(handlers_family::unblock_member),
         )
+        .route(
+            "/api/v1/families/{family}/members/{user_id}/block",
+            put(handlers_family::block_member).delete(handlers_family::unblock_member),
+        )
         // Reporting: any member may file, only the owner may read or
         // resolve — and a report naming the owner is never listed to them
         // (protocol.md, "Reporting a member").
@@ -137,8 +201,34 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers_report::create_report).get(handlers_report::list_reports),
         )
         .route(
+            "/api/v1/families/{family}/reports",
+            post(handlers_report::create_report).get(handlers_report::list_reports),
+        )
+        .route(
             "/api/v1/families/reports/{id}/resolve",
             post(handlers_report::resolve_report),
+        )
+        .route(
+            "/api/v1/families/{family}/reports/{id}/resolve",
+            post(handlers_report::resolve_report),
+        )
+        // Invitations (docs/protocol.md, "Several families"): the owner's
+        // side under the family, the invited person's under their own id.
+        .route(
+            "/api/v1/families/{family}/invitations",
+            post(handlers_invitation::create_invitation).get(handlers_invitation::list_invitations),
+        )
+        .route(
+            "/api/v1/families/{family}/invitations/{id}",
+            delete(handlers_invitation::withdraw_invitation),
+        )
+        .route(
+            "/api/v1/invitations/{id}/accept",
+            post(handlers_invitation::accept_invitation),
+        )
+        .route(
+            "/api/v1/invitations/{id}/decline",
+            post(handlers_invitation::decline_invitation),
         )
         .route(
             // NOT under /families: an assistant report needs no family, and
@@ -150,6 +240,20 @@ pub fn build_router(state: AppState) -> Router {
         // Chats & messages
         .route("/api/v1/chats", get(handlers_chat::list_chats))
         .route("/api/v1/chats/direct", post(handlers_chat::direct_chat))
+        // Groups (docs/protocol.md, "Groups").
+        .route("/api/v1/chats/groups", post(handlers_group::create_group))
+        .route(
+            "/api/v1/chats/{id}",
+            patch(handlers_group::rename_group).delete(handlers_group::delete_group),
+        )
+        .route(
+            "/api/v1/chats/{id}/members",
+            post(handlers_group::add_members),
+        )
+        .route(
+            "/api/v1/chats/{id}/members/{user_id}",
+            delete(handlers_group::remove_member),
+        )
         .route(
             "/api/v1/chats/{id}/messages",
             get(handlers_chat::get_messages).post(handlers_chat::post_message),
@@ -217,41 +321,42 @@ pub fn build_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(preview_limit))
                 .get(handlers_attachment::get_preview),
         )
-        // Board
+        // Board — `/families/{family}/board…`, `mine` being the home
+        // family (docs/protocol.md, "Several families").
         .route(
-            "/api/v1/families/mine/board",
+            "/api/v1/families/{family}/board",
             get(handlers_board::get_board),
         )
         .route(
-            "/api/v1/families/mine/board/changes",
+            "/api/v1/families/{family}/board/changes",
             get(handlers_board::get_board_changes),
         )
         .route(
-            "/api/v1/families/mine/board/notes",
+            "/api/v1/families/{family}/board/notes",
             post(handlers_board::create_note),
         )
         .route(
-            "/api/v1/families/mine/board/notes/{note_id}",
+            "/api/v1/families/{family}/board/notes/{note_id}",
             patch(handlers_board::patch_note).delete(handlers_board::delete_note),
         )
         // Answering an event is the SHARED act, like moving a note: any
         // member may, and it has its own route because it is not an edit
         // (docs/protocol.md, "Board").
         .route(
-            "/api/v1/families/mine/board/notes/{note_id}/rsvp",
+            "/api/v1/families/{family}/board/notes/{note_id}/rsvp",
             put(handlers_board::put_rsvp).delete(handlers_board::delete_rsvp),
         )
         // The assistant's picture behind an event: the AUTHOR's, and its
         // own route because it is not an edit anybody could send — the
         // prompt is the note's own title (docs/protocol.md, "Board").
         .route(
-            "/api/v1/families/mine/board/notes/{note_id}/backdrop",
+            "/api/v1/families/{family}/board/notes/{note_id}/backdrop",
             post(handlers_board::draw_backdrop),
         )
         // Ticking a line off a task list is the shared act too, for the
         // same reason and with its own route (docs/protocol.md, "Board").
         .route(
-            "/api/v1/families/mine/board/notes/{note_id}/tasks/{item_id}",
+            "/api/v1/families/{family}/board/notes/{note_id}/tasks/{item_id}",
             put(handlers_board::put_task_done),
         )
         // Sticker pack — CHAT stickers, one pack per family; not the board's
@@ -259,15 +364,15 @@ pub fn build_router(state: AppState) -> Router {
         // "Sticker pack"). Any member may add; whoever added an item, or
         // the owner, may remove it.
         .route(
-            "/api/v1/families/mine/pack",
+            "/api/v1/families/{family}/pack",
             get(handlers_pack::get_pack).post(handlers_pack::add_pack_item),
         )
         .route(
-            "/api/v1/families/mine/pack/changes",
+            "/api/v1/families/{family}/pack/changes",
             get(handlers_pack::get_pack_changes),
         )
         .route(
-            "/api/v1/families/mine/pack/{item_id}",
+            "/api/v1/families/{family}/pack/{item_id}",
             delete(handlers_pack::remove_pack_item),
         )
         // Devices
@@ -280,6 +385,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/calls/ice", get(handlers_call::get_ice_servers))
         // Ops
         .route("/api/v1/healthz", get(handlers_device::healthz))
+        // Apple's App Store Server Notifications: no session, Apple's
+        // signature is the authentication. A notification nests two signed
+        // values in a third, each with its certificates — tens of KiB.
+        .route(
+            "/api/v1/appstore/notifications",
+            post(handlers_subscription::appstore_notification)
+                .layer(DefaultBodyLimit::max(APPSTORE_BODY_LIMIT)),
+        )
         // Realtime
         .route("/api/v1/ws", get(ws::ws_upgrade))
         .layer(DefaultBodyLimit::max(body_limit))

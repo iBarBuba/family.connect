@@ -749,6 +749,86 @@ public class ChatStoreTests : IDisposable
     }
 
     /// <summary>
+    /// THE ROSTER AND THE BLOCK LIST ARE KEPT IN MEMORY, AND NO WRITE MAY LEAVE THE COPY BEHIND — not one through another
+    /// store on the same file, and not a wipe, which no store sees. A conversation asks both once per bubble, so a stale
+    /// copy would be a blocked member's words drawn, or a renamed member drawn by their old name, until a restart.
+    /// </summary>
+    [Fact]
+    public void WhatIsKeptOfTheRosterFollowsEveryWriteWhoeverMadeIt()
+    {
+        var reading = Store();
+        var writing = Store();
+        writing.Replace([new MemberDto(7, "anna", "Anna", Role: "owner"), new MemberDto(11, "bob", "Bob", Role: "member")]);
+        Assert.Equal("Bob", reading.Member(11)!.DisplayName);
+        Assert.False(reading.IsBlocked(11));
+        Assert.Empty(reading.Blocked());
+
+        writing.Joined(new UserDto(11, "bob", "Robert", 3));
+        Assert.Equal("Robert", reading.Member(11)!.DisplayName);
+        Assert.Equal(3, reading.Members().Single(member => member.Id == 11).AvatarVersion);
+        writing.SetOwner(11);
+        Assert.True(reading.Member(11)!.Owner);
+        writing.Left(7);
+        Assert.True(reading.Member(7)!.HasLeft);
+        writing.Deleted(new MemberDto(7, "deleted", "Deleted account"));
+        Assert.True(reading.Member(7)!.Deleted);
+
+        writing.SetBlocked(11, true);
+        Assert.True(reading.IsBlocked(11));
+        Assert.Equal([11L], reading.Blocked());
+        writing.ReplaceBlocked([14]);
+        Assert.False(reading.IsBlocked(11));
+        Assert.True(reading.IsBlocked(14));
+
+        database.WipeAll();
+        Assert.Empty(reading.Members());
+        Assert.Null(reading.Member(11));
+        Assert.False(reading.IsBlocked(14));
+        Assert.Empty(reading.Blocked());
+    }
+
+    /// <summary>
+    /// The copy handed out is the caller's to read, never to change: a second caller must get the table, not what the
+    /// first one did to its answer.
+    /// </summary>
+    [Fact]
+    public void TheKeptRosterCannotBeChangedByWhoeverWasHandedIt()
+    {
+        var store = Store();
+        store.Replace([new MemberDto(7, "anna", "Anna", Role: "owner")]);
+        store.ReplaceBlocked([11]);
+        Assert.False(store.Members() is List<MemberDto>);
+        Assert.False(store.Blocked() is List<long>);
+        Assert.Throws<NotSupportedException>(() => ((IList<MemberDto>)store.Members()).Add(new MemberDto(8, "x", "X")));
+        Assert.Throws<NotSupportedException>(() => ((IList<long>)store.Blocked()).Add(12));
+        Assert.Single(store.Members());
+        Assert.Equal([11L], store.Blocked());
+    }
+
+    /// <summary>
+    /// A chat's kind is what its row says — asked of every bubble a conversation draws — null for a chat with no row yet, and
+    /// picked up once the list read writes one; a wipe forgets it.
+    /// </summary>
+    [Fact]
+    public void AChatsKindIsItsRowsAndFollowsTheListRead()
+    {
+        var store = Store();
+        Assert.Null(store.Kind(42));
+        store.Replace([Row(), Row(new ChatDto(43, "direct", "Bob")), Row(new ChatDto(44, "ai", "Assistant"))]);
+        Assert.Equal("family", store.Kind(42));
+        Assert.Equal("direct", store.Kind(43));
+        Assert.Equal("ai", store.Kind(44));
+        Assert.Equal(store.Chat(43)!.Chat.Kind, store.Kind(43));
+        // A chat the list no longer carries is hidden, not forgotten: its kind is still its row's.
+        store.Replace([Row()]);
+        Assert.Equal("direct", store.Kind(43));
+        Assert.Null(store.Kind(99));
+
+        database.WipeAll();
+        Assert.Null(store.Kind(42));
+    }
+
+    /// <summary>
     /// The `member_blocked` frame is a STATE-SET, and it is the one place a client applies the
     /// consequence itself: the frame reaches the blocker's own devices and no list read is
     /// coming. The chat leaves the list and comes back WHOLE, because nothing about it is ever
@@ -847,5 +927,131 @@ public class ChatStoreTests : IDisposable
         store.Apply(Message(2, chat: 42, body: "rewritten", created: "2026-09-12T13:00:00Z",
             editSeq: 7));
         Assert.Equal([43L, 42L], store.Chats().Select(row => row.Chat.Id));
+    }
+
+    /// <summary>
+    /// A GROUP's members and admin are kept on its row as the server stated them, in join order, and rewritten whole by
+    /// every list read — and every other kind carries neither (docs/protocol.md, "Groups").
+    /// </summary>
+    [Fact]
+    public void AGroupsMembersAndAdminArePersistedAndRewrittenWhole()
+    {
+        var store = Store();
+        store.Replace([Row(), Row(new ChatDto(77, "group", "Cousins", MemberIds: [11, 7, 9], AdminUserId: 11))]);
+
+        var group = store.Chat(77)!.Chat;
+        Assert.Equal([11L, 7L, 9L], group.MemberIds!);
+        Assert.Equal(11, group.AdminUserId);
+        Assert.Null(group.PeerUserId);
+        Assert.Null(store.Chat(42)!.Chat.MemberIds);
+        Assert.Null(store.Chat(42)!.Chat.AdminUserId);
+
+        // The admin left and the hand-off went to the member who joined earliest after them.
+        store.Replace([Row(), Row(new ChatDto(77, "group", "Cousins", MemberIds: [7, 9], AdminUserId: 7))]);
+        group = store.Chats().Single(row => row.Chat.Id == 77).Chat;
+        Assert.Equal([7L, 9L], group.MemberIds!);
+        Assert.Equal(7, group.AdminUserId);
+    }
+
+    /// <summary>
+    /// A group a list read no longer carries is HIDDEN, as every chat is — "a client drops every chat that leaves
+    /// <c>GET /chats</c>, of any kind" — and comes back when a later read carries it again.
+    /// </summary>
+    [Fact]
+    public void AGroupThatLeavesTheListIsHidden()
+    {
+        var store = Store();
+        store.Replace([Row(), Row(new ChatDto(77, "group", "Cousins", MemberIds: [7, 9], AdminUserId: 9))]);
+
+        store.Replace([Row()]);
+        Assert.False(store.IsListed(77));
+        Assert.DoesNotContain(store.Chats(), row => row.Chat.Id == 77);
+
+        store.Replace([Row(), Row(new ChatDto(77, "group", "Cousins", MemberIds: [7, 9], AdminUserId: 9))]);
+        Assert.True(store.IsListed(77));
+    }
+
+    /// <summary>
+    /// <see cref="ChatStore.Upsert"/> writes the chat and puts it on the list without touching its counts or its marker;
+    /// <see cref="ChatStore.Remove"/> takes a group and its messages away, and refuses every other kind.
+    /// </summary>
+    [Fact]
+    public void UpsertKeepsTheCountsAndRemoveTakesOnlyAGroup()
+    {
+        var store = Store();
+        store.Replace([Row(), Row(new ChatDto(77, "group", "Cousins", MemberIds: [7, 9], AdminUserId: 9), unread: 4, read: 30)]);
+        store.Apply([Message(40, chat: 77, sender: 9)]);
+
+        store.Upsert(new ChatDto(77, "group", "The cousins", MemberIds: [7, 9, 11], AdminUserId: 9));
+        var held = store.Chat(77)!;
+        Assert.Equal("The cousins", held.Chat.Title);
+        Assert.Equal(4, held.UnreadCount);
+        Assert.Equal(30, held.LastReadMessageId);
+
+        // A chat never held before starts with nothing unread.
+        store.Upsert(new ChatDto(78, "group", "Book club", MemberIds: [7, 12], AdminUserId: 12));
+        Assert.Equal(0, store.Chat(78)!.UnreadCount);
+
+        Assert.False(store.Remove(42));
+        Assert.NotNull(store.Chat(42));
+        Assert.True(store.Remove(77));
+        Assert.Null(store.Chat(77));
+        Assert.Null(store.Message(40));
+        Assert.False(store.Remove(77));
+    }
+
+    /// <summary>
+    /// A LIST READ THAT BEGAN BEFORE A GROUP WAS MADE does not hide it when it lands — and one that began before a rename
+    /// keeps the newer name while still taking its counts. The next read, begun after, decides normally.
+    /// </summary>
+    [Fact]
+    public void AListReadOlderThanAnUpsertDoesNotUndoIt()
+    {
+        var store = Store();
+        store.Replace([Row(), Row(new ChatDto(77, "group", "Cousins", MemberIds: [7, 9], AdminUserId: 9))]);
+
+        var mark = store.ListMark;
+        // While the request is in flight: a group is created, and another is renamed.
+        store.Upsert(new ChatDto(78, "group", "Book club", MemberIds: [7, 12], AdminUserId: 7));
+        store.Upsert(new ChatDto(77, "group", "The cousins", MemberIds: [7, 9, 11], AdminUserId: 9));
+        store.Replace([Row(), Row(new ChatDto(77, "group", "Cousins", MemberIds: [7, 9], AdminUserId: 9), unread: 3)], mark);
+
+        Assert.True(store.IsListed(78));
+        var renamed = store.Chat(77)!;
+        Assert.Equal("The cousins", renamed.Chat.Title);
+        Assert.Equal([7L, 9L, 11L], renamed.Chat.MemberIds!);
+        Assert.Equal(3, renamed.UnreadCount);
+
+        // A read begun after the changes is the list again.
+        store.Replace([Row(), Row(new ChatDto(77, "group", "Cousins", MemberIds: [7, 9], AdminUserId: 9))], store.ListMark);
+        Assert.False(store.IsListed(78));
+        Assert.Equal("Cousins", store.Chat(77)!.Chat.Title);
+    }
+
+    /// <summary>
+    /// A LIST READ THAT BEGAN BEFORE A GROUP WAS REMOVED does not write it back; the next read, begun after, adds it if the
+    /// server lists it again (the reader was added back).
+    /// </summary>
+    [Fact]
+    public void AListReadOlderThanARemoveDoesNotWriteItBack()
+    {
+        var store = Store();
+        var group = new ChatDto(77, "group", "Cousins", MemberIds: [7, 9], AdminUserId: 9);
+        store.Replace([Row(), Row(group)]);
+
+        var mark = store.ListMark;
+        Assert.True(store.Remove(77));
+        // And a removal of a group this device never held is a fact too.
+        Assert.False(store.Remove(79));
+        store.Replace([Row(), Row(group, last: Message(40, chat: 77, sender: 9)),
+                       Row(new ChatDto(79, "group", "Never seen", MemberIds: [7, 9], AdminUserId: 9))], mark);
+
+        Assert.Null(store.Chat(77));
+        Assert.Null(store.Message(40));
+        Assert.Null(store.Chat(79));
+        Assert.NotNull(store.Chat(42));
+
+        store.Replace([Row(), Row(group)], store.ListMark);
+        Assert.True(store.IsListed(77));
     }
 }

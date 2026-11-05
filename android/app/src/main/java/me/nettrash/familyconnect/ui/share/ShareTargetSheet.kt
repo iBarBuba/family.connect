@@ -45,19 +45,24 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import me.nettrash.familyconnect.R
 import me.nettrash.familyconnect.data.db.ChatDao
 import me.nettrash.familyconnect.data.db.ChatEntity
+import me.nettrash.familyconnect.data.repo.FamilyList
 import me.nettrash.familyconnect.data.repo.FamilyRepository
+import me.nettrash.familyconnect.data.settings.SettingsRepository
 import me.nettrash.familyconnect.ui.components.Avatar
 import me.nettrash.familyconnect.ui.components.EmptyState
+import me.nettrash.familyconnect.ui.group.GroupAvatarMark
+import me.nettrash.familyconnect.util.GroupRules
 import javax.inject.Inject
 
 /**
- * The chats a share may land in: family or direct, NEVER `kind == "ai"` —
+ * The chats a share may land in: family, direct or a group, NEVER `kind == "ai"` —
  * the assistant's private thread takes no shared files, and offering it
  * would offer a send the server refuses. Order is the DAO's (family chat
  * pinned first, then recency), so this only filters. Pure, and pinned by
@@ -69,11 +74,19 @@ fun shareTargets(chats: List<ChatEntity>): List<ChatEntity> = chats.filter { it.
 class ShareTargetViewModel @Inject constructor(
     chatDao: ChatDao,
     familyRepository: FamilyRepository,
+    settings: SettingsRepository,
 ) : ViewModel() {
-    /** Null while Room has not answered — the sheet shows nothing yet, not "no chats". */
-    val chats: StateFlow<List<ChatEntity>?> = chatDao.observeChats()
-        .map(::shareTargets)
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+    /**
+     * Null while Room has not answered — the sheet shows nothing yet, not
+     * "no chats". The CURRENT family's chats, as the chat list shows them:
+     * with several families there is one family chat per family, and the
+     * one offered is the family's being shown (docs/protocol.md, "Several
+     * families").
+     */
+    val chats: StateFlow<List<ChatEntity>?> =
+        combine(chatDao.observeChats(), settings.state) { chats, s ->
+            shareTargets(FamilyList.chatsOf(chats, s.currentFamilyId, s.families.firstOrNull()?.id))
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
     /**
      * userId → profile-picture version — the same derivation
@@ -169,6 +182,8 @@ fun ShareTargetSheet(
                                         tint = MaterialTheme.colorScheme.onPrimaryContainer,
                                     )
                                 }
+                            } else if (GroupRules.isGroup(chat.kind)) {
+                                GroupAvatarMark()
                             } else {
                                 Avatar(
                                     name = chat.title,

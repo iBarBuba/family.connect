@@ -19,6 +19,12 @@
 //!
 //! Not built, here as on the Mac: the jump from a report to the message it
 //! names, which the protocol offers while `message_id` survives.
+//!
+//! With several families (docs/protocol.md, "Several families") this is the
+//! family on screen. Its owner may invite the members of their OTHER
+//! families ("Invite…", hidden when there is no other family) and withdraw
+//! what is still pending; a password is offered for reset only where the
+//! server says this owner owns every family the member is in.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -34,12 +40,12 @@ use yew::prelude::*;
 use crate::actions::{Action, Done};
 use crate::api::{ApiError, FamilyPatch};
 use crate::model::{
-    Assistant, Family, JoinRequest, Me, Member, PackItem, Report, ReportedAttachment,
+    Assistant, Family, Invitation, JoinRequest, Me, Member, PackItem, Report, ReportedAttachment,
 };
 use crate::time;
 use crate::views::avatar::Avatar;
 use crate::views::birthday::BirthdayDialog;
-use crate::views::dialog::{generic_failure, Confirm};
+use crate::views::dialog::{generic_failure, Confirm, Modal};
 use crate::views::password::ResetPasswordDialog;
 use crate::views::report::{ReportDialog, ReportTarget, REASONS};
 use crate::views::stickers::PackSection;
@@ -66,6 +72,17 @@ pub struct FamilyProps {
     /// A sticker is on its way into the pack.
     #[prop_or_default]
     pub pack_adding: bool,
+    /// For the owner: whom they may invite — the members of their other
+    /// families who are not in this one (Store::invitable).
+    #[prop_or_default]
+    pub invitable: Vec<(i64, String)>,
+    /// For the owner: whether they are in another family at all. Without
+    /// one there is nobody to invite, and no "Invite…".
+    #[prop_or_default]
+    pub other_families: bool,
+    /// For the owner: this family's invitations still pending.
+    #[prop_or_default]
+    pub sent_invitations: Vec<Invitation>,
     pub on_action: Callback<Action>,
     pub on_close: Callback<()>,
 }
@@ -81,6 +98,7 @@ enum Tool {
     Remove(i64),
     Report(i64),
     Rotate,
+    Invite,
 }
 
 #[function_component(FamilyPane)]
@@ -287,9 +305,21 @@ pub fn family_pane(props: &FamilyProps) -> Html {
                     requests={props.join_requests.clone()}
                     on_action={props.on_action.clone()}
                 />
+                if props.other_families {
+                    <section class="group" aria-labelledby="family-invitations">
+                        <h3 id="family-invitations">{ t("Invitations") }</h3>
+                        <div class="setting-row">
+                            <button class="link" aria-haspopup="dialog" onclick={set_tool(Tool::Invite)}>{ t("Invite…") }</button>
+                        </div>
+                    </section>
+                }
+                <PendingInvitations
+                    invitations={props.sent_invitations.clone()}
+                    on_action={props.on_action.clone()}
+                />
                 <Reports reports={props.reports.clone()} on_action={props.on_action.clone()} />
                 <JoinPolicy family={family.clone()} on_action={props.on_action.clone()} />
-                if let Some(ceiling) = props.account.max_family_members {
+                if let Some(ceiling) = cap_ceiling(family, &props.account) {
                     <MemberLimit
                         family={family.clone()}
                         {count}
@@ -382,8 +412,13 @@ pub fn family_pane(props: &FamilyProps) -> Html {
                                 <div class="menu-backdrop" onclick={set_tool(Tool::Nothing)} aria-hidden="true"></div>
                                 <div class="menu" role="menu" onkeydown={menu_keys.clone()}>
                                     <button role="menuitem" onclick={set_tool(Tool::Birthday(id))}>{ t("Birthday…") }</button>
-                                    if removable {
+                                    // Not where the server says it will not
+                                    // work: a member also in a family this
+                                    // owner does not own.
+                                    if removable && member.password_reset != Some(false) {
                                         <button role="menuitem" onclick={set_tool(Tool::Password(id))}>{ t("Reset Password…") }</button>
+                                    }
+                                    if removable {
                                         <button role="menuitem" class="danger" onclick={set_tool(Tool::Remove(id))}>{ t("Remove from Family") }</button>
                                     }
                                 </div>
@@ -446,6 +481,15 @@ pub fn family_pane(props: &FamilyProps) -> Html {
                 />
             }
         }
+        Tool::Invite => html! {
+            <InviteDialog
+                family={family.name.clone()}
+                invitable={props.invitable.clone()}
+                invited={props.sent_invitations.iter().map(|invitation| invitation.user.id).collect::<HashSet<i64>>()}
+                on_action={props.on_action.clone()}
+                on_close={close_tool.clone()}
+            />
+        },
         Tool::Report(id) => {
             let id = *id;
             let submit = {
@@ -503,6 +547,136 @@ pub fn family_pane(props: &FamilyProps) -> Html {
                 }
             </div>
             { tool_dialog }
+        </section>
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct InviteProps {
+    family: String,
+    invitable: Vec<(i64, String)>,
+    /// Who already has an invitation waiting.
+    invited: HashSet<i64>,
+    on_action: Callback<Action>,
+    on_close: Callback<()>,
+}
+
+/// The owner's picker: the members of their other families who are not in
+/// this one, and nobody else on the server — each a press away from an
+/// invitation, or marked as invited already (docs/protocol.md, "Several
+/// families"). The invited person accepts or declines; until then they are
+/// not in the family.
+#[function_component(InviteDialog)]
+fn invite_dialog(props: &InviteProps) -> Html {
+    let busy = use_state(|| Option::<i64>::None);
+    let error = use_state(|| Option::<String>::None);
+    let close = props.on_close.reform(|_: MouseEvent| ());
+    let rows = props.invitable.iter().map(|(id, name)| {
+        let id = *id;
+        let invited = props.invited.contains(&id);
+        let invite = {
+            let busy = busy.clone();
+            let error = error.clone();
+            let on_action = props.on_action.clone();
+            Callback::from(move |_: MouseEvent| {
+                if busy.is_some() {
+                    return;
+                }
+                busy.set(Some(id));
+                error.set(None);
+                let busy = busy.clone();
+                let error = error.clone();
+                on_action.emit(Action::Invite {
+                    user_id: id,
+                    done: Callback::from(move |failure: Option<ApiError>| {
+                        busy.set(None);
+                        error.set(failure.map(|failure| generic_failure(&failure)));
+                    }),
+                });
+            })
+        };
+        html! {
+            <li key={id.to_string()} class="member-row">
+                <Avatar title={name.clone()} user_id={Some(id)} size={28} />
+                <button
+                    type="button"
+                    class="link invite-row"
+                    disabled={invited || busy.is_some()}
+                    onclick={invite}
+                >
+                    { name.clone() }
+                </button>
+                if invited {
+                    <span class="capsule">{ t("Invited") }</span>
+                }
+            </li>
+        }
+    });
+    html! {
+        <Modal title={fc_text::families::invite_title(&props.family)} on_cancel={props.on_close.clone()} busy={busy.is_some()}>
+            if props.invitable.is_empty() {
+                <p class="dialog-message hint">{ t("Members of your other families who aren't in this one appear here.") }</p>
+            } else {
+                <ul class="members invitable">{ for rows }</ul>
+            }
+            if let Some(message) = (*error).clone() {
+                <p class="error" role="alert">{ message }</p>
+            }
+            <div class="dialog-actions">
+                <button type="button" class="primary" onclick={close}>{ t("Done") }</button>
+            </div>
+        </Modal>
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct PendingInvitationsProps {
+    invitations: Vec<Invitation>,
+    on_action: Callback<Action>,
+}
+
+/// The owner's invitations still waiting on an answer, each withdrawable.
+#[function_component(PendingInvitations)]
+fn pending_invitations(props: &PendingInvitationsProps) -> Html {
+    let error = use_state(|| Option::<String>::None);
+    if props.invitations.is_empty() {
+        return Html::default();
+    }
+    let rows = props.invitations.iter().map(|invitation| {
+        let id = invitation.id;
+        let withdraw = {
+            let error = error.clone();
+            let on_action = props.on_action.clone();
+            Callback::from(move |_: MouseEvent| {
+                error.set(None);
+                let error = error.clone();
+                on_action.emit(Action::WithdrawInvitation {
+                    invitation_id: id,
+                    done: Callback::from(move |failure: Option<ApiError>| {
+                        error.set(failure.map(|failure| generic_failure(&failure)));
+                    }),
+                });
+            })
+        };
+        html! {
+            <li class="member-row" key={id.to_string()}>
+                <Avatar title={invitation.user.display_name.clone()} user_id={Some(invitation.user.id)} version={invitation.user.avatar_version} size={28} />
+                <div class="identity-text">
+                    <strong>{ invitation.user.display_name.clone() }</strong>
+                </div>
+                <span class="row-actions">
+                    <button class="link danger" onclick={withdraw}>{ t("Withdraw Invitation") }</button>
+                </span>
+            </li>
+        }
+    });
+    html! {
+        <section class="group" aria-labelledby="family-pending-invitations">
+            <h3 id="family-pending-invitations">{ t("Pending Invitations") }</h3>
+            <ul class="members">{ for rows }</ul>
+            if let Some(message) = (*error).clone() {
+                <p class="error" role="alert">{ message }</p>
+            }
         </section>
     }
 }
@@ -926,6 +1100,14 @@ struct AssistantProps {
     on_action: Callback<Action>,
 }
 
+/// The most the owner's member cap may be: the family's own
+/// `member_ceiling` — a paid family's is lower — else `GET /me`'s
+/// `max_family_members`, from a server that predates it (docs/protocol.md,
+/// "Paid families"). None when neither is known, and no cap is offered.
+pub fn cap_ceiling(family: &Family, account: &Me) -> Option<i64> {
+    fc_text::paid::member_ceiling(family.member_ceiling, account.max_family_members)
+}
+
 /// The family as a change on its way will leave it — for drawing, while the
 /// answer is out. Turning vision off takes the two switches that ride on it
 /// with it, as the server does in the same write.
@@ -1073,13 +1255,13 @@ fn assistant_settings(props: &AssistantProps) -> Html {
                         }) }
                     </select>
                 </label>
-                <p class="footnote">{ t1("The language %@ answers in when it is asked in the family chat. It is not this app's language — that follows the device. With none chosen, it answers in the language of whoever asked.", &token) }</p>
+                <p class="footnote">{ t1("The language %@ answers in when it is asked in the family chat or a group. It is not this app's language — that follows the device. With none chosen, it answers in the language of whoever asked.", &token) }</p>
                 <label class="setting-row toggle">
                     <span>{ t("Sees recent history") }</span>
                     <input type="checkbox" role="switch" checked={family.ai_history}
                         onchange={switch(|on| FamilyPatch { ai_history: Some(on), ..FamilyPatch::default() })} />
                 </label>
-                <p class="footnote">{ t1("With this on, mentioning %@ in the family chat sends the last month of that chat to the assistant, so it can answer questions about what was said earlier. With it off, only the message that mentions it is sent.", &token) }</p>
+                <p class="footnote">{ t1("With this on, mentioning %@ in the family chat or a group sends the last month of that chat to the assistant, so it can answer questions about what was said earlier. With it off, only the message that mentions it is sent.", &token) }</p>
             </section>
             <section class="group" aria-labelledby="assistant-pictures">
                 <h3 id="assistant-pictures">{ t("Pictures") }</h3>
@@ -1089,7 +1271,7 @@ fn assistant_settings(props: &AssistantProps) -> Html {
                         <input type="checkbox" role="switch" checked={family.ai_vision}
                             onchange={switch(|on| FamilyPatch { ai_vision: Some(on), ..FamilyPatch::default() })} />
                     </label>
-                    <p class="footnote">{ t2("With this on, a photo is sent to the model your server is set up to use when a member attaches it to a question in their own chat with the assistant, attaches it to an %@ message in the family chat, or replies to a photo with %@ — never a photo the assistant was not pointed at, never from an earlier message unless Recent photos is on, and never a video, file or place. With it off, no photo is ever sent.", &token, &token) }</p>
+                    <p class="footnote">{ t2("With this on, a photo is sent to the model your server is set up to use when a member attaches it to a question in their own chat with the assistant, attaches it to an %@ message in the family chat or a group, or replies to a photo with %@ — never a photo the assistant was not pointed at, never from an earlier message unless Recent photos is on, and never a video, file or place. With it off, no photo is ever sent.", &token, &token) }</p>
                 }
                 <label class="setting-row toggle">
                     <span>{ t("Recent photos") }</span>
@@ -1097,7 +1279,7 @@ fn assistant_settings(props: &AssistantProps) -> Html {
                         onchange={switch(|on| FamilyPatch { ai_history_photos: Some(on), ..FamilyPatch::default() })} />
                 </label>
                 <p class="footnote">
-                    { t2("With this on, whenever anyone mentions %@ in the family chat, the most recent photos in that chat — up to %lld, from anyone, that nobody pointed the assistant at — also go to the model your server is set up to use, after any photo on the message itself or on the one it replies to. Nearly every mention then sends pictures, which costs more. It is off unless you turn it on.", &token, &limit.to_string()) }
+                    { t2("With this on, whenever anyone mentions %@ in the family chat or a group, the most recent photos in that chat — up to %lld, from anyone, that nobody pointed the assistant at — also go to the model your server is set up to use, after any photo on the message itself or on the one it replies to. Nearly every mention then sends pictures, which costs more. It is off unless you turn it on.", &token, &limit.to_string()) }
                     if let Some(note) = photos_note {
                         { format!(" {note}") }
                     }
@@ -1108,7 +1290,7 @@ fn assistant_settings(props: &AssistantProps) -> Html {
                         onchange={switch(|on| FamilyPatch { ai_faces: Some(on), ..FamilyPatch::default() })} />
                 </label>
                 <p class="footnote">
-                    { t2("With this on, whenever anyone mentions %@ in the family chat, the profile pictures of the members named in that chat's recent history — up to %lld — also go to the model your server is set up to use, so it can tell who is who. They are the pictures members chose for themselves, not photos anyone attached; never a member who has left, and never anyone outside this family. Most mentions then send pictures, which costs more. It is off unless you turn it on; with it off, no face is ever sent.", &token, &limit.to_string()) }
+                    { t2("With this on, whenever anyone mentions %@ in the family chat or a group, the profile pictures of the members named in that chat's recent history — up to %lld — also go to the model your server is set up to use, so it can tell who is who. They are the pictures members chose for themselves, not photos anyone attached; never a member who has left, and never anyone outside this family. Most mentions then send pictures, which costs more. It is off unless you turn it on; with it off, no face is ever sent.", &token, &limit.to_string()) }
                     if let Some(note) = faces_note {
                         { format!(" {note}") }
                     }
@@ -1507,6 +1689,23 @@ mod tests {
         };
         yew::Renderer::<MemberLimit>::with_root_and_props(root.clone(), props).render();
         (root, sent)
+    }
+
+    /// The cap picker's range is the family's own ceiling — 25 for a paid
+    /// family under an operator's 50 — and the operator's where a server
+    /// predates it.
+    #[wasm_bindgen_test]
+    fn the_caps_range_is_the_familys_ceiling_then_the_servers() {
+        let account = Me {
+            max_family_members: Some(50),
+            ..Me::default()
+        };
+        let mut family = Family::default();
+        assert_eq!(cap_ceiling(&family, &account), Some(50), "from before");
+        family.member_ceiling = Some(25);
+        assert_eq!(cap_ceiling(&family, &account), Some(25), "a paid family");
+        assert_eq!(cap_ceiling(&family, &Me::default()), Some(25));
+        assert_eq!(cap_ceiling(&Family::default(), &Me::default()), None);
     }
 
     fn element(root: &web_sys::Element, css: &str) -> web_sys::HtmlElement {

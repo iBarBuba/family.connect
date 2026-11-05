@@ -8,7 +8,7 @@ namespace FamilyConnect.App.Logic;
 /// One notification to raise: what it says, what it is FOR, and the tag that makes a second one
 /// about the same thing replace the first rather than stack on it.
 /// </summary>
-public sealed record Toast(string Tag, string Title, string Body, long? ChatId = null)
+public sealed record Toast(string Tag, string Title, string Body, long? ChatId = null, long? FamilyId = null)
 {
     /// <summary>Whether this one opens the board rather than a chat.</summary>
     public bool IsBoard => ChatId is null;
@@ -49,7 +49,14 @@ public sealed class NotificationRules(ChatStore chats, IStringCatalog? words = n
     public bool InFront { get; set; }
 
     /// <summary>The family's name, for the title of anything from the family chat or the wall.</summary>
+    /// <remarks>The SHOWN family's — what a title says when the account's list cannot name the family something is from.</remarks>
     public string? FamilyName { get; set; }
+
+    /// <summary>
+    /// Every family the account is in (docs/protocol.md, "Several families"): a family chat's message, or a note, is titled
+    /// with THAT family's name — the one its chat or note belongs to — not the shown one's.
+    /// </summary>
+    public IReadOnlyList<FamilyDto> Families { get; set; } = [];
 
     /// <summary>The assistant's user id, so its answers can be gated with the member they answer.</summary>
     public long? AssistantUserId { get; set; }
@@ -85,10 +92,10 @@ public sealed class NotificationRules(ChatStore chats, IStringCatalog? words = n
         var mentioned = (message.Mentions ?? []).Any(mention => mention.UserId == me);
         return new Toast(
             ChatTag(message.ChatId),
-            NotifyText.Title(
-                chat.Chat.Kind == "family" ? FamilyName : null, NameOf(message.SenderId),
-                mentioned, say),
+            NotifyText.Title(Prefix(chat.Chat), NameOf(message.SenderId), mentioned, say),
             NotifyText.NewMessage(say),
+            // No family: a click opens the chat in the family shown when it lists it, else the first that does
+            // (FamilyRules.FamilyToOpen) — a direct chat may be in several.
             message.ChatId);
     }
 
@@ -108,8 +115,9 @@ public sealed class NotificationRules(ChatStore chats, IStringCatalog? words = n
         }
         return new Toast(
             "board",
-            NotifyText.Title(FamilyName, NameOf(note.AuthorId), mentioned: false, say),
-            NotifyText.NewNote(say));
+            NotifyText.Title(FamilyRules.NameOf(note.FamilyId, Families) ?? FamilyName, NameOf(note.AuthorId), mentioned: false, say),
+            NotifyText.NewNote(say),
+            FamilyId: note.FamilyId);
     }
 
     /// <summary>
@@ -124,6 +132,18 @@ public sealed class NotificationRules(ChatStore chats, IStringCatalog? words = n
     /// </summary>
     public static string ChatTag(long chatId) =>
         string.Create(System.Globalization.CultureInfo.InvariantCulture, $"chat-{chatId}");
+
+    /// <summary>
+    /// What goes before the sender in a title (docs/protocol.md, "Push notifications"): the family's name in the family
+    /// chat, the GROUP's name in a group — "<c>&lt;Group&gt; — &lt;Sender&gt;</c>" — and nothing in a direct chat, whose
+    /// title is the sender alone. A group whose name arrived empty is titled by the sender alone too, rather than " — Anna".
+    /// </summary>
+    private string? Prefix(ChatDto chat) => chat.Kind switch
+    {
+        ChatKinds.Family => FamilyRules.NameOf(chat, Families) ?? FamilyName,
+        ChatKinds.Group => chat.Title is { Length: > 0 } title ? title : null,
+        _ => null,
+    };
 
     /// <summary>Whether anything is worth saying at all.</summary>
     private bool Speaking => Wanted && !InFront;

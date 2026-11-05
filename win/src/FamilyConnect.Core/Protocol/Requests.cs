@@ -29,7 +29,13 @@ public sealed record SendRequest(
     /// Absent otherwise — never <c>false</c> — and never sent to a server whose <c>GET /families/mine</c> does not name
     /// <c>max_round_video_ms</c>, which would ignore it and deliver a square video.
     /// </summary>
-    bool? Round = null);
+    bool? Round = null,
+    /// <summary>
+    /// <c>true</c> sends the message's one video as an ANIMATION — an animated picture made into a silent looping video,
+    /// drawn as a picture that plays by itself (docs/protocol.md, "Animations"). Absent otherwise — never <c>false</c>. No
+    /// discovery key guards it: a server that predates it ignores it and delivers the ordinary video the file still is.
+    /// </summary>
+    bool? Animation = null);
 
 public sealed record PollRequest(string[] Options);
 
@@ -213,10 +219,93 @@ public sealed record MeResponse(
     /// lookup providers, or null until they have — and null on a server with no lookup source (docs/protocol.md,
     /// "Consenting to the assistant", amended 2026-10-03). Absent on an older server, which reads as null: no lookups.
     /// </summary>
-    [property: JsonPropertyName("assistant_lookup_consent_at")] string? AssistantLookupConsentAt = null)
+    [property: JsonPropertyName("assistant_lookup_consent_at")] string? AssistantLookupConsentAt = null,
+    /// <summary>
+    /// Every family the caller is in, the HOME family first and then in the order they were joined, each with its own
+    /// <c>role</c> (docs/protocol.md, "Several families", 2026-10-22). ALWAYS present on a server that knows several
+    /// families, so null is an older server — read through <see cref="AllFamilies"/>, which falls back to <see cref="Family"/>.
+    /// </summary>
+    FamilyDto[]? Families = null,
+    /// <summary>Every join request still waiting, oldest first; null from an older server (<see cref="AllPending"/>).</summary>
+    [property: JsonPropertyName("pending_join_requests")] PendingJoinDto[]? PendingJoinRequests = null,
+    /// <summary>The caller's own pending invitations into other families, oldest first.</summary>
+    InvitationDto[]? Invitations = null,
+    /// <summary>
+    /// The operator's <c>[families] member_families</c>: whether a member may start another family in the app. False is
+    /// what an older server's silence means — it has no such door.
+    /// </summary>
+    [property: JsonPropertyName("member_families_enabled")] bool MemberFamiliesEnabled = false,
+    /// <summary>How many families one account may be in; 0 from an older server, which allows one (<see cref="FamilyCap"/>).</summary>
+    [property: JsonPropertyName("max_families_per_account")] int MaxFamiliesPerAccount = 0,
+    /// <summary>
+    /// Whether this server charges for a NEW family (docs/protocol.md, "Paid families", 2026-10-30). ALWAYS present on a server
+    /// that knows it; absent is an older server, which is <c>false</c> — and with it false nothing about paid families applies.
+    /// </summary>
+    [property: JsonPropertyName("subscriptions_enabled")] bool SubscriptionsEnabled = false,
+    /// <summary>
+    /// The caller's own App Store subscription — the active one, or else the one that ended last — or null. Present only while
+    /// <see cref="SubscriptionsEnabled"/>; this client cannot sell one, and reads it for one thing: whether the caller may start
+    /// a family here (<c>active</c>).
+    /// </summary>
+    SubscriptionDto? Subscription = null,
+    /// <summary>What a paid family gets — each limit present only while the operator has it on. A purchase screen's words.</summary>
+    [property: JsonPropertyName("paid_family_limits")] PaidFamilyLimitsDto? PaidFamilyLimits = null,
+    /// <summary>How many days an unpaid family has before it is deleted (14 by default); 0 when the server did not say.</summary>
+    [property: JsonPropertyName("unpaid_days")] int UnpaidDays = 0)
 {
+    /// <summary>Whether the caller owns the HOME family — what <c>role</c> is about.</summary>
     public bool IsOwner => Role == "owner";
+
+    /// <summary>
+    /// The families, whatever the server's age: <see cref="Families"/> when it is there, and otherwise the one
+    /// <see cref="Family"/> an older server describes, carrying the <see cref="Role"/> that came beside it.
+    /// </summary>
+    public IReadOnlyList<FamilyDto> AllFamilies =>
+        Families ?? (Family is { } home ? [home with { Role = home.Role ?? Role }] : []);
+
+    /// <summary>The waiting join requests, whatever the server's age.</summary>
+    public IReadOnlyList<PendingJoinDto> AllPending =>
+        PendingJoinRequests ?? (PendingJoinRequest is { } pending ? [pending] : []);
+
+    /// <summary>The cap on families per account, never below one.</summary>
+    public int FamilyCap => Math.Max(1, MaxFamiliesPerAccount);
 }
+
+/// <summary>
+/// An account's App Store subscription as the server holds it (docs/protocol.md, "Paid families"). <see cref="ExpiresAt"/> is
+/// when it stops covering anything — the expiry, or Apple's grace-period end when that is later; <see cref="Renews"/> only
+/// when the server knows.
+/// </summary>
+public sealed record SubscriptionDto(
+    [property: JsonPropertyName("product_id")] string? ProductId = null,
+    string? Environment = null,
+    [property: JsonPropertyName("expires_at")] string? ExpiresAt = null,
+    bool Active = false,
+    bool? Renews = null);
+
+/// <summary>A paid family's limits from <c>GET /me</c>, each key present only while the operator has that one on.</summary>
+public sealed record PaidFamilyLimitsDto(
+    int? Members = null,
+    [property: JsonPropertyName("storage_bytes")] long? StorageBytes = null,
+    [property: JsonPropertyName("ai_tokens")] long? AiTokens = null,
+    int? Images = null,
+    [property: JsonPropertyName("transcript_ms")] long? TranscriptMs = null);
+
+/// <summary>
+/// An owner's invitation into their family (docs/protocol.md, "Several families"): pending until the invited person accepts
+/// or declines it. <see cref="User"/> is the invited person.
+/// </summary>
+public sealed record InvitationDto(
+    long Id,
+    [property: JsonPropertyName("family_id")] long FamilyId,
+    [property: JsonPropertyName("family_name")] string FamilyName,
+    [property: JsonPropertyName("invited_by")] UserDto InvitedBy,
+    UserDto User,
+    [property: JsonPropertyName("created_at")] string? CreatedAt = null);
+
+public sealed record InvitationResponse(InvitationDto Invitation);
+
+public sealed record InvitationsResponse(InvitationDto[]? Invitations);
 
 public sealed record PendingJoinDto(
     [property: JsonPropertyName("family_id")] long FamilyId,
@@ -260,7 +349,30 @@ public sealed record FamilyDto(
     /// owner sets them. <c>[]</c> by default; ABSENT on a server that predates them, which reads as none — read through
     /// <c>GreetingWeather.Saved</c>, which treats null and a null inside as nothing.
     /// </summary>
-    [property: JsonPropertyName("greeting_places")] string[]? GreetingPlaces = null);
+    [property: JsonPropertyName("greeting_places")] string[]? GreetingPlaces = null,
+    /// <summary>
+    /// The caller's own role in this family, <c>"owner"</c> or <c>"member"</c> — on each of <c>GET /me</c>'s
+    /// <c>families</c> (docs/protocol.md, "Several families"); absent on every other read of a family.
+    /// </summary>
+    string? Role = null,
+    /// <summary>
+    /// The most members this family may have whatever its owner sets (docs/protocol.md, <c>Family</c>, 2026-10-30): the
+    /// operator's ceiling, or a paid family's lower limit. The owner's cap picker draws its range from it; absent on an older
+    /// server, which falls back to <c>max_family_members</c> on <c>GET /me</c>.
+    /// </summary>
+    [property: JsonPropertyName("member_ceiling")] int? MemberCeiling = null,
+    /// <summary><c>"free"</c> or <c>"paid"</c>, only while the server's subscriptions are on; absent means payment does not apply.</summary>
+    string? Plan = null,
+    /// <summary>
+    /// When the server will DELETE this family, present only while a paid family is not covered by its owner's subscription
+    /// (docs/protocol.md, "Paid families"). Every member's app shows it as a banner; its absence on a read, or on a
+    /// <c>family_plan</c> frame, is the deadline gone.
+    /// </summary>
+    [property: JsonPropertyName("delete_at")] string? DeleteAt = null)
+{
+    /// <summary>Whether the caller owns this family, as <c>GET /me</c>'s <c>families</c> says.</summary>
+    public bool IsOwner => Role == "owner";
+}
 
 /// <summary>
 /// The family as the family screen needs it, with the assistant's capabilities.
@@ -459,12 +571,30 @@ public sealed record MemberResponse(MemberDto Member);
 
 public sealed record ChatResponse(ChatDto Chat);
 
+/// <summary>
+/// What <c>DELETE /chats/{id}/members/{user_id}</c> answers (docs/protocol.md, "Groups"): the group as it now stands when
+/// its admin removed somebody else, and — <see cref="Chat"/> null — nothing at all when the caller LEFT, which is a
+/// <c>204</c> and not "the answer could not be read".
+/// </summary>
+public sealed record GroupMemberAnswer(ChatDto? Chat = null)
+{
+    /// <summary>The caller left: the group is no longer theirs to hold.</summary>
+    public bool Left => Chat is null;
+}
+
 public sealed record UserResponse(UserDto User);
 
 public sealed record InviteCodeResponse(
     [property: JsonPropertyName("invite_code")] string InviteCode);
 
-public sealed record JoinAnswer(string Status)
+/// <param name="Status"><c>joined</c> or <c>pending</c>.</param>
+/// <param name="FamilyId">
+/// The family the code belongs to — joined, or waited on (docs/protocol.md, <c>POST /families/join</c>, 2026-10-22). Absent
+/// from a server that predates several families.
+/// </param>
+public sealed record JoinAnswer(
+    string Status,
+    [property: JsonPropertyName("family_id")] long? FamilyId = null)
 {
     /// <summary>Membership was immediate: the family's policy is <c>open</c>.</summary>
     public bool Joined => Status == "joined";
@@ -538,7 +668,26 @@ public sealed record ReportsResponse(ReportDto[]? Reports);
 public sealed record StatsResponse(
     [property: JsonPropertyName("generated_at")] string? GeneratedAt,
     StatsTotalsDto Totals,
-    StatsMemberDto[]? Members);
+    StatsMemberDto[]? Members,
+    /// <summary>
+    /// What a PAID family has used of its limits, and when the monthly ones start again (docs/protocol.md, "Family statistics",
+    /// amended 2026-10-30). Absent for a free family and on a server with subscriptions off — and then no section is drawn.
+    /// </summary>
+    AllowanceDto? Allowance = null);
+
+/// <summary>
+/// A paid family's allowance: each limit absent when the operator turned that one off. The monthly numbers count from the 1st,
+/// UTC, where the rest of the statistics count everything still here — so the two can differ, and neither is wrong.
+/// </summary>
+public sealed record AllowanceDto(
+    [property: JsonPropertyName("renews_at")] string? RenewsAt = null,
+    [property: JsonPropertyName("storage_bytes")] AllowanceUseDto? StorageBytes = null,
+    [property: JsonPropertyName("ai_tokens")] AllowanceUseDto? AiTokens = null,
+    AllowanceUseDto? Images = null,
+    [property: JsonPropertyName("transcript_ms")] AllowanceUseDto? TranscriptMs = null);
+
+/// <summary>One limit: how much is used, and of how much.</summary>
+public sealed record AllowanceUseDto(long Used = 0, long Limit = 0);
 
 public sealed record StatsTotalsDto(
     int Members,

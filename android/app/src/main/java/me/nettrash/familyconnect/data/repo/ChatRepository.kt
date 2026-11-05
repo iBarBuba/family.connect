@@ -14,14 +14,18 @@
  *                  the request was in flight are
  *                  added back on top, but only the ones newer than the
  *                  `last_message` the response carries — the rest the
- *                  server had already counted. A direct chat the
+ *                  server had already counted. A chat of ANY kind the
  *                  response does NOT list is pruned — see below.
- *   deleteDirectChat
- *                — the one way a chat leaves this device, reached from
- *                  the two paths a vanished chat is learned about: the
- *                  `member_deleted` frame (immediate) and the prune in
- *                  refreshChats (the repair for a device that was
- *                  offline when it happened).
+ *   applyChat    — a group as the server now describes it, off the
+ *                  `chat_updated` frame or a group endpoint's answer
+ *                  (docs/protocol.md, "Groups").
+ *   deleteChat   — the one way a chat leaves this device, reached from
+ *                  every path a vanished chat is learned about: the
+ *                  `member_deleted` and `chat_removed` frames
+ *                  (immediate), a group this person left or deleted
+ *                  (GroupRepository), and the prune in refreshChats (the
+ *                  repair for a device that was offline when it
+ *                  happened).
  *   openChatId   — which chat the user is looking at right now, and
  *                  whether its newest message is actually on screen; the
  *                  message pipeline consults both to decide whether an
@@ -56,11 +60,15 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import me.nettrash.familyconnect.data.db.ChatDao
 import me.nettrash.familyconnect.data.db.ChatEntity
+import me.nettrash.familyconnect.data.db.GroupMembersCodec
 import me.nettrash.familyconnect.data.db.MessageDao
 import me.nettrash.familyconnect.data.net.ApiResult
 import me.nettrash.familyconnect.data.net.ChatApi
+import me.nettrash.familyconnect.data.net.dto.ChatDto
 import me.nettrash.familyconnect.data.net.ws.ChatSocket
 import me.nettrash.familyconnect.data.net.ws.ClientFrame
 import me.nettrash.familyconnect.data.net.ws.ServerFrame
@@ -68,6 +76,7 @@ import me.nettrash.familyconnect.data.settings.SettingsRepository
 import me.nettrash.familyconnect.data.net.ws.SocketState
 import me.nettrash.familyconnect.data.push.UnreadNotifications
 import me.nettrash.familyconnect.di.AppScope
+import me.nettrash.familyconnect.util.GroupRules
 import me.nettrash.familyconnect.util.TimeFormat
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
@@ -99,6 +108,12 @@ class ChatRepository @Inject constructor(
      */
     private val settings: SettingsRepository,
     @param:AppScope private val scope: CoroutineScope,
+    /**
+     * The voice messages parked in a chat, which go when the chat does
+     * ([deleteChat]). Defaulted so the tests can build this by hand; Dagger
+     * ignores the default and injects ParkedRecordings (AppModule).
+     */
+    private val chatDrafts: ChatDrafts = ChatDrafts { },
 ) {
     /** The device's words for the chat-list previews (MessageRepository.PreviewLabels). */
     private val previewLabels by lazy { MessageRepository.Companion.PreviewLabels.from(appContext) }
@@ -193,6 +208,18 @@ class ChatRepository @Inject constructor(
      */
     private val liveMentionIds = ConcurrentHashMap<Long, MutableSet<Long>>()
 
+    /**
+     * Serialises the two writers of a chat's `family_ids` that race each
+     * other on a departure — [applyChat] off this repository's collector and
+     * [dropFamily] off FamilyRepository's — so neither decides on a row the
+     * other is halfway through changing. Each reads, decides and writes; an
+     * interleaving would let [dropFamily] narrow a chat [applyChat] had just
+     * moved, from the copy it read before the move. Above the `init` for
+     * the reason the ledgers are: the collector may call [applyChat] on its
+     * first dispatch.
+     */
+    private val familyListing = Mutex()
+
     // Declared AFTER the state it touches: the collector body may run on
     // the very first dispatch after construction, and a lambda reading a
     // property whose initializer has not run yet sees null.
@@ -213,10 +240,21 @@ class ChatRepository @Inject constructor(
                 // Keyed on the member, never on the frame's family: a
                 // peer this account only ever shared a direct chat with
                 // may be in another family altogether, or in none.
-                if (frame is ServerFrame.MemberDeleted) {
-                    for (chatId in chatDao.directChatIdsWith(frame.member.id)) {
-                        deleteDirectChat(chatId)
-                    }
+                when (frame) {
+                    is ServerFrame.MemberDeleted ->
+                        for (chatId in chatDao.directChatIdsWith(frame.member.id)) {
+                            deleteChat(chatId)
+                        }
+                    // A group created, renamed, or its members or admin
+                    // changed — the frame a member just added learns of it
+                    // by (docs/protocol.md, "Groups").
+                    is ServerFrame.ChatUpdated -> applyChat(frame.chat)
+                    // Left, removed from, or deleted: gone from every path
+                    // this person can reach it by. A screen showing it
+                    // leaves on its own (ChatScreen's "the chat itself
+                    // goes").
+                    is ServerFrame.ChatRemoved -> deleteChat(frame.chatId)
+                    else -> Unit
                 }
             }
         }
@@ -252,12 +290,13 @@ class ChatRepository @Inject constructor(
         val idsAtRequest = liveUnreadIds.mapValues { it.value.toSet() }
         val mentionIdsAtRequest = liveMentionIds.mapValues { it.value.toSet() }
         // Snapshotted before the await for the same reason, and it is the
-        // prune's whole safety margin: a direct chat this device started
+        // prune's whole safety margin: a direct chat this device started —
+        // or a group it created, or was added to by a `chat_updated` —
         // WHILE the request was in flight cannot be in a response the
         // server computed before it existed, and pruning it would delete
         // the conversation the user is at that moment typing into.
         // Only chats that were already here when we asked are candidates.
-        val directAtRequest = chatDao.directChatIds()
+        val heldAtRequest = chatDao.allChatIds()
         return when (val result = chatApi.chats()) {
             is ApiResult.Ok -> {
                 val merged = result.value.chats.map { item ->
@@ -336,15 +375,28 @@ class ChatRepository @Inject constructor(
                         maxReactionSeq = existing?.maxReactionSeq ?: 0L,
                         maxEditSeq = existing?.maxEditSeq ?: 0L,
                         maxPollSeq = existing?.maxPollSeq ?: 0L,
+                        // A group's members and admin are the server's, like
+                        // its title — overwritten, never merged.
+                        memberIdsJson = GroupMembersCodec.encode(item.chat.memberIds),
+                        adminUserId = item.chat.adminUserId,
+                        // Which families list it — the server's too
+                        // (docs/protocol.md, "Several families"). Absent from
+                        // a server from before, and then left unsaid.
+                        familyIdsJson = GroupMembersCodec.encode(item.chat.familyIds),
                     )
                 }
                 chatDao.upsertAll(merged)
-                // Anything DIRECT the server no longer lists is gone, so
-                // it goes here too — the repair that heals a device which
-                // was offline when the peer deleted their account and
-                // never saw the frame. Without it the row sits in the
-                // list under the peer's OLD name and answers 404 to
-                // everything.
+                // Anything the server no longer lists is gone, so it goes
+                // here too — the repair that heals a device which was
+                // offline when the peer deleted their account, or when a
+                // group was left, removed from or deleted, and never saw
+                // the frame. Without it the row sits in the list under its
+                // OLD name and answers 404 to everything. Every kind, since
+                // groups (docs/protocol.md, resync step 2): "a client drops
+                // every chat that leaves `GET /chats`, of any kind" — the
+                // family chat and the assistant's thread cannot leave it
+                // while this client can still ask, so for them the rule
+                // never fires.
                 //
                 // Only on a response that actually came back, and `GET
                 // /chats` has no cursor and no pages: one 200 is the
@@ -354,8 +406,8 @@ class ChatRepository @Inject constructor(
                 // deletes nothing — a flaky connection must never wipe
                 // somebody's history.
                 val listed = result.value.chats.mapTo(HashSet()) { it.chat.id }
-                for (chatId in directAtRequest) {
-                    if (chatId !in listed) deleteDirectChat(chatId)
+                for (chatId in heldAtRequest) {
+                    if (chatId !in listed) deleteChat(chatId)
                 }
                 // The cross-device half of the badge. A chat the SERVER
                 // says has nothing unread has been read by this person —
@@ -389,26 +441,6 @@ class ChatRepository @Inject constructor(
     }
 
     /**
-     * Drop one direct chat and everything this device keeps about it.
-     *
-     * The ONE way a chat leaves this device, shared by both halves of the
-     * repair — the `member_deleted` frame above and the prune in
-     * [refreshChats] — so the two can never disagree about what "gone"
-     * means. Deliberately takes a chat id that has already been proved
-     * direct: the family chat and the assistant chat cannot disappear
-     * server-side, so nothing may ever delete them here.
-     *
-     * Messages first, then the row: the reverse order would leave, for an
-     * instant, a chat list with no row to hang the messages off and a
-     * screen that could re-open an empty chat. Everything else keyed by
-     * chat id lives ON the row — the unread badge, both read markers and
-     * the three catch-up cursors — so it goes with it. The live-unread
-     * ledger is the only piece held in memory rather than in Room, and it
-     * is dropped here too; drafts are in the ViewModel and die with the
-     * screen, and an attachment is cached under its own id, never a
-     * chat's.
-     */
-    /**
      * Remove the direct chat with one person from THIS device.
      *
      * "For the blocker that chat is not merely unlisted; it is gone from
@@ -429,7 +461,7 @@ class ChatRepository @Inject constructor(
      */
     suspend fun removeDirectChatsWith(userId: Long) {
         for (chatId in chatDao.directChatIdsWith(userId)) {
-            deleteDirectChat(chatId)
+            deleteChat(chatId)
         }
     }
 
@@ -454,11 +486,140 @@ class ChatRepository @Inject constructor(
         }
     }
 
-    private suspend fun deleteDirectChat(chatId: Long) {
+    /**
+     * Drop one chat and everything this device keeps about it.
+     *
+     * The ONE way a chat leaves this device, shared by every path that
+     * learns of it — the `member_deleted` and `chat_removed` frames above,
+     * a group this person left or deleted (GroupRepository) and the prune
+     * in [refreshChats] — so they can never disagree about what "gone"
+     * means.
+     *
+     * Messages first, then the row: the reverse order would leave, for an
+     * instant, a chat list with no row to hang the messages off and a
+     * screen that could re-open an empty chat. Everything else keyed by
+     * chat id lives ON the row — the unread badge, both read markers and
+     * the three catch-up cursors — so it goes with it. The live-unread
+     * ledger is the only piece held in memory rather than in Room, and it
+     * is dropped here too; the voice messages parked in the chat go
+     * through [chatDrafts]; the composer's draft is in the ViewModel and
+     * dies with the screen, which leaves when its chat goes; and an
+     * attachment is cached under its own id, never a chat's.
+     */
+    suspend fun deleteChat(chatId: Long) {
         messageDao.deleteByChat(chatId)
         chatDao.deleteById(chatId)
         liveUnreadIds.remove(chatId)
         liveMentionIds.remove(chatId)
+        chatDrafts.forgetChat(chatId)
+    }
+
+    /**
+     * This account is out of [familyId] (docs/protocol.md, "Several
+     * families"): that family's chats go — its family chat, its groups, its
+     * `ai` chat. A chat that never said its families (a server from before)
+     * was the one family's, and goes.
+     *
+     * A DIRECT chat that names its families is narrowed, never deleted
+     * here — even when nothing in [remainingFamilyIds] lists it any more.
+     * Direct chats are the pair's, and what a departure does to each is the
+     * server's call, sent to the leaver as a `chat_updated` for every one it
+     * touches: narrowed to the families the two still share, moved onto
+     * another family of the leaver (a chat they held after the other side
+     * had gone, docs/protocol.md "Several families"), or `[]` — gone for
+     * this side, which [applyChat] deletes. That frame is sent BEFORE
+     * `member_left`, but the two are consumed by different collectors
+     * (this repository's and FamilyRepository's), so either may run first.
+     * Deleting here when the local copy names no remaining family made the
+     * outcome depend on that race: run first, it took a chat about to be
+     * moved — row, messages, read marker — and the `chat_updated` that
+     * followed found nothing to move. Narrowed instead, the row stays, in
+     * no family this device shows, until the frame says where it lives or
+     * that it is gone; whichever order they run in, the result is the same.
+     * A frame that never arrives (the socket down for the leave) leaves the
+     * row to [refreshChats], whose prune drops what the server no longer
+     * lists and whose upsert re-lists what it does. So [remainingFamilyIds]
+     * no longer decides anything here; it stays because it is the per-family
+     * store's contract (FamilyLocalData), which hands it to every half.
+     */
+    suspend fun dropFamily(familyId: Long, remainingFamilyIds: Set<Long>) = familyListing.withLock {
+        for (chat in chatDao.allChats()) {
+            val ids = chat.familyIds
+            if (ids != null && familyId !in ids) continue
+            if (chat.kind == "direct" && ids != null) {
+                // Still listed in a family in [remainingFamilyIds], or in
+                // none until its `chat_updated` decides — see above.
+                chatDao.setFamilyIds(chat.id, GroupMembersCodec.encode(ids.filter { it != familyId }))
+            } else {
+                deleteChat(chat.id)
+            }
+        }
+    }
+
+    /**
+     * Store a GROUP as the server now describes it — the `chat_updated`
+     * frame, or the answer to a group endpoint (docs/protocol.md,
+     * "Groups").
+     *
+     * A state-set over the row: the title, the member list and the admin
+     * are the server's and replace what was here; everything else on the
+     * row — the preview, the count, both read markers, the three cursors —
+     * is this device's and survives. A group first seen here (created
+     * elsewhere, or this person just added to it) starts with nothing
+     * unread, which is what the server set its marker to, and the next
+     * `GET /chats` brings its preview.
+     *
+     * Since several families `chat_updated` also REPLACES a chat of any
+     * other kind whose `family_ids` changed — a direct chat whose two people
+     * stopped, or started, sharing a family (docs/protocol.md, "Several
+     * families"). A row of another kind this device does not hold is still
+     * `GET /chats`'s to write: it brings the preview and the count with it.
+     *
+     * A DIRECT chat whose `family_ids` arrive EMPTY is gone for this side —
+     * "gone for the one who left (`family_ids: []`)" — and goes, through
+     * [deleteChat]. It used to be kept with an empty list, listed nowhere
+     * and holding its messages until the next `GET /chats` pruned it, which
+     * left a departure's result depending on whether this frame or the
+     * `member_left` after it ran first (see [dropFamily]).
+     */
+    suspend fun applyChat(dto: ChatDto): ChatEntity? = familyListing.withLock {
+        val existing = chatDao.getById(dto.id)
+        if (!GroupRules.isGroup(dto.kind)) {
+            when {
+                existing == null -> null
+                dto.kind == "direct" && dto.familyIds?.isEmpty() == true -> {
+                    deleteChat(dto.id)
+                    null
+                }
+                else -> existing.copy(
+                    title = dto.title,
+                    familyIdsJson = dto.familyIds?.let(GroupMembersCodec::encode) ?: existing.familyIdsJson,
+                ).also { chatDao.upsertAll(listOf(it)) }
+            }
+        } else {
+            val entity = existing?.copy(
+                title = dto.title,
+                memberIdsJson = GroupMembersCodec.encode(dto.memberIds),
+                adminUserId = dto.adminUserId,
+                familyIdsJson = dto.familyIds?.let(GroupMembersCodec::encode) ?: existing.familyIdsJson,
+            ) ?: ChatEntity(
+                id = dto.id,
+                kind = dto.kind,
+                peerUserId = dto.peerUserId,
+                title = dto.title,
+                unreadCount = 0,
+                myLastReadId = null,
+                peerLastReadId = null,
+                lastMessageBody = null,
+                lastMessageAt = null,
+                lastMessageSenderId = null,
+                memberIdsJson = GroupMembersCodec.encode(dto.memberIds),
+                adminUserId = dto.adminUserId,
+                familyIdsJson = GroupMembersCodec.encode(dto.familyIds),
+            )
+            chatDao.upsertAll(listOf(entity))
+            entity
+        }
     }
 
     /** POST /chats/direct — get-or-create, idempotent server-side. */
@@ -466,7 +627,13 @@ class ChatRepository @Inject constructor(
         when (val result = chatApi.createDirect(userId)) {
             is ApiResult.Ok -> {
                 val dto = result.value.chat
-                val entity = chatDao.getById(dto.id) ?: ChatEntity(
+                // A row already held keeps everything that is this device's,
+                // but is listed where the answer says: [dropFamily] can leave
+                // one listed nowhere until its `chat_updated` lands, and a
+                // chat opened again before that must show in the list.
+                val entity = chatDao.getById(dto.id)?.let { held ->
+                    held.copy(familyIdsJson = dto.familyIds?.let(GroupMembersCodec::encode) ?: held.familyIdsJson)
+                } ?: ChatEntity(
                     id = dto.id,
                     kind = dto.kind,
                     peerUserId = dto.peerUserId,
@@ -477,6 +644,8 @@ class ChatRepository @Inject constructor(
                     lastMessageBody = null,
                     lastMessageAt = null,
                     lastMessageSenderId = null,
+                    // Listed in every family the two share.
+                    familyIdsJson = GroupMembersCodec.encode(dto.familyIds),
                 )
                 chatDao.upsertAll(listOf(entity))
                 ApiResult.Ok(entity)

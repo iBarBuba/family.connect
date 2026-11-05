@@ -10,6 +10,9 @@
 //!   table splits a body), exactly as Apple's Foundation renders it.
 //! - [`emoji`] — which messages are "emoji only" and how big they draw, the
 //!   quick reaction set, and the "More reactions…" catalogue.
+//! - [`emoji_typing`] — emoji as you type (#101): `:-)` and Telegram's other
+//!   emoticons, and `:name:` shortcodes, become emoji the moment they are
+//!   typed; a Backspace straight after takes one back.
 //! - [`reactions`] — a message's reactions as chips and as "See who reacted".
 //! - [`mentions`] — `@Name`: the composer's trigger and suggestions, who a
 //!   text names at send, and which tokens an incoming body highlights.
@@ -27,6 +30,12 @@
 //! - [`media_plan`] — what a picked video or sound file becomes before it is
 //!   uploaded: kept, or transcoded to the protocol's profile and to exactly
 //!   which numbers — the rules every port is held to by the oracle's vectors.
+//! - [`animation`] — an animated GIF, WebP or PNG sent as a silent looping
+//!   video (#96): which frame shows when on the 30-a-second grid, the size
+//!   and the bitrate, held to the oracle's vectors like `media_plan`.
+//! - [`animation_source`] — what an animated GIF, WebP or PNG states about
+//!   itself (its canvas, each frame's delay), read from its bytes for the
+//!   plan; and the test for which message is drawn as an animation.
 //! - [`wav`] — a voice note as WAV, for browsers that cannot record MP4.
 //! - [`account`] — usernames, passwords, names, invite codes, birthdays, the
 //!   family's languages and the owner's member cap, by the server's rules.
@@ -54,9 +63,24 @@
 //! - [`transcript_sound`] — the sound a device sends for that text when the
 //!   server's stored copy will not do (a video, Ogg, an oversized file):
 //!   AAC copied where it fits, re-encoded to 64 kbit/s mono where not.
+//! - [`sound_mix`] — a video's sound tracks mixed into one for its
+//!   transcode (#98, Rule E): summed and clamped, each at its own place in
+//!   time, resampled to the highest rate among them.
 //! - [`lookups`] — the assistant looking things up (#72): which providers a
 //!   client names and how, what the consent screen asks, and where the
 //!   server's sources footer starts under an answer.
+//! - [`groups`] — groups inside a family (#107): what a chat of each kind
+//!   offers (a group is the family chat less calls and "seen"), who in a
+//!   group may rename, add, remove, delete and leave, the name's bounds, and
+//!   what each refusal is told as.
+//! - [`families`] — one account in several families (#88): which family
+//!   is shown, which chats are listed in it, when the switcher is drawn,
+//!   when "New Family…" and "Join Another Family…" are offered, and what
+//!   each new refusal is told as.
+//! - [`paid`] — families a server hosts for a subscription (#89): whether
+//!   this account may start one here, the banner over a family that will be
+//!   deleted, Family Statistics' allowance rows, and what each new refusal is
+//!   told as, for a client that cannot sell the subscription.
 //! - [`greeting_places`] — the places the owner names for today's weather
 //!   in the daily greeting (#72): when the field is offered, and what a name
 //!   may be, by the server's own rules.
@@ -71,6 +95,8 @@
 //!   draws them as bars — held to every port by the oracle's vectors.
 
 pub mod account;
+pub mod animation;
+pub mod animation_source;
 pub mod assistant;
 pub mod assistant_consent;
 pub mod assistant_pictures;
@@ -81,8 +107,11 @@ pub mod calendar;
 pub mod call_record;
 pub mod composer;
 pub mod emoji;
+pub mod emoji_typing;
 pub mod excerpt;
+pub mod families;
 pub mod greeting_places;
+pub mod groups;
 pub mod i18n;
 pub mod links;
 pub mod lookups;
@@ -95,8 +124,10 @@ pub mod mp4;
 pub mod mp4_read;
 pub mod notify;
 pub mod pack;
+pub mod paid;
 pub mod reactions;
 pub mod record;
+pub mod sound_mix;
 pub mod transcode;
 pub mod transcript;
 pub mod transcript_sound;

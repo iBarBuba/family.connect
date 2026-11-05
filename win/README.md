@@ -32,6 +32,8 @@ win/
                 AppSession — which screen the app is on, and the three ways a session ends
                 LiveConnection — the socket, the resync, the outbox and the router under one policy
                 ChatList — the rows, their order, and the one line under each name
+                Groups — ChatKinds (what the family chat shares with a group), GroupRules (who may rename, add, remove,
+                                delete and leave; the name; whom the lists offer), GroupText, GroupModel (#107)
                 Conversation — one open chat: the window, paging back, the read marker, typing
                 Board — the wall: the stickers on it, the badge over it, the writes that change it
                 Pack — the family's CHAT stickers: the panel, who may remove what, add, remove, send
@@ -42,8 +44,16 @@ win/
                 TranscodeAttempts — the order a transcode is asked for in, and what ends the asking
                 FrameTurn — a frame of a transcode beside the same frame of its source
                 Faststart — an MP4's index moved in front of its media data
+                AnimationTiming, AnimatedPictures, AnimationFrames, AnimationMp4 — an animated GIF, WebP or PNG as the
+                                protocol's silent looping video (#96): the plan (fc_text::animation's vectors), the three
+                                formats taken apart (a GIF decoded here, APNG and WebP frames cut into standalone stills),
+                                one compositor, BT.709 NV12, and the MP4's sample table made exact on the 1/30 s grid
                 AttachmentCache — downloaded bytes, kept, with the preview rule in ONE place
                 Family — the door, the owner's console, and the numbers everybody may see
+                Families — one account in several families (#88): which chats a family lists, the switcher's rows,
+                                the doors to another family, invitations and the owner's "Invite…"
+                PaidFamilies — a server that charges for a new family (#89): the create doors, the cap's ceiling, the unpaid
+                                banner, the statistics' allowance, the dates they name and the two refusals
                 Notifications — when this client speaks up, and what it says when it does
                 Avatars — what a picture must be before it is sent, and a cache keyed by VERSION
                 StartupSetting — what the "start when I sign in" row shows, and who may change it
@@ -62,10 +72,11 @@ win/
                           Attention, TrayIcon, GlobalHotKey + HotKeySetting (Ctrl+Alt+Shift+F),
                           StartupLaunch (the manifest's startup task),
                           ShareInbox, WindowPlacement, WebViewCallMedia, VoiceRecorder,
-                          MediaPreparing, LocationFinder, StickerImaging, KeepAwake (the
+                          MediaPreparing + AnimationPreparing (an animation's frames into Media Foundation through a
+                          MediaStreamSource), LocationFinder, StickerImaging, KeepAwake (the
                           screen on while recording), SessionWatch (lock, screen saver, sleep),
                           ScreenReader (whether one runs, so the microphone waits for it),
-                          VideoMessageRecorder + RoundVideoSetting (a video message's camera, switched off),
+                          VideoMessageRecorder + RoundVideoSetting (a video message's camera),
                           RoundFramePlayer (a received circle's frame-server player) + RoundCrashMark
                           (a build that died playing one in place opens the viewer)
                 Views/    ServerView, SignInView, DoorView, PendingView, OfflineView, ChatsView,
@@ -251,6 +262,19 @@ when the ceiling moves. `Seats` keeps both and answers what is actually left. An
 two dependent switches (`ai_history_photos`, `ai_faces`) are never offered, never sent and never
 drawn as on while `ai_vision` is off — the server refuses that combination and clears them in the
 same write.
+
+**A server may charge for a new family, and this client cannot sell one** (docs/protocol.md, "Paid families"; issue #89;
+`PaidFamilies`). With `subscriptions_enabled` on `GET /me` false or absent nothing changes. With it true, "Create a Family" on the
+family gate and "New Family…" need the account's `subscription.active`: without it the gate draws "On this server, a new family is
+started in the Family Connect app on iPhone, iPad or Mac." where the form was, and "New Family…" stays and says the same in a
+dialog; a door the operator shut keeps priority and stays as it was, and "Join a Family" is untouched. While the family shown has
+a `delete_at`, an InfoBar over its chat list says the day it will be deleted — to the owner where to renew, to a member which
+member owns it (no banner until the roster names them) — and a `family_plan` frame puts it on, or takes it off, the family it
+names. The owner's cap picker takes its range from `member_ceiling`. A paid family's statistics gain "This Month's Allowance".
+`storage_allowance_used` fails an upload for good and the row says why; `ai_error`'s `"allowance_used"` and the REST code
+`ai_allowance_used` say when the month renews. A deadline is the reader's own day in their zone; a renewal is its UTC calendar
+day, always the 1st (docs/protocol.md, "UTC calendar day"; `PaidFamilies.RenewalDay`) — both with the year only when it is not
+this year (`PaidFamilies.Day`).
 
 **The statistics' rows do not add up to the totals, and the gap is the block.** The totals are the
 family's numbers; the rows are what this caller may see of them. Nothing here sums the rows.
@@ -526,8 +550,9 @@ receive a circle from a phone or the web and check:
 - **Memory**: play a minute-long circle three times and watch Task Manager — the frames are surfaces outside .NET's heap,
   given back when it stops, ends or scrolls away.
 
-**Recording a video message is built and switched off** (docs/audio-video-messages-2026-10-04.md, Phase 3d; Blocked 1,
-Decision 28). `RoundVideoRules.RecordingEnabled` is `false`, and while it is, no build draws a way in: no video button in
+**Recording a video message is built and switched on** (2026-10-21, ahead of trials T1–T3 below;
+docs/audio-video-messages-2026-10-04.md, Phase 3d; Blocked 1, Decision 28). `RoundVideoRules.RecordingEnabled` is `true`;
+set to `false`, no build draws a way in: no video button in
 the empty field, no "Record Video Message" in the paperclip's menu or the microphone's, no "Press Shift+F10 for a video
 message." hint for Narrator — and nothing enumerates or opens a camera. A build that can only RECEIVE circles shows no way
 of recording one (Decision 40). Behind the switch is the whole recorder: the video button (Segoe E714 inside the empty
@@ -556,9 +581,9 @@ clip asks "Delete video message?" in `OnClosing`, and Keep cancels the close. Th
 `max_round_video_ms` and `max_round_video_bytes` on `GET /families/mine` (`RoundVideoLimits`, carried by the pass into the
 session) and a camera on the machine.
 
-**To switch it on**, set `RecordingEnabled = true` in `src/FamilyConnect.App.Logic/RoundVideoRules.cs`, build, and run the
-trials on the ARM64 machine (`RoundVideoRulesTests.RecordingIsSwitchedOffUntilTheTrials` fails while it is on, on
-purpose: flip that assertion too when the trials pass and the switch is meant to ship). Then:
+**The trials.** The switch (`RecordingEnabled` in `src/FamilyConnect.App.Logic/RoundVideoRules.cs`) is on; run these on
+the ARM64 machine, and if one fails set it back to `false` (`RoundVideoRulesTests.RecordingIsSwitchedOn` then fails, on
+purpose: flip that assertion too):
 
 - **T1 — the picture and the microphone.** Open the recorder (the video button in an empty field) on the built-in webcam
   and on any USB one: the circle shows the live picture, mirrored, within a second or two ("Starting camera…" then "Not
@@ -826,6 +851,35 @@ cp win/tests/FamilyConnect.Core.Tests/Fixtures/waveform-vectors.json android/app
 
 JSON has no NaN or infinity, so a peak that is one is written as the string `"NaN"`, `"Infinity"`
 or `"-Infinity"`; every other number is the shortest decimal that round-trips.
+
+A sixth, `emoji-typing-vectors.json`, is `fc_text::emoji_typing` — emoji as you type (issue #101,
+docs/emoji-as-you-type-2026-10-18.md): the emoticon table, and keys typed into a field with what the
+field then holds (`⌫` is a Backspace, `→` drops the live swap). Every port implements all of it — on
+Windows in App.Logic, whose test project links the file from Core.Tests' fixtures — and it travels
+like the three above:
+
+```bash
+cd win/tools/board-oracle
+cargo run --quiet -- emoji-typing > ../../tests/FamilyConnect.Core.Tests/Fixtures/emoji-typing-vectors.json
+cd ../../..
+cp win/tests/FamilyConnect.Core.Tests/Fixtures/emoji-typing-vectors.json ios/FamilyConnectTests/Fixtures/
+cp win/tests/FamilyConnect.Core.Tests/Fixtures/emoji-typing-vectors.json android/app/src/test/resources/
+```
+
+A seventh, `animation-plan-vectors.json`, is `fc_text::animation` — an animated GIF, WebP or PNG sent
+in a chat as a silent looping video (issue #96, docs/protocol.md "Animations"): each format's frame
+delay, the shortest-frame rule, and the plan — which source frame shows on each tick of the
+30-a-second grid, the size and the bitrate. Every port's encoder follows it; on Windows the plan
+lives in App.Logic, whose test project links the file from Core.Tests' fixtures. It travels like the
+four above:
+
+```bash
+cd win/tools/board-oracle
+cargo run --quiet -- animation-plan > ../../tests/FamilyConnect.Core.Tests/Fixtures/animation-plan-vectors.json
+cd ../../..
+cp win/tests/FamilyConnect.Core.Tests/Fixtures/animation-plan-vectors.json ios/FamilyConnectTests/Fixtures/
+cp win/tests/FamilyConnect.Core.Tests/Fixtures/animation-plan-vectors.json android/app/src/test/resources/
+```
 
 Four implementations of one rule need an oracle, not four readings. This repo has been bitten by a
 byte-versus-character split that panicked on Cyrillic, and the portfolio by four ports that agreed

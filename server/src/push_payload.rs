@@ -79,6 +79,11 @@ pub enum PushEvent {
     Message {
         chat_id: i64,
         message_id: i64,
+        /// The family a tap opens the app in — a family chat's, a group's
+        /// or an `ai` chat's own; `None` for a direct chat, which belongs to
+        /// the pair (docs/protocol.md, "Several families"). On the wire only
+        /// when present, so every payload pinned before it is unchanged.
+        family_id: Option<i64>,
     },
     /// A note added to the family board. Creation only — moves and edits
     /// never push (protocol.md, "Board").
@@ -98,6 +103,37 @@ pub enum PushEvent {
     Report {
         family_id: i64,
     },
+    /// An owner invited the recipient into their family (docs/protocol.md,
+    /// "Several families").
+    Invitation {
+        family_id: i64,
+        invitation_id: i64,
+    },
+    /// A paid family's deadline: it stopped being covered, it is deleted
+    /// tomorrow, or it was deleted (docs/protocol.md, "Paid families").
+    FamilyPlan {
+        family_id: i64,
+        stage: PlanStage,
+    },
+}
+
+/// Which moment of a paid family's deadline a push announces — `stage` on
+/// the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStage {
+    Unpaid,
+    Tomorrow,
+    Deleted,
+}
+
+impl PlanStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanStage::Unpaid => "unpaid",
+            PlanStage::Tomorrow => "tomorrow",
+            PlanStage::Deleted => "deleted",
+        }
+    }
 }
 
 impl PushEvent {
@@ -109,6 +145,8 @@ impl PushEvent {
             PushEvent::JoinRequest { .. } => "join_request",
             PushEvent::Joined { .. } => "joined",
             PushEvent::Report { .. } => "report",
+            PushEvent::Invitation { .. } => "invitation",
+            PushEvent::FamilyPlan { .. } => "family_plan",
         }
     }
 
@@ -121,9 +159,11 @@ impl PushEvent {
             // All board notes collapse into one entry: several notes pinned
             // at once is one thing to look at, not five alerts.
             PushEvent::BoardNote { family_id, .. } => Some(format!("board-{family_id}")),
-            PushEvent::JoinRequest { .. } | PushEvent::Joined { .. } | PushEvent::Report { .. } => {
-                None
-            }
+            PushEvent::JoinRequest { .. }
+            | PushEvent::Joined { .. }
+            | PushEvent::Report { .. }
+            | PushEvent::Invitation { .. }
+            | PushEvent::FamilyPlan { .. } => None,
         }
     }
 }
@@ -165,13 +205,32 @@ impl Notification {
             match note.event {
                 PushEvent::Message { .. } => note.body = Text::say("New message", &[]),
                 PushEvent::BoardNote { .. } => note.body = Text::say("New note", &[]),
-                // A report, a join request and a join carry no family text to withhold.
+                // A report, a join request, a join, an invitation and a
+                // deadline carry no family text to withhold.
                 PushEvent::JoinRequest { .. }
                 | PushEvent::Joined { .. }
-                | PushEvent::Report { .. } => {}
+                | PushEvent::Report { .. }
+                | PushEvent::Invitation { .. }
+                | PushEvent::FamilyPlan { .. } => {}
             }
         }
         note
+    }
+
+    /// The same notification, naming the family a tap should open the app
+    /// in — for a message push only, and only when there is one
+    /// (docs/protocol.md, "Several families"). A builder rather than one
+    /// more argument to every composer: the composers and their golden
+    /// tests stay exactly what they were, and the family is the caller's,
+    /// which is where the chat's row was read.
+    pub fn in_family(mut self, family_id: Option<i64>) -> Self {
+        if let PushEvent::Message {
+            family_id: slot, ..
+        } = &mut self.event
+        {
+            *slot = family_id;
+        }
+        self
     }
 }
 
@@ -209,6 +268,12 @@ fn attachment_summary(message: &Message) -> Option<Text> {
             // somebody chose, "Video message" says somebody is talking to
             // you (protocol.md, "Video messages").
             "video" if attachment.round => Text::say("Video message", &[]),
+            // And an animation is a video on the wire and a "GIF" on a lock
+            // screen — the word every messenger uses, the same in every
+            // language, and the one its tile is labelled with (protocol.md,
+            // "Animations"; issue #96). A caption, when it has one, is the
+            // message's words and wins before this is asked.
+            "video" if attachment.animation => Text::say("GIF", &[]),
             "video" => Text::say("Video", &[]),
             // A voice note has no name worth showing, so the kind is the
             // summary; a track picked off a disk may carry one, and that
@@ -260,6 +325,8 @@ fn attachment_summary(message: &Message) -> Option<Text> {
     )
 }
 
+/// `family_name` is the name a title puts before the sender: the family's in
+/// the family chat, the GROUP's in a group (protocol.md, "Groups").
 pub fn message_notification(
     include_message_body: bool,
     chat_kind: &str,
@@ -269,7 +336,7 @@ pub fn message_notification(
     badge: i64,
     chat_unread: i64,
 ) -> Notification {
-    let title = Text::Verbatim(if chat_kind == "family" {
+    let title = Text::Verbatim(if chat_kind == "family" || chat_kind == "group" {
         format!("{family_name} — {sender_name}")
     } else {
         sender_name.to_string()
@@ -294,15 +361,17 @@ pub fn message_notification(
         event: PushEvent::Message {
             chat_id: message.chat_id,
             message_id: message.id,
+            family_id: None,
         },
     }
 }
 
 /// The message push for a member the message NAMES: the same push, a
-/// different title — `"<Family> — <Sender> mentioned you"` — and never a
-/// second one (protocol.md, "Mentioning a member"). Family chat only, which
-/// is the only chat a mention is accepted in, so the direct-chat title rule
-/// has no mention form.
+/// different title — `"<Family> — <Sender> mentioned you"`, or the group's
+/// name in a group — and never a second one (protocol.md, "Mentioning a
+/// member"). The family chat and groups are the only chats a mention is
+/// accepted in, so the direct-chat title rule has no mention form; both
+/// read `family_name` as the name before the sender.
 pub fn mention_notification(
     include_message_body: bool,
     family_name: &str,
@@ -427,6 +496,71 @@ pub fn joined_notification(family_name: &str, family_id: i64, badge: i64) -> Not
     }
 }
 
+/// The invited person's alert: title = the family's name, body =
+/// `"<Owner> invited you"` in the device's language (docs/protocol.md,
+/// "Several families").
+pub fn invitation_notification(
+    family_name: &str,
+    owner_display_name: &str,
+    family_id: i64,
+    invitation_id: i64,
+    badge: i64,
+) -> Notification {
+    Notification {
+        title: Text::Verbatim(family_name.to_string()),
+        body: Text::say("%@ invited you", &[owner_display_name]),
+        badge,
+        chat_unread: None,
+        event: PushEvent::Invitation {
+            family_id,
+            invitation_id,
+        },
+    }
+}
+
+/// A paid family's deadline, to one member: the family's name over the
+/// server's own sentence, the OWNER's words for the owner, because the owner
+/// is the one person who can renew (docs/protocol.md, "Paid families"). No
+/// date and no number in it: the banner in the app carries the date, in the
+/// reader's own calendar.
+pub fn family_plan_notification(
+    family_name: &str,
+    family_id: i64,
+    stage: PlanStage,
+    to_owner: bool,
+    badge: i64,
+) -> Notification {
+    let body = match (stage, to_owner) {
+        (PlanStage::Unpaid, false) => Text::say(
+            "This family's subscription has ended. It will be deleted unless it is renewed.",
+            &[],
+        ),
+        (PlanStage::Unpaid, true) => Text::say(
+            "Your subscription has ended. Renew it, or this family will be deleted.",
+            &[],
+        ),
+        (PlanStage::Tomorrow, false) => Text::say(
+            "This family will be deleted tomorrow unless its subscription is renewed.",
+            &[],
+        ),
+        (PlanStage::Tomorrow, true) => Text::say(
+            "This family will be deleted tomorrow. Renew your subscription to keep it.",
+            &[],
+        ),
+        (PlanStage::Deleted, _) => Text::say(
+            "This family was deleted because its subscription ended.",
+            &[],
+        ),
+    };
+    Notification {
+        title: Text::Verbatim(family_name.to_string()),
+        body,
+        badge,
+        chat_unread: None,
+        event: PushEvent::FamilyPlan { family_id, stage },
+    }
+}
+
 /// The APNs request body, exactly as protocol.md specifies it: the `aps`
 /// dictionary plus top-level `kind` and the event's ids — its words in `language`, the one the
 /// device registered (docs/protocol.md, "The words of a push").
@@ -444,9 +578,24 @@ pub fn apns_payload(note: &Notification, language: Option<&str>) -> Value {
         PushEvent::Message {
             chat_id,
             message_id,
+            family_id,
         } => {
             payload["chat_id"] = json!(chat_id);
             payload["message_id"] = json!(message_id);
+            if let Some(family_id) = family_id {
+                payload["family_id"] = json!(family_id);
+            }
+        }
+        PushEvent::Invitation {
+            family_id,
+            invitation_id,
+        } => {
+            payload["family_id"] = json!(family_id);
+            payload["invitation_id"] = json!(invitation_id);
+        }
+        PushEvent::FamilyPlan { family_id, stage } => {
+            payload["family_id"] = json!(family_id);
+            payload["stage"] = json!(stage.as_str());
         }
         PushEvent::BoardNote { family_id, note_id } => {
             payload["family_id"] = json!(family_id);
@@ -472,9 +621,24 @@ pub fn fcm_message(note: &Notification, push_token: &str, language: Option<&str>
         PushEvent::Message {
             chat_id,
             message_id,
+            family_id,
         } => {
             data["chat_id"] = json!(chat_id.to_string());
             data["message_id"] = json!(message_id.to_string());
+            if let Some(family_id) = family_id {
+                data["family_id"] = json!(family_id.to_string());
+            }
+        }
+        PushEvent::Invitation {
+            family_id,
+            invitation_id,
+        } => {
+            data["family_id"] = json!(family_id.to_string());
+            data["invitation_id"] = json!(invitation_id.to_string());
+        }
+        PushEvent::FamilyPlan { family_id, stage } => {
+            data["family_id"] = json!(family_id.to_string());
+            data["stage"] = json!(stage.as_str());
         }
         PushEvent::BoardNote { family_id, note_id } => {
             data["family_id"] = json!(family_id.to_string());
@@ -786,6 +950,17 @@ mod tests {
         assert_eq!(hidden.title, "The Smiths — Anna mentioned you");
     }
 
+    /// A group titles its pushes as the family chat does, with the group's
+    /// name where the family's would be (protocol.md, "Groups").
+    #[test]
+    fn a_group_push_is_titled_with_the_group_s_name() {
+        let message = protocol_message();
+        let note = message_notification(true, "group", "Cousins", "Anna", &message, 3, 1);
+        assert_eq!(note.title, "Cousins — Anna");
+        let direct = message_notification(true, "direct", "Cousins", "Anna", &message, 3, 1);
+        assert_eq!(direct.title, "Anna");
+    }
+
     #[test]
     fn the_apns_message_payload_matches_the_protocol_example_exactly() {
         let note = message_notification(
@@ -997,6 +1172,7 @@ mod tests {
                     accuracy_m: None,
                     sticker: false,
                     round: false,
+                    animation: false,
                     waveform: None,
                 }),
                 ..protocol_message()
@@ -1104,6 +1280,7 @@ mod tests {
                 accuracy_m: None,
                 sticker: false,
                 round: false,
+                animation: false,
                 waveform: None,
             }
         }
@@ -1228,6 +1405,88 @@ mod tests {
         );
     }
 
+    /// A message push from a family chat, group or `ai` chat names its
+    /// family; a direct chat's names none (docs/protocol.md, "Several
+    /// families"). A string on FCM like every other id.
+    #[test]
+    fn a_message_push_names_its_family_only_when_it_has_one() {
+        let note =
+            message_notification(true, "family", "Smiths", "Anna", &protocol_message(), 1, 1)
+                .in_family(Some(3));
+        let apns = apns_payload(&note, None);
+        assert_eq!(apns["family_id"], 3);
+        let fcm = fcm_message(&note, "tok", None);
+        assert_eq!(fcm["message"]["data"]["family_id"], "3");
+
+        let direct =
+            message_notification(true, "direct", "Smiths", "Anna", &protocol_message(), 1, 1)
+                .in_family(None);
+        assert!(apns_payload(&direct, None).get("family_id").is_none());
+        assert!(
+            fcm_message(&direct, "tok", None)["message"]["data"]
+                .get("family_id")
+                .is_none()
+        );
+    }
+
+    /// A paid family's deadline: the family's name, the owner's words for the
+    /// owner, `kind: "family_plan"` with the family and the stage, on both
+    /// transports — and FCM's as strings.
+    #[test]
+    fn the_family_plan_push_carries_its_family_and_stage() {
+        let member = family_plan_notification("Ivanovs", 3, PlanStage::Unpaid, false, 0);
+        let owner = family_plan_notification("Ivanovs", 3, PlanStage::Unpaid, true, 0);
+        assert_eq!(member.title, "Ivanovs");
+        assert_eq!(
+            member.body,
+            "This family's subscription has ended. It will be deleted unless it is renewed."
+        );
+        assert_eq!(
+            owner.body,
+            "Your subscription has ended. Renew it, or this family will be deleted."
+        );
+        let apns = apns_payload(&owner, None);
+        assert_eq!(apns["kind"], "family_plan");
+        assert_eq!(apns["family_id"], 3);
+        assert_eq!(apns["stage"], "unpaid");
+        let tomorrow = family_plan_notification("Ivanovs", 3, PlanStage::Tomorrow, false, 0);
+        let fcm = fcm_message(&tomorrow, "token", Some("ru"));
+        assert_eq!(fcm["message"]["data"]["family_id"], "3");
+        assert_eq!(fcm["message"]["data"]["stage"], "tomorrow");
+        assert_eq!(
+            fcm["message"]["notification"]["body"],
+            "Если подписку не продлить, эта семья будет удалена завтра."
+        );
+        let deleted = family_plan_notification("Ivanovs", 3, PlanStage::Deleted, true, 0);
+        assert_eq!(
+            deleted.body,
+            "This family was deleted because its subscription ended."
+        );
+        assert_eq!(apns_payload(&deleted, None)["stage"], "deleted");
+    }
+
+    /// The invitation push: the family's name over `"<Owner> invited you"`,
+    /// in the device's language, with both ids (docs/protocol.md, "Several
+    /// families").
+    #[test]
+    fn the_invitation_push_carries_its_family_and_invitation() {
+        let note = invitation_notification("Ivanovs", "Anna", 3, 4, 2);
+        let apns = apns_payload(&note, None);
+        assert_eq!(apns["kind"], "invitation");
+        assert_eq!(apns["family_id"], 3);
+        assert_eq!(apns["invitation_id"], 4);
+        assert_eq!(apns["aps"]["alert"]["title"], "Ivanovs");
+        assert_eq!(apns["aps"]["alert"]["body"], "Anna invited you");
+        assert!(apns["aps"].get("thread-id").is_none());
+        let fcm = fcm_message(&note, "tok", Some("ru"));
+        assert_eq!(fcm["message"]["data"]["invitation_id"], "4");
+        assert_eq!(fcm["message"]["data"]["family_id"], "3");
+        assert_eq!(
+            fcm["message"]["notification"]["body"],
+            "Anna приглашает тебя"
+        );
+    }
+
     #[test]
     fn fcm_data_values_are_strings_for_every_event_kind() {
         let joined = fcm_message(&joined_notification("The Smiths", 7, 0), "t", None);
@@ -1335,6 +1594,7 @@ mod tests {
                 accuracy_m: None,
                 sticker,
                 round: false,
+                animation: false,
                 waveform: None,
             }
         }
@@ -1431,6 +1691,7 @@ mod tests {
                 accuracy_m: None,
                 sticker: false,
                 round,
+                animation: false,
                 waveform: None,
             }
         }
@@ -1523,6 +1784,7 @@ mod tests {
                 accuracy_m: None,
                 sticker: false,
                 round,
+                animation: false,
                 waveform: None,
             }
         }
@@ -1573,6 +1835,92 @@ mod tests {
             "",
             "Anna",
             &carrying(vec![video(91, true)]),
+            1,
+            1,
+        );
+        assert_eq!(hidden.body, "New message");
+    }
+
+    /// An animation is a video on the wire and a "GIF" on a lock screen
+    /// (protocol.md, "Animations"; issue #96): the flag changes what one
+    /// video is CALLED — in every language the same word — nothing about
+    /// how several are counted, nothing about a caption, which is the
+    /// message's own words, and nothing about the operator's switch.
+    #[test]
+    fn an_animation_is_called_a_gif() {
+        fn video(id: i64, animation: bool) -> crate::models::Attachment {
+            crate::models::Attachment {
+                id,
+                kind: "video".to_string(),
+                mime: "video/mp4".to_string(),
+                size: 182_330,
+                width: Some(480),
+                height: Some(270),
+                duration_ms: Some(2_100),
+                has_preview: true,
+                name: None,
+                latitude: None,
+                longitude: None,
+                accuracy_m: None,
+                sticker: false,
+                round: false,
+                animation,
+                waveform: None,
+            }
+        }
+        fn carrying(videos: Vec<crate::models::Attachment>) -> Message {
+            Message {
+                body: String::new(),
+                attachment: videos.first().cloned(),
+                attachments: Some(videos),
+                ..protocol_message()
+            }
+        }
+        let gif = attachment_summary(&carrying(vec![video(93, true)])).expect("a summary");
+        assert_eq!(gif.render(None), "GIF");
+        for language in ["de", "es", "fr", "ja", "ru", "sr", "sr-Latn", "zh-Hans"] {
+            assert_eq!(gif.render(Some(language)), "GIF", "{language}");
+        }
+        // The same MP4 sent as an ordinary video is still a video.
+        assert_eq!(
+            attachment_summary(&carrying(vec![video(93, false)]))
+                .map(|text| text.render(None))
+                .as_deref(),
+            Some("Video")
+        );
+        // Two videos are counted as videos, whatever either says — the
+        // server never sends that shape, and the word is for ONE.
+        assert_eq!(
+            attachment_summary(&carrying(vec![video(93, true), video(94, false)]))
+                .map(|text| text.render(None))
+                .as_deref(),
+            Some("2 Videos")
+        );
+        // An animation may carry a caption, and a caption is what pushes.
+        let captioned = Message {
+            body: "when the pizza arrives".to_string(),
+            ..carrying(vec![video(93, true)])
+        };
+        let note = message_notification(true, "direct", "", "Anna", &captioned, 1, 1);
+        assert_eq!(note.body, "when the pizza arrives");
+        // The word is what a caption-less one pushes; the operator's switch
+        // still withholds it.
+        let shown = message_notification(
+            true,
+            "family",
+            "The Smiths",
+            "Anna",
+            &carrying(vec![video(93, true)]),
+            1,
+            1,
+        );
+        assert_eq!(shown.body, "GIF");
+        let hidden = message_notification(
+            false,
+            "family",
+            "The Smiths",
+            "Anna",
+            &carrying(vec![video(93, true)]),
             1,
             1,
         );

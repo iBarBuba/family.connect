@@ -14,6 +14,8 @@ use sqlx::postgres::PgRow;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::keyring::{KeyError, Keyring, SealedRow};
+
 /// `User` object: the public identity of an account.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct User {
@@ -37,18 +39,18 @@ pub struct User {
 
 impl User {
     /// Map a row exposing `id, username, display_name, created_at,
-    /// avatar_version, birthday_month, birthday_day`, and optionally
-    /// `deleted_at`.
-    pub fn from_row(row: &PgRow) -> Self {
-        Self {
+    /// avatar_version, birthday`, and optionally `deleted_at`. The three
+    /// sealed columns are opened with `keys` (#59).
+    pub fn from_row(row: &PgRow, keys: &Keyring) -> Result<Self, KeyError> {
+        Ok(Self {
             id: row.get("id"),
-            username: row.get("username"),
-            display_name: row.get("display_name"),
+            username: row.text(keys, "username")?,
+            display_name: row.text(keys, "display_name")?,
             created_at: row.get("created_at"),
             avatar_version: row.get("avatar_version"),
-            birthday: Birthday::from_row(row),
+            birthday: Birthday::from_row(row, keys)?,
             deleted: deleted_from_row(row),
-        }
+        })
     }
 }
 
@@ -86,8 +88,10 @@ pub fn deleted_from_row(row: &PgRow) -> bool {
 /// database enforces the same equivalence (migration 0018), so this type
 /// is the only shape either side can produce.
 ///
-/// `i16` because the columns are `SMALLINT`; the range is the validator's
-/// business and the constraint's, not the type's.
+/// Stored as ONE sealed value of two bytes, month then day (#59, migration
+/// 0059), so half a birthday cannot be written at all. The range is the
+/// validator's business; `i16` is what the wire and the validator have
+/// always spoken.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Birthday {
     pub month: i16,
@@ -95,19 +99,39 @@ pub struct Birthday {
 }
 
 impl Birthday {
-    /// Read `birthday_month`/`birthday_day` from a row, as the one or the
-    /// none they always are together.
+    /// Read the sealed `birthday` column from a row: absent when NULL.
     ///
-    /// Both columns must be in the SELECT: `.get` panics on a name the
-    /// query did not ask for, which is the loud failure this crate wants
-    /// when a column list and a DTO drift apart.
-    pub fn from_row(row: &PgRow) -> Option<Self> {
-        let month: Option<i16> = row.get("birthday_month");
-        let day: Option<i16> = row.get("birthday_day");
-        match (month, day) {
-            (Some(month), Some(day)) => Some(Self { month, day }),
-            // Half a birthday cannot be written (migration 0018), so this
-            // arm is only ever reached by "nobody set one".
+    /// The column must be in the SELECT: `.get` panics on a name the query
+    /// did not ask for, which is the loud failure this crate wants when a
+    /// column list and a DTO drift apart.
+    pub fn from_row(row: &PgRow, keys: &Keyring) -> Result<Option<Self>, KeyError> {
+        Self::from_column(row, keys, "birthday")
+    }
+
+    /// The same, from a column of another name (a joined user's).
+    pub fn from_column(
+        row: &PgRow,
+        keys: &Keyring,
+        column: &str,
+    ) -> Result<Option<Self>, KeyError> {
+        Ok(row
+            .opened_opt(keys, column)?
+            .and_then(|plain| Self::from_plain(&plain)))
+    }
+
+    /// The two bytes a birthday is sealed as.
+    pub fn plain(self) -> [u8; 2] {
+        [self.month as u8, self.day as u8]
+    }
+
+    /// A birthday from the two bytes it was sealed as; anything else is no
+    /// birthday at all.
+    pub fn from_plain(plain: &[u8]) -> Option<Self> {
+        match plain {
+            [month, day] => Some(Self {
+                month: i16::from(*month),
+                day: i16::from(*day),
+            }),
             _ => None,
         }
     }
@@ -152,6 +176,17 @@ pub struct Member {
     /// carries `"deleted": false`.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub deleted: bool,
+    /// Whether the READER may reset this member's password — present only in
+    /// the OWNER's read of their own family's roster, and absent everywhere
+    /// else, the frames included (docs/protocol.md, "Several families").
+    ///
+    /// True exactly when the owner owns EVERY family this member is in: a
+    /// reset signs the member out of every device and so hands over the whole
+    /// account, every family and every direct chat with it (decision D7). A
+    /// boolean and not a list, so the owner learns WHETHER they may and never
+    /// WHICH other families anybody is in.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub password_reset: Option<bool>,
 }
 
 /// `Family` object. `invite_code` is present when (and only when) the caller
@@ -306,6 +341,27 @@ pub struct Family {
     /// so an object written before it existed still reads.
     #[serde(default)]
     pub greeting_places: Vec<String>,
+
+    /// The most members this family may have whatever its owner sets: the
+    /// operator's `max_family_members`, or a paid family's lower ceiling
+    /// (protocol.md, "Paid families"). ALWAYS present; a cap picker draws its
+    /// range from it. `default` on the way in, for objects from before it.
+    #[serde(default)]
+    pub member_ceiling: i64,
+
+    /// `"free"` or `"paid"` — present only while the server's subscriptions
+    /// are on, because with them off payment does not apply to anybody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+
+    /// When the server will delete this PAID family, present only while its
+    /// owner's subscription does not cover it (protocol.md, "Paid families").
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub delete_at: Option<OffsetDateTime>,
 }
 
 /// What a member says the ASSISTANT got wrong (docs/protocol.md, "Reporting
@@ -420,16 +476,38 @@ pub struct JoinRequest {
     pub created_at: OffsetDateTime,
 }
 
-/// `Chat` object. `title` is denormalized server-side (family name or peer
-/// display name) so clients never join locally; `peer_user_id` is `null`
-/// for the family chat, per the protocol example.
+/// `Chat` object. `title` is denormalized server-side (family name, peer
+/// display name, the assistant's name, or a group's own name) so clients
+/// never join locally; `peer_user_id` is `null` for every kind but direct,
+/// per the protocol example.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Chat {
     pub id: i64,
-    /// `"family"` or `"direct"`.
+    /// `"family"`, `"direct"`, `"ai"` or `"group"`.
     pub kind: String,
     pub title: String,
     pub peer_user_id: Option<i64>,
+    /// A group's members, in the order they joined — present only for a
+    /// group (protocol.md, "Groups").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_ids: Option<Vec<i64>>,
+    /// A group's admin — present only for a group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_user_id: Option<i64>,
+    /// Which families the chat is listed in (docs/protocol.md, "Several
+    /// families"): exactly one for a family chat, a group and an `ai` chat;
+    /// for a direct chat every family the two people share, ascending. A
+    /// client shows in its current family exactly the chats naming it.
+    ///
+    /// ALWAYS present, `[]` included — the one list on this object where
+    /// absence may not mean "empty": an absent `family_ids` is how a client
+    /// knows the server predates several families and that the chat belongs
+    /// to the one family the account has. `[]` is a direct chat whose pair
+    /// shares no family any more, which a client therefore shows in none of
+    /// them: closed, exactly as leaving a family always closed it, until
+    /// the two share one again.
+    #[serde(default)]
+    pub family_ids: Vec<i64>,
 }
 
 /// One user's reaction on a message (protocol.md `Reaction`).
@@ -728,29 +806,32 @@ impl ReplyTo {
 impl Message {
     /// Map a row exposing `id, chat_id, sender_id, client_msg_id, body,
     /// created_at`. Reaction fields start `None`; the paths that expose
-    /// them (`get_messages`) enrich afterwards.
+    /// them (`get_messages`) enrich afterwards. The bodies — the message's
+    /// and the quoted ones — are sealed (#59) and opened with `keys`.
     ///
     /// The reply snippet is read with `try_get` from the joined columns
     /// `reply_to_message_id` / `reply_sender_id` / `reply_body`, so the
     /// SAME mapper serves both the narrow SELECTs (chat-list previews,
     /// which carry no quote) and the joined one in `get_messages`. All
-    /// three must be present and non-NULL for a snippet to appear.
-    pub fn from_row(row: &PgRow) -> Self {
+    /// three must be present and non-NULL for a snippet to appear. Only a
+    /// column that is ABSENT reads as no quote: one that is there but will
+    /// not open is an error, never a quote quietly dropped.
+    pub fn from_row(row: &PgRow, keys: &Keyring) -> Result<Self, KeyError> {
         let reply_to = match (
             row.try_get::<Option<i64>, _>("reply_to_message_id"),
             row.try_get::<Option<i64>, _>("reply_sender_id"),
-            row.try_get::<Option<String>, _>("reply_body"),
+            quoted_body(row, keys, "reply_body")?,
         ) {
-            (Ok(Some(message_id)), Ok(Some(sender_id)), Ok(Some(body))) => {
+            (Ok(Some(message_id)), Ok(Some(sender_id)), Some(body)) => {
                 // The second level, under the same all-three-or-nothing
                 // rule. A narrow SELECT that does not join it simply has no
                 // such columns, and `try_get` reports that as absent.
                 let parent = match (
                     row.try_get::<Option<i64>, _>("reply_parent_message_id"),
                     row.try_get::<Option<i64>, _>("reply_parent_sender_id"),
-                    row.try_get::<Option<String>, _>("reply_parent_body"),
+                    quoted_body(row, keys, "reply_parent_body")?,
                 ) {
-                    (Ok(Some(pid)), Ok(Some(psender)), Ok(Some(pbody))) => {
+                    (Ok(Some(pid)), Ok(Some(psender)), Some(pbody)) => {
                         Some(QuotedParent::new(pid, psender, &pbody))
                     }
                     _ => None,
@@ -785,12 +866,12 @@ impl Message {
             Ok(count) if count > 0 => Some(count),
             _ => None,
         };
-        Self {
+        Ok(Self {
             id: row.get("id"),
             chat_id: row.get("chat_id"),
             sender_id: row.get("sender_id"),
             client_msg_id: row.get("client_msg_id"),
-            body: row.get("body"),
+            body: row.text(keys, "body")?,
             created_at: row.get("created_at"),
             reactions: None,
             reaction_seq,
@@ -807,7 +888,20 @@ impl Message {
             poll: None,
             call: None,
             mentions: None,
-        }
+        })
+    }
+}
+
+/// A quoted message's body off a joined row: `None` when the SELECT has no
+/// such column or the quote is NULL, the opened text otherwise.
+fn quoted_body(row: &PgRow, keys: &Keyring, column: &str) -> Result<Option<String>, KeyError> {
+    match row.try_get::<Option<Vec<u8>>, _>(column) {
+        Ok(Some(sealed)) => keys
+            .open_text(&sealed)
+            .map(Some)
+            .map_err(|err| err.in_column(column)),
+        Ok(None) | Err(sqlx::Error::ColumnNotFound(_)) => Ok(None),
+        Err(err) => Err(KeyError::Db(err)),
     }
 }
 
@@ -928,6 +1022,17 @@ pub struct Attachment {
     /// that is not a video (0052's two CHECKs).
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub round: bool,
+    /// True when (and only when) the message carrying this video was sent
+    /// as an ANIMATION (docs/protocol.md, "Animations"; issue #96) — an
+    /// animated GIF, WebP or PNG the sender turned into a silent looping
+    /// H.264 MP4, drawn as a picture that moves. Absent on the wire
+    /// otherwise, exactly as `sticker` and `round` are: an ordinary video
+    /// never carries `"animation": false`, and a client that does not know
+    /// the flag plays the video it still is. Never true on anything that is
+    /// not a video, never beside `sticker`, never beside `round` (0055's
+    /// three CHECKs).
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub animation: bool,
     /// Audio only, and only when the uploader sent one: the recording's
     /// shape as 48 levels of 0..15, one lowercase hex digit each
     /// (docs/protocol.md, "A voice note's waveform"). The sender computes
@@ -1044,6 +1149,40 @@ impl Attachment {
             && self.size as u64 <= max_bytes as u64
     }
 
+    /// An animation's one media type (docs/protocol.md, "Animations";
+    /// issue #96): the profile's container, which every client plays the
+    /// same way.
+    pub const ANIMATION_MIME: &'static str = "video/mp4";
+    /// The largest SHORT side an animation may DECLARE: the media profile's
+    /// own ceiling, to which the sender scales the picture's canvas. Unlike
+    /// a video message's, the long side is free — an animation keeps its
+    /// picture's shape.
+    pub const ANIMATION_MAX_SHORT_SIDE: i32 = 720;
+
+    /// Whether this CLAIMED upload may be sent as an animation
+    /// (docs/protocol.md, "Animations", check 4): a `kind=video` of
+    /// `video/mp4`; a declared width and height of at least 1, the shorter
+    /// of them at most 720; a declared length of at least 1 ms. All of it is
+    /// the sender's DECLARATION — this server never decodes a video — and
+    /// anything missing is a no, because a tile is laid out at its shape
+    /// before a byte arrives.
+    ///
+    /// No byte ceiling here, on purpose: an animation is held only to
+    /// `max_attachment_bytes`, which the upload already enforced, so there
+    /// is nothing left for the send to ask about its size.
+    pub fn fits_animation(&self) -> bool {
+        let shape_ok = match (self.width, self.height) {
+            (Some(width), Some(height)) => {
+                width >= 1 && height >= 1 && width.min(height) <= Self::ANIMATION_MAX_SHORT_SIDE
+            }
+            _ => false,
+        };
+        self.kind == Self::KIND_VIDEO
+            && self.mime == Self::ANIMATION_MIME
+            && shape_ok
+            && self.duration_ms.is_some_and(|ms| ms >= 1)
+    }
+
     pub fn kind_for(mime: &str) -> Option<&'static str> {
         Self::ACCEPTED
             .iter()
@@ -1079,8 +1218,10 @@ impl Attachment {
         }
     }
 
-    pub fn from_row(row: &PgRow) -> Self {
-        Self {
+    /// The name, the coordinates and the waveform are sealed (#59) under
+    /// the key of whatever holds the attachment, and opened with `keys`.
+    pub fn from_row(row: &PgRow, keys: &Keyring) -> Result<Self, KeyError> {
+        Ok(Self {
             id: row.get("id"),
             kind: row.get("kind"),
             mime: row.get("mime"),
@@ -1089,13 +1230,14 @@ impl Attachment {
             height: row.get("height"),
             duration_ms: row.get("duration_ms"),
             has_preview: row.get("has_preview"),
-            name: row.get("name"),
-            // `try_get` rather than `get`: these three arrived last and a
-            // narrow SELECT that forgets them must degrade to "not a
-            // location" rather than panic inside a handler, which surfaces
-            // as a dropped connection with no error body.
-            latitude: row.try_get("latitude").unwrap_or_default(),
-            longitude: row.try_get("longitude").unwrap_or_default(),
+            name: row.text_opt(keys, "name")?,
+            // A narrow SELECT that does not ask for these must degrade to
+            // "not a location" rather than panic inside a handler, which
+            // surfaces as a dropped connection with no error body — and,
+            // since they are sealed, ONLY a column that is absent degrades:
+            // one that is there and will not open is an error.
+            latitude: sealed_f64(row, keys, "latitude")?,
+            longitude: sealed_f64(row, keys, "longitude")?,
             accuracy_m: row.try_get("accuracy_m").unwrap_or_default(),
             // The same forgiveness, and for a better reason still: most
             // SELECTs have no business with this column — a note's picture
@@ -1105,12 +1247,37 @@ impl Attachment {
             // has no business with it — a note's picture, a pack item's —
             // reads false rather than failing.
             round: row.try_get("round").unwrap_or_default(),
+            // And for the animation's flag (0055), the same way and for the
+            // same reason (issue #96).
+            animation: row.try_get("animation").unwrap_or_default(),
             // And for the waveform (0053): only audio has one, and a SELECT
             // that never asked for it — a note's picture, a pack item's, the
             // assistant's history — reads "none" rather than failing.
-            waveform: row.try_get("waveform").unwrap_or_default(),
-        }
+            waveform: row
+                .opened_if_selected(keys, "waveform")?
+                .map(String::from_utf8)
+                .transpose()
+                .map_err(|_| KeyError::Malformed {
+                    column: Some("waveform".to_string()),
+                    key_id: 0,
+                })?,
+        })
     }
+}
+
+/// A sealed coordinate: eight big-endian bytes, as `float8send` writes them
+/// (migration 0059) and as `f64::to_be_bytes` does.
+fn sealed_f64(row: &PgRow, keys: &Keyring, column: &str) -> Result<Option<f64>, KeyError> {
+    row.opened_if_selected(keys, column)?
+        .map(|plain| {
+            <[u8; 8]>::try_from(plain.as_slice())
+                .map(f64::from_be_bytes)
+                .map_err(|_| KeyError::Malformed {
+                    column: Some(column.to_string()),
+                    key_id: 0,
+                })
+        })
+        .transpose()
 }
 
 /// One sticker of a family's pack (docs/protocol.md, "Sticker pack").
@@ -1145,6 +1312,14 @@ pub struct PackItem {
     /// item never carries `"deleted": false`.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub deleted: bool,
+    /// Whose pack this item is in (docs/protocol.md, "Several families") —
+    /// on every item a server since 2026-10-22 sends, tombstones included,
+    /// because a client holding several families' packs has to know which
+    /// one a `pack_item` frame is for. Read with `try_get`, like
+    /// `deleted_at` on a user: a SELECT that does not name the column reads
+    /// as absent rather than panicking inside a handler.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub family_id: Option<i64>,
 }
 
 impl PackItem {
@@ -1157,12 +1332,13 @@ impl PackItem {
     /// of something that no longer exists would be a small leak for no
     /// reader. The picture is attached by the caller, which knows whether
     /// it is reading one item or a page of them.
-    pub fn from_row(row: &PgRow) -> Self {
+    /// The label is sealed under the family's key (#59).
+    pub fn from_row(row: &PgRow, keys: &Keyring) -> Result<Self, KeyError> {
         let deleted = row
             .get::<Option<time::OffsetDateTime>, _>("deleted_at")
             .is_some();
         if deleted {
-            return Self {
+            return Ok(Self {
                 id: row.get("id"),
                 added_by: None,
                 label: None,
@@ -1170,17 +1346,19 @@ impl PackItem {
                 created_at: None,
                 pack_seq: row.get("pack_seq"),
                 deleted: true,
-            };
+                family_id: row.try_get("family_id").ok(),
+            });
         }
-        Self {
+        Ok(Self {
             id: row.get("id"),
             added_by: Some(row.get("added_by")),
-            label: row.get("label"),
+            label: row.text_opt(keys, "label")?,
             attachment: None,
             created_at: Some(row.get("created_at")),
             pack_seq: row.get("pack_seq"),
             deleted: false,
-        }
+            family_id: row.try_get("family_id").ok(),
+        })
     }
 }
 
@@ -1280,6 +1458,12 @@ pub struct Note {
     /// note never carries `"deleted": false`.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub deleted: bool,
+    /// Whose board the note is on (docs/protocol.md, "Several families") —
+    /// on every note, tombstones included, so a client holding several
+    /// boards knows which one a `board_note` frame is for. `try_get`, like
+    /// [`PackItem::family_id`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub family_id: Option<i64>,
 }
 
 impl Note {
@@ -1343,10 +1527,12 @@ impl Note {
         value.clamp(0.0, 1.0)
     }
 
-    pub fn from_row(row: &PgRow) -> Self {
+    /// The words and the place are sealed under the family's key (#59); a
+    /// tombstone opens nothing.
+    pub fn from_row(row: &PgRow, keys: &Keyring) -> Result<Self, KeyError> {
         let deleted_at: Option<OffsetDateTime> = row.get("deleted_at");
         if deleted_at.is_some() {
-            return Self {
+            return Ok(Self {
                 id: row.get("id"),
                 author_id: None,
                 text: None,
@@ -1368,12 +1554,13 @@ impl Note {
                 board_seq: row.get("board_seq"),
                 content_seq: None,
                 deleted: true,
-            };
+                family_id: row.try_get("family_id").ok(),
+            });
         }
-        Self {
+        Ok(Self {
             id: row.get("id"),
             author_id: Some(row.get("author_id")),
-            text: Some(row.get("text")),
+            text: Some(row.text(keys, "text")?),
             color: Some(row.get("color")),
             size: Some(row.get("size")),
             font: Some(row.get("font")),
@@ -1384,7 +1571,7 @@ impl Note {
             attachment: None,
             starts_at: row.get("starts_at"),
             ends_at: row.get("ends_at"),
-            place: row.get("place"),
+            place: row.text_opt(keys, "place")?,
             // Hydrated by the caller too, for the same reason — and `[]`
             // rather than absent on an event, which the caller decides
             // because only it knows the kind is meaningful here.
@@ -1403,7 +1590,8 @@ impl Note {
             board_seq: row.get("board_seq"),
             content_seq: Some(row.get("content_seq")),
             deleted: false,
-        }
+            family_id: row.try_get("family_id").ok(),
+        })
     }
 }
 
@@ -1436,16 +1624,17 @@ impl TaskItem {
     /// Longest one line may be. A thing to do, not a paragraph about it.
     pub const MAX_TEXT_CHARS: usize = 100;
 
-    pub fn from_row(row: &PgRow) -> Self {
+    /// The line is sealed under the family's key (#59).
+    pub fn from_row(row: &PgRow, keys: &Keyring) -> Result<Self, KeyError> {
         let done_at: Option<OffsetDateTime> = row.get("done_at");
-        Self {
+        Ok(Self {
             id: row.get("id"),
-            text: row.get("text"),
+            text: row.text(keys, "text")?,
             done: done_at.is_some(),
             // Only meaningful while it is done, and a deleted account's
             // tick keeps the item done without a name behind it.
             done_by: done_at.and_then(|_| row.get::<Option<i64>, _>("done_by")),
-        }
+        })
     }
 }
 
@@ -1467,6 +1656,25 @@ impl Rsvp {
 pub struct PendingJoinRequest {
     pub family_id: i64,
     pub family_name: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// `Invitation` object: an owner's invitation into their family, pending
+/// until the invited person accepts or declines it (docs/protocol.md,
+/// "Several families"; decision D4). `user` is the invited person.
+///
+/// `invited_by` is an `Option` only because its column is: the owner who
+/// sent it is a FK that a scrubbed account's own invitations never outlive
+/// (the scrub deletes them), so a live invitation always carries it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Invitation {
+    pub id: i64,
+    pub family_id: i64,
+    pub family_name: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub invited_by: Option<User>,
+    pub user: User,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -1494,6 +1702,9 @@ mod tests {
             ai_transcripts: false,
             ai_lookups: false,
             greeting_places: Vec::new(),
+            member_ceiling: 50,
+            plan: None,
+            delete_at: None,
         };
         let json = serde_json::to_value(&family).expect("serialize");
         assert!(
@@ -1523,6 +1734,9 @@ mod tests {
             ai_transcripts: false,
             ai_lookups: false,
             greeting_places: Vec::new(),
+            member_ceiling: 50,
+            plan: None,
+            delete_at: None,
         };
         assert_eq!(
             serde_json::to_value(&family).expect("serialize"),
@@ -1532,7 +1746,7 @@ mod tests {
                 "ai_vision": false, "ai_history_photos": false,
                 "ai_greeting": false, "ai_faces": false,
                 "ai_transcripts": false, "ai_lookups": false,
-                "greeting_places": []
+                "greeting_places": [], "member_ceiling": 50
             })
         );
     }
@@ -1555,6 +1769,9 @@ mod tests {
             ai_transcripts: false,
             ai_lookups: false,
             greeting_places: Vec::new(),
+            member_ceiling: 50,
+            plan: None,
+            delete_at: None,
         };
         assert_eq!(
             serde_json::to_value(&family).expect("serialize"),
@@ -1565,7 +1782,7 @@ mod tests {
                 "ai_vision": false, "ai_history_photos": false,
                 "ai_greeting": false, "ai_faces": false,
                 "ai_transcripts": false, "ai_lookups": false,
-                "greeting_places": []
+                "greeting_places": [], "member_ceiling": 50
             })
         );
     }
@@ -1591,6 +1808,9 @@ mod tests {
             ai_transcripts: false,
             ai_lookups: false,
             greeting_places: Vec::new(),
+            member_ceiling: 50,
+            plan: None,
+            delete_at: None,
         };
         assert_eq!(
             serde_json::to_value(&family).expect("serialize"),
@@ -1600,7 +1820,7 @@ mod tests {
                 "max_members": 12, "ai_history": true, "ai_vision": false,
                 "ai_history_photos": false, "ai_greeting": false, "ai_faces": false,
                 "ai_transcripts": false, "ai_lookups": false,
-                "greeting_places": []
+                "greeting_places": [], "member_ceiling": 50
             })
         );
     }
@@ -1725,6 +1945,7 @@ mod tests {
             avatar_version: 3,
             birthday: Some(Birthday { month: 3, day: 14 }),
             deleted: false,
+            password_reset: None,
         };
         assert_eq!(
             serde_json::to_value(&member).expect("serialize"),
@@ -1745,6 +1966,7 @@ mod tests {
             avatar_version: 0,
             birthday: None,
             deleted: false,
+            password_reset: None,
         };
         assert_eq!(
             serde_json::to_value(&member).expect("serialize"),
@@ -1789,6 +2011,7 @@ mod tests {
             avatar_version: 0,
             birthday: None,
             deleted: true,
+            password_reset: None,
         };
         assert_eq!(
             serde_json::to_value(&tombstone).expect("serialize"),
@@ -1849,6 +2072,9 @@ mod tests {
                 kind: "family".to_string(),
                 title: "The Smiths".to_string(),
                 peer_user_id: None,
+                member_ids: None,
+                admin_user_id: None,
+                family_ids: Vec::new(),
             },
             last_message: None,
             unread_count: 0,
@@ -1861,8 +2087,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&entry).expect("serialize"),
             serde_json::json!({
+                // `family_ids` since 2026-10-22, ALWAYS a key (protocol.md,
+                // "Several families"); this fixture names no family.
                 "chat": {"id": 42, "kind": "family", "title": "The Smiths",
-                         "peer_user_id": null},
+                         "peer_user_id": null, "family_ids": []},
                 "last_message": null,
                 "unread_count": 0,
                 "last_read_message_id": 0
@@ -1895,6 +2123,9 @@ mod tests {
             kind: "family".to_string(),
             title: "The Smiths".to_string(),
             peer_user_id: None,
+            member_ids: None,
+            admin_user_id: None,
+            family_ids: Vec::new(),
         };
         let json = serde_json::to_value(&chat).expect("serialize");
         assert_eq!(json["peer_user_id"], serde_json::Value::Null);
@@ -2008,6 +2239,7 @@ mod tests {
             accuracy_m: None,
             sticker: false,
             round: false,
+            animation: false,
             waveform: None,
         };
         let json = serde_json::to_value(&photo).expect("serializes");
@@ -2057,6 +2289,7 @@ mod tests {
             accuracy_m: None,
             sticker: false,
             round: false,
+            animation: false,
             waveform: None,
         };
         let json = serde_json::to_value(&note).expect("serializes");
@@ -2124,6 +2357,7 @@ mod tests {
             accuracy_m: None,
             sticker: false,
             round: false,
+            animation: false,
             waveform: None,
         }
     }
@@ -2225,5 +2459,141 @@ mod tests {
         // The bytes.
         assert!(!with(&|a| a.size = CEILING as i64 + 1));
         assert!(!with(&|a| a.size = -1));
+    }
+
+    /// An animation as protocol.md draws it: a 480 x 270 MP4 of 2.1 s.
+    fn animation_video() -> Attachment {
+        Attachment {
+            id: 93,
+            kind: "video".to_string(),
+            mime: "video/mp4".to_string(),
+            size: 182_330,
+            width: Some(480),
+            height: Some(270),
+            duration_ms: Some(2_100),
+            has_preview: true,
+            name: None,
+            latitude: None,
+            longitude: None,
+            accuracy_m: None,
+            sticker: false,
+            round: false,
+            animation: false,
+            waveform: None,
+        }
+    }
+
+    /// `animation` is on the wire when — and only when — it is true, the
+    /// sticker's and the video message's rule: an ordinary video never
+    /// carries `"animation": false`, and every attachment a shipped server
+    /// ever sent, which has no key, reads as an ordinary video
+    /// (protocol.md, "Animations"; issue #96).
+    #[test]
+    fn the_animation_flag_is_absent_unless_true() {
+        let video = animation_video();
+        let json = serde_json::to_value(&video).expect("serializes");
+        assert!(json.get("animation").is_none(), "{json}");
+        let back: Attachment = serde_json::from_value(json).expect("parses without the key");
+        assert!(!back.animation);
+
+        let moving = Attachment {
+            animation: true,
+            ..video
+        };
+        let json = serde_json::to_value(&moving).expect("serializes");
+        assert_eq!(json["animation"], true);
+        assert!(json.get("sticker").is_none(), "{json}");
+        assert!(json.get("round").is_none(), "{json}");
+        let back: Attachment = serde_json::from_value(json).expect("parses");
+        assert_eq!(back, moving);
+    }
+
+    /// Check 4 of "Animations" — "What the server checks", as a pure
+    /// question about a claimed row: the kind, the type, a declared shape
+    /// of at least 1 x 1 whose SHORT side is at most 720 (the long side is
+    /// free), a declared length of at least 1 ms — and no byte ceiling of
+    /// its own, since the upload already held it to `max_attachment_bytes`.
+    #[test]
+    fn what_may_be_sent_as_an_animation() {
+        assert_eq!(Attachment::ANIMATION_MAX_SHORT_SIDE, 720);
+        assert_eq!(Attachment::ANIMATION_MIME, "video/mp4");
+        assert!(animation_video().fits_animation());
+
+        let with = |change: &dyn Fn(&mut Attachment)| {
+            let mut attachment = animation_video();
+            change(&mut attachment);
+            attachment.fits_animation()
+        };
+        // The edges that ARE allowed: the smallest picture, a short side of
+        // exactly 720 either way round, a long side far past it, a square,
+        // the shortest length and a long one, and any size.
+        assert!(with(&|a| {
+            a.width = Some(1);
+            a.height = Some(1);
+        }));
+        assert!(with(&|a| {
+            a.width = Some(1280);
+            a.height = Some(720);
+        }));
+        assert!(with(&|a| {
+            a.width = Some(720);
+            a.height = Some(1280);
+        }));
+        assert!(with(&|a| {
+            a.width = Some(720);
+            a.height = Some(720);
+        }));
+        assert!(with(&|a| {
+            a.width = Some(4000);
+            a.height = Some(2);
+        }));
+        assert!(with(&|a| a.duration_ms = Some(1)));
+        assert!(with(&|a| a.duration_ms = Some(600_000)));
+        assert!(with(&|a| a.size = 0));
+        assert!(with(&|a| a.size = 1 << 40));
+
+        // Not a video, or not an MP4.
+        for (kind, mime) in [
+            ("photo", "image/gif"),
+            ("photo", "image/webp"),
+            ("audio", "audio/mp4"),
+            ("file", "video/mp4"),
+            ("location", Attachment::LOCATION_MIME),
+            ("video", "video/quicktime"),
+        ] {
+            assert!(
+                !with(&|a| {
+                    a.kind = kind.to_string();
+                    a.mime = mime.to_string();
+                }),
+                "{kind} {mime}"
+            );
+        }
+        // The shape: missing, below 1, or a short side over 720.
+        assert!(!with(&|a| a.width = None));
+        assert!(!with(&|a| a.height = None));
+        assert!(!with(&|a| {
+            a.width = None;
+            a.height = None;
+        }));
+        assert!(!with(&|a| a.width = Some(0)));
+        assert!(!with(&|a| a.height = Some(0)));
+        assert!(!with(&|a| a.width = Some(-480)));
+        assert!(!with(&|a| {
+            a.width = Some(1280);
+            a.height = Some(721);
+        }));
+        assert!(!with(&|a| {
+            a.width = Some(721);
+            a.height = Some(1280);
+        }));
+        assert!(!with(&|a| {
+            a.width = Some(721);
+            a.height = Some(721);
+        }));
+        // The length: missing or nothing.
+        assert!(!with(&|a| a.duration_ms = None));
+        assert!(!with(&|a| a.duration_ms = Some(0)));
+        assert!(!with(&|a| a.duration_ms = Some(-1)));
     }
 }

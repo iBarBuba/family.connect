@@ -69,7 +69,13 @@ public sealed record MemberDto(
     string? Role = null,
     bool HasLeft = false,
     bool Deleted = false,
-    BirthdayDto? Birthday = null)
+    BirthdayDto? Birthday = null,
+    /// <summary>
+    /// Whether the OWNER reading their own family may reset this member's password — which needs them to own every family
+    /// the member is in (docs/protocol.md, "Several families", D7). Present in the owner's own read only; null from every
+    /// other read and from a server that predates several families (see <c>FamilyRules.MayResetPassword</c>).
+    /// </summary>
+    bool? PasswordReset = null)
 {
     /// <summary>
     /// Whether this member owns the family. The wire says <c>"role": "owner"|"member"</c> — a
@@ -101,11 +107,30 @@ public sealed record MemberDto(
 /// </remarks>
 public sealed record BirthdayDto(int Month, int Day);
 
+/// <summary>
+/// A chat (docs/protocol.md, "Objects"): <c>family</c>, <c>direct</c>, <c>ai</c> or — since 2026-10-22 — <c>group</c>.
+/// </summary>
+/// <param name="MemberIds">
+/// A GROUP's members, the reader included, in the order they joined (docs/protocol.md, "Groups"). Present only for a group;
+/// null for every other kind, and for a group a server before groups described.
+/// </param>
+/// <param name="AdminUserId">
+/// The one member of a GROUP who may rename it, add and remove members, and delete it. Present only for a group.
+/// </param>
+/// <param name="FamilyIds">
+/// Which families the chat is LISTED in (docs/protocol.md, "Several families"): exactly one for a family chat, a group and an
+/// <c>ai</c> chat; for a direct chat every family the two people share, ascending. Null from a server that predates several
+/// families, where it means the one family the account has — so a null is listed in the HOME family alone
+/// (<c>FamilyRules.FamiliesOf</c>). An empty array is listed nowhere.
+/// </param>
 public sealed record ChatDto(
     long Id,
     string Kind,
     string Title,
-    long? PeerUserId = null);
+    long? PeerUserId = null,
+    long[]? MemberIds = null,
+    long? AdminUserId = null,
+    long[]? FamilyIds = null);
 
 public sealed record MentionDto(long UserId, string Name);
 
@@ -167,7 +192,14 @@ public sealed record AttachmentDto(
     /// absent on a picked sound file, a video, anything else, and everything an older client or server sent. Read
     /// through <see cref="FamilyConnect.Core.Waveform.LevelsOrPlaceholder"/>, never trusted to be well formed.
     /// </summary>
-    string? Waveform = null)
+    string? Waveform = null,
+    /// <summary>
+    /// This video is an ANIMATION (docs/protocol.md, "Animations"): an animated GIF, WebP or PNG the sender turned into a
+    /// silent looping H.264 MP4. Present on the wire only when true, set by the send and never changed — every other video,
+    /// and everything an older server sent, reads false here. Never beside <see cref="Sticker"/> or <see cref="Round"/>,
+    /// never on anything but a video; in every other respect it is still <c>kind=video</c>.
+    /// </summary>
+    bool Animation = false)
 {
     public bool IsPhoto => Kind == "photo";
     public bool IsVideo => Kind == "video";
@@ -241,6 +273,19 @@ public sealed record MessageDto(
     /// </remarks>
     public AttachmentDto? RoundVideo =>
         string.IsNullOrEmpty(Body) && Media is [{ Round: true, Kind: "video" } video] ? video : null;
+
+    /// <summary>
+    /// The video this message IS, when it is an ANIMATION — drawn as a picture that plays by itself, muted, looping, with a
+    /// small "GIF" label and no player controls (docs/protocol.md, "Animations", "How it is drawn").
+    /// </summary>
+    /// <remarks>
+    /// THE STICKER'S AND THE VIDEO MESSAGE'S ONE TEST: exactly ONE attachment, that attachment is <c>kind=video</c>, and it
+    /// carries <c>animation: true</c>. Unlike a video message an animation MAY carry a caption, so the body is not asked.
+    /// Anything else — two attachments, the flag on a photo, a server that ignores the flag — is null, and is drawn as the
+    /// ordinary message it otherwise is.
+    /// </remarks>
+    public AttachmentDto? AnimationVideo =>
+        Media is [{ Animation: true, Kind: "video" } video] ? video : null;
 }
 
 public sealed record TaskItemDto(long Id, string Text, bool Done, long? DoneBy = null);
@@ -268,7 +313,12 @@ public sealed record NoteDto(
     RsvpDto[]? Rsvps = null,
     TaskItemDto[]? Items = null,
     MentionDto[]? Mentions = null,
-    bool Deleted = false)
+    bool Deleted = false,
+    /// <summary>
+    /// The family whose board the note is on (docs/protocol.md, "Several families", 2026-10-22) — how a <c>board_note</c>
+    /// frame says whose it is. Null from a server that predates several families: the one family there is.
+    /// </summary>
+    long? FamilyId = null)
 {
     /// <summary>How many people gave this answer — the number the sticker shows.</summary>
     public int Count(string answer) => Rsvps?.Count(rsvp => rsvp.Answer == answer) ?? 0;
@@ -309,7 +359,9 @@ public sealed record PackItemDto(
     long PackSeq = 0,
     /// <summary>A few words for a screen reader, when whoever added it gave any. Never drawn over the picture.</summary>
     string? Label = null,
-    bool Deleted = false);
+    bool Deleted = false,
+    /// <summary>Whose pack the item is in (2026-10-22); null from an older server, which has one family to mean.</summary>
+    long? FamilyId = null);
 
 /// <summary>The error body, as it arrives.</summary>
 public sealed record ErrorEnvelope(ErrorBody Error);

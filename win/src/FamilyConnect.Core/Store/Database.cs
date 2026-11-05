@@ -57,6 +57,53 @@ public sealed class Database : IDisposable
         return new Held(serial);
     }
 
+    /// <summary>
+    /// How many times the roster or the block list may have changed — the members and blocked tables. Read and bumped under
+    /// <see cref="Hold"/> only.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>WHAT LETS A STORE KEEP THEM IN MEMORY.</b> A conversation asks "is this sender blocked?" and "who is this?" for
+    /// every bubble it draws, and each of those was a query under the one lock this file has — hundreds of them per redraw,
+    /// on the window's thread, while the socket's thread waited to write. They are tiny tables that change a few times a
+    /// day, so <see cref="ChatStore"/> keeps them in memory and asks this number whether what it keeps is still the table.
+    /// </para>
+    /// <para>
+    /// <b>ON THE DATABASE, NOT THE STORE</b>, because every writer has to bump it and more than one store can sit on one
+    /// file (the tests make several): a counter in each store would let one store's write leave another's copy stale. And
+    /// <see cref="WipeAll"/> bumps it too, which no store sees happen.
+    /// </para>
+    /// </remarks>
+    internal long RosterGeneration { get; private set; }
+
+    /// <summary>The members or the blocked table is about to change: every copy kept of them is stale. Under <see cref="Hold"/>.</summary>
+    internal void RosterChanged() => RosterGeneration++;
+
+    /// <summary>
+    /// The same for the chats table's rows — what <see cref="ChatStore.Kind"/> keeps. Bumped by every write of a chat's
+    /// list row and by <see cref="WipeAll"/>; under <see cref="Hold"/> only.
+    /// </summary>
+    internal long ChatsGeneration { get; private set; }
+
+    /// <summary>A chat's list row is about to be written. Under <see cref="Hold"/>.</summary>
+    internal void ChatsChanged() => ChatsGeneration++;
+
+    /// <summary>
+    /// How many times a chat has been TOUCHED outside a list read — upserted by <c>chat_updated</c> or a group endpoint's
+    /// answer, or removed — and when each was last (see <see cref="ChatStore.ListMark"/>). On the database, like the
+    /// generations, so a second store on the same file sees them; under <see cref="Hold"/> only.
+    /// </summary>
+    internal long ChatTouches { get; private set; }
+
+    private readonly Dictionary<long, long> touchedAt = [];
+
+    /// <summary>This chat changed outside a list read, as of now. Under <see cref="Hold"/>.</summary>
+    internal void Touched(long chatId) => touchedAt[chatId] = ++ChatTouches;
+
+    /// <summary>The chats touched after <paramref name="mark"/>. Under <see cref="Hold"/>.</summary>
+    internal HashSet<long> TouchedSince(long mark) =>
+        [.. touchedAt.Where(touch => touch.Value > mark).Select(touch => touch.Key)];
+
     /// <summary>The cache, held. Disposing it lets the next operation in.</summary>
     public readonly struct Held : IDisposable
     {
@@ -198,6 +245,10 @@ public sealed class Database : IDisposable
     public void WipeAll()
     {
         using var serialised = Hold();
+        // Whatever a store keeps in memory of these tables goes with them.
+        RosterChanged();
+        ChatsChanged();
+        touchedAt.Clear();
         using var transaction = connection.BeginTransaction();
         foreach (var table in Tables())
         {
@@ -205,6 +256,158 @@ public sealed class Database : IDisposable
             command.Transaction = transaction;
             command.CommandText = $"DELETE FROM \"{table}\"";
             command.ExecuteNonQuery();
+        }
+        transaction.Commit();
+    }
+
+    /// <summary>
+    /// ONE FAMILY's rows, gone — and nothing else (docs/protocol.md, "Several families"): the account left that family, was
+    /// removed from it, or the family went. Its board, its pack, its roster and every cursor and mark kept for it; its chats
+    /// with their messages and queued sends — except a direct chat still listed in another family, which only stops naming
+    /// this one (a direct chat belongs to the pair, and stays while they share another family).
+    /// </summary>
+    /// <remarks>
+    /// <see cref="WipeAll"/> is still what a sign-out, an expired session and leaving the LAST family do. This is the
+    /// narrower thing leaving one of several needs: the people stay on <c>members</c>, because a name still has to resolve
+    /// for an old message in a chat that stays.
+    /// </remarks>
+    /// <returns>The chats that went, so a window showing one can close it.</returns>
+    public IReadOnlyList<long> DropFamily(long familyId)
+    {
+        using var serialised = Hold();
+        RosterChanged();
+        ChatsChanged();
+        var gone = new List<long>();
+        using var transaction = connection.BeginTransaction();
+        var listed = new List<(long Chat, long[] Families)>();
+        using (var read = connection.CreateCommand())
+        {
+            read.Transaction = transaction;
+            read.CommandText = "SELECT chat_id, family_ids_json FROM chats WHERE family_ids_json IS NOT NULL";
+            using var reader = read.ExecuteReader();
+            while (reader.Read())
+            {
+                if (Protocol.Wire.Decode<long[]>(reader.GetString(1)) is { } families && families.Contains(familyId))
+                {
+                    listed.Add((reader.GetInt64(0), families));
+                }
+            }
+        }
+        foreach (var (chat, families) in listed)
+        {
+            Touched(chat);
+            var rest = families.Where(family => family != familyId).ToArray();
+            if (rest.Length > 0)
+            {
+                using var shrink = connection.CreateCommand();
+                shrink.Transaction = transaction;
+                shrink.CommandText = "UPDATE chats SET family_ids_json = $families WHERE chat_id = $id";
+                shrink.Parameters.AddWithValue("$families", Protocol.Wire.Encode(rest));
+                shrink.Parameters.AddWithValue("$id", chat);
+                shrink.ExecuteNonQuery();
+                continue;
+            }
+            gone.Add(chat);
+            foreach (var statement in new[]
+                     {
+                         "DELETE FROM outbox WHERE chat_id = $id",
+                         "DELETE FROM messages WHERE chat_id = $id",
+                         "DELETE FROM chats WHERE chat_id = $id",
+                     })
+            {
+                using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = statement;
+                command.Parameters.AddWithValue("$id", chat);
+                command.ExecuteNonQuery();
+            }
+        }
+        foreach (var statement in new[]
+                 {
+                     "DELETE FROM pack_recents WHERE item_id IN (SELECT item_id FROM pack_items WHERE family_id = $family)",
+                     "DELETE FROM pack_items WHERE family_id = $family",
+                     "DELETE FROM notes WHERE family_id = $family",
+                     "DELETE FROM family_members WHERE family_id = $family",
+                     // Its cursors, its marks and its ceilings: every key spelled for it (FamilyKeys).
+                     "DELETE FROM meta WHERE key LIKE '%@' || $family",
+                 })
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = statement;
+            command.Parameters.AddWithValue("$family", familyId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            command.ExecuteNonQuery();
+        }
+        transaction.Commit();
+        return gone;
+    }
+
+    /// <summary>
+    /// Every family this cache holds anything per family for — a roster, a note, a pack item — so a family the account left
+    /// while this app was not running is found and dropped once <c>GET /me</c> no longer lists it.
+    /// </summary>
+    public IReadOnlyList<long> HeldFamilies()
+    {
+        using var serialised = Hold();
+        var ids = new List<long>();
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT family_id FROM family_members
+            UNION SELECT family_id FROM notes WHERE family_id IS NOT NULL
+            UNION SELECT family_id FROM pack_items WHERE family_id IS NOT NULL
+            ORDER BY 1
+            """;
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            ids.Add(reader.GetInt64(0));
+        }
+        return ids;
+    }
+
+    /// <summary>
+    /// What a cache from before several families held, made the HOME family's — the one family such a build ever saw — once
+    /// <c>GET /me</c> names it: the notes and pack items migration 11 left without a family, the roster as that family's, and
+    /// the board's and the pack's cursors, marks and ceilings under that family's keys. Idempotent: a second call finds
+    /// nothing unadopted.
+    /// </summary>
+    public void AdoptLegacy(long homeFamilyId)
+    {
+        using var serialised = Hold();
+        RosterChanged();
+        using var transaction = connection.BeginTransaction();
+        foreach (var statement in new[]
+                 {
+                     "UPDATE notes SET family_id = $family WHERE family_id IS NULL",
+                     "UPDATE pack_items SET family_id = $family WHERE family_id IS NULL",
+                     // Only while no roster is kept per family at all: afterwards `members` is everybody, of every family.
+                     """
+                     INSERT INTO family_members (family_id, user_id, role, has_left)
+                     SELECT $family, user_id, role, MAX(has_left, deleted) FROM members
+                      WHERE NOT EXISTS (SELECT 1 FROM family_members)
+                     """,
+                 })
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = statement;
+            command.Parameters.AddWithValue("$family", homeFamilyId);
+            command.ExecuteNonQuery();
+        }
+        foreach (var key in BoardStore.MetaKeys.Concat(PackStore.MetaKeys))
+        {
+            using var move = connection.CreateCommand();
+            move.Transaction = transaction;
+            // The family's own key wins if it is already there; the bare one goes either way.
+            move.CommandText =
+                """
+                INSERT OR IGNORE INTO meta (key, value) SELECT $scoped, value FROM meta WHERE key = $bare;
+                DELETE FROM meta WHERE key = $bare;
+                """;
+            move.Parameters.AddWithValue("$scoped", FamilyKeys.Of(key, homeFamilyId));
+            move.Parameters.AddWithValue("$bare", key);
+            move.ExecuteNonQuery();
         }
         transaction.Commit();
     }

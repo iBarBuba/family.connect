@@ -25,6 +25,9 @@
 
 package me.nettrash.familyconnect.ui.board
 
+import me.nettrash.familyconnect.ui.components.ProseKeyboard
+import me.nettrash.familyconnect.ui.components.EmojiTypingField
+import me.nettrash.familyconnect.ui.components.proseValue
 import androidx.annotation.StringRes
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.PickVisualMediaRequest
@@ -94,7 +97,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.res.stringResource
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -124,8 +129,11 @@ import me.nettrash.familyconnect.ui.components.isWideWindow
 import me.nettrash.familyconnect.ui.components.AssistantConsentDialog
 import me.nettrash.familyconnect.data.db.NoteEntity
 import me.nettrash.familyconnect.data.repo.BackdropOutcome
+import me.nettrash.familyconnect.data.repo.PaidFamilies
+import me.nettrash.familyconnect.util.TimeFormat
 import java.time.Instant
 import java.time.ZoneId
+import java.time.ZoneOffset
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
@@ -142,6 +150,7 @@ import android.content.Intent
 import android.provider.CalendarContract
 import android.widget.Toast
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -342,11 +351,15 @@ internal fun EventDialog(
         title = { Text(stringResource(R.string.s_add_event)) },
         text = {
             Column {
+                // Emoji as you type (#101), like every prose field — but not
+                // the place below, which is a name.
+                val (titleValue, onTitleValue) = proseValue(title) { title = NoteText.capped(it) }
                 OutlinedTextField(
-                    value = title,
-                    onValueChange = { title = NoteText.capped(it) },
+                    value = titleValue,
+                    onValueChange = onTitleValue,
                     label = { Text(stringResource(R.string.s_event)) },
                     singleLine = true,
+                    keyboardOptions = ProseKeyboard.Sentences,
                 )
                 Spacer(Modifier.size(16.dp))
                 Text(
@@ -379,6 +392,8 @@ internal fun EventDialog(
                     onValueChange = { if (it.length <= 200) place = it },
                     label = { Text(stringResource(R.string.s_event_place)) },
                     singleLine = true,
+                    // A place is a name, not a sentence: every word.
+                    keyboardOptions = ProseKeyboard.Words,
                 )
             }
         },
@@ -438,9 +453,10 @@ internal fun NoteEventBlock(note: NoteEntity, modifier: Modifier = Modifier) {
         if (going > 0 || maybe > 0) {
             Text(
                 text = when {
-                    maybe == 0 -> stringResource(R.string.s_rsvp_going_count, going)
-                    going == 0 -> stringResource(R.string.s_rsvp_maybe_count, maybe)
-                    else -> stringResource(R.string.s_rsvp_going_maybe_count, going, maybe)
+                    maybe == 0 -> pluralStringResource(R.plurals.s_rsvp_going_count, going, going)
+                    going == 0 -> pluralStringResource(R.plurals.s_rsvp_maybe_count, maybe, maybe)
+                    // The going count picks the form: no language here inflects "maybe".
+                    else -> pluralStringResource(R.plurals.s_rsvp_going_maybe_count, going, going, maybe)
                 },
                 style = MaterialTheme.typography.labelSmall,
                 color = Color.Black.copy(alpha = 0.55f),
@@ -1264,7 +1280,7 @@ fun BoardScreen(
     ) { uri ->
         if (uri != null) viewModel.pinPhoto(uri, notes.size % NoteColors.palette.size)
     }
-    if (pinFailed) {
+    pinFailed?.let { said ->
         AlertDialog(
             onDismissRequest = viewModel::clearPinFailure,
             confirmButton = {
@@ -1272,7 +1288,7 @@ fun BoardScreen(
                     Text(stringResource(R.string.s_dismiss))
                 }
             },
-            text = { Text(stringResource(R.string.s_pin_photo_failed)) },
+            text = { Text(stringResource(said)) },
         )
     }
     // The wall is in front of somebody, so everything on it has been shown
@@ -1997,6 +2013,9 @@ internal fun NoteDialog(
     // the reader anything on its own. The web says both (docs/protocol.md,
     // "Board"). A toast, like the missing-calendar refusal above it.
     val context = LocalContext.current
+    // For the one refusal whose sentence takes an argument: read through
+    // the configuration-aware resources, never LocalContext's.
+    val resources = LocalResources.current
     /**
      * A backdrop this dialog has just drawn, and whether one is on its way.
      * Kept here rather than beside the button so the banner above can draw
@@ -2010,6 +2029,8 @@ internal fun NoteDialog(
     var text by remember(draft.noteId) {
         mutableStateOf(TextFieldValue(draft.text, TextRange(draft.text.length)))
     }
+    // Emoji as you type (#101): the live replacement a Backspace takes back.
+    val noteEmoji = remember(draft.noteId) { EmojiTypingField() }
     var color by remember(draft.noteId) { mutableStateOf(draft.color) }
     // The lines as the author is writing them. A new list opens with one
     // empty row, so the first thing to do is one tap away rather than two.
@@ -2024,7 +2045,7 @@ internal fun NoteDialog(
             },
         )
     }
-    var nextLineKey by remember(draft.noteId) { mutableStateOf(draft.items.size.toLong() + 1) }
+    var nextLineKey by remember(draft.noteId) { mutableLongStateOf(draft.items.size.toLong() + 1) }
     // Ticks on their way: the line and the state being sent, so a box
     // answers the tap at once and goes back to the note's own truth when
     // the answer — or the refusal — lands.
@@ -2199,8 +2220,20 @@ internal fun NoteDialog(
                                             val said = when (outcome) {
                                                 is BackdropOutcome.Drawn -> null
                                                 BackdropOutcome.Refused ->
-                                                    R.string.s_assistant_provider_refused
-                                                BackdropOutcome.Failed -> R.string.s_draw_failed
+                                                    resources.getString(R.string.s_assistant_provider_refused)
+                                                BackdropOutcome.Failed -> resources.getString(R.string.s_draw_failed)
+                                                // A paid family's pictures are
+                                                // used up until the 1st of next
+                                                // month, named in UTC where the
+                                                // month turns (docs/protocol.md,
+                                                // "Paid families").
+                                                BackdropOutcome.AllowanceUsed -> resources.getString(
+                                                    R.string.e_ai_allowance_used,
+                                                    TimeFormat.calendarDay(
+                                                        PaidFamilies.nextMonthStartUtc(System.currentTimeMillis()),
+                                                        zone = ZoneOffset.UTC,
+                                                    ),
+                                                )
                                                 // The consent screen asked,
                                                 // and "Not Now" was the
                                                 // answer: nothing to report.
@@ -2214,7 +2247,11 @@ internal fun NoteDialog(
                                                 Toast.makeText(
                                                     context,
                                                     said,
-                                                    Toast.LENGTH_SHORT,
+                                                    if (outcome == BackdropOutcome.AllowanceUsed) {
+                                                        Toast.LENGTH_LONG
+                                                    } else {
+                                                        Toast.LENGTH_SHORT
+                                                    },
                                                 ).show()
                                             }
                                         }
@@ -2319,9 +2356,11 @@ internal fun NoteDialog(
                                 },
                             )
                             if (canEdit) {
-                                OutlinedTextField(
-                                    value = line.text,
-                                    onValueChange = { value ->
+                                // Emoji as you type (#101). Keyed by the
+                                // line, so removing one above does not hand
+                                // this field another line's caret.
+                                val (lineValue, onLineValue) = key(line.key) {
+                                    proseValue(line.text) { value ->
                                         lines = lines.toMutableList().also {
                                             it[at] = line.copy(
                                                 text = NoteText.cappedTo(
@@ -2329,9 +2368,14 @@ internal fun NoteDialog(
                                                 ),
                                             )
                                         }
-                                    },
+                                    }
+                                }
+                                OutlinedTextField(
+                                    value = lineValue,
+                                    onValueChange = onLineValue,
                                     label = { Text(stringResource(R.string.s_thing_to_do)) },
                                     singleLine = true,
+                                    keyboardOptions = ProseKeyboard.Sentences,
                                     modifier = Modifier.weight(1f),
                                 )
                                 IconButton(onClick = {
@@ -2362,12 +2406,13 @@ internal fun NoteDialog(
                         }
                     }
                     if (draft.items.isNotEmpty()) {
+                        val doneCount = draft.items.count { item -> ticking[item.id] ?: item.done }
                         Text(
-                            text = stringResource(
-                                R.string.s_tasks_done_of,
-                                draft.items.count { item ->
-                                    ticking[item.id] ?: item.done
-                                },
+                            // The done count picks the form: the participle agrees with it.
+                            text = pluralStringResource(
+                                R.plurals.s_tasks_done_of,
+                                doneCount,
+                                doneCount,
                                 draft.items.size,
                             ),
                             style = MaterialTheme.typography.bodySmall,
@@ -2398,7 +2443,10 @@ internal fun NoteDialog(
                         // server would refuse never becomes a save that
                         // fails, which on this screen used to fail SILENTLY
                         // (docs/protocol.md, "Board").
-                        onValueChange = { value ->
+                        onValueChange = { typed ->
+                            // Emoji as you type (#101) first; the cap has
+                            // the last word.
+                            val value = noteEmoji.onValueChange(text, typed)
                             val capped = NoteText.capped(value.text)
                             // A cut moves the end, so the caret is put
                             // there rather than left past it.
@@ -2411,13 +2459,13 @@ internal fun NoteDialog(
                         label = { Text(stringResource(R.string.s_note)) },
                         minLines = 3,
                         maxLines = 8,
+                        keyboardOptions = ProseKeyboard.Sentences,
                         supportingText = if (NoteText.shouldShowCounter(text.text)) {
                             {
                                 Text(
-                                    stringResource(
-                                        R.string.s_note_characters_left,
-                                        NoteText.remaining(text.text),
-                                    ),
+                                    NoteText.remaining(text.text).let { left ->
+                                        pluralStringResource(R.plurals.s_note_characters_left, left, left)
+                                    },
                                 )
                             }
                         } else {
@@ -2431,11 +2479,14 @@ internal fun NoteDialog(
                     val offered = MemberMention.query(text.text)
                         ?.let { query -> MemberMention.candidates(roster, query, excluding = emptySet()) }
                         .orEmpty()
+                        // Members only: a note is not a message, and nothing
+                        // on the board reaches the assistant.
+                        .map { MemberMention.Suggestion.Member(it) }
                     if (offered.isNotEmpty()) {
                         MentionSuggestionsRow(
                             candidates = offered,
-                            onPick = { name ->
-                                val accepted = MemberMention.accept(text.text, name)
+                            onPick = { suggestion ->
+                                val accepted = MemberMention.accept(text.text, suggestion)
                                 text = TextFieldValue(accepted, TextRange(accepted.length))
                             },
                         )

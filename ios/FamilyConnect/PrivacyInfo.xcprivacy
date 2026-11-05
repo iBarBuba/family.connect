@@ -185,6 +185,23 @@
 			</array>
 		</dict>
 
+		<!-- Purchases: for each App Store subscription an account presents
+		     (paid families, #89), the product, the environment, the expiry,
+		     whether it renews or was refunded, and Apple's transaction ids,
+		     sealed under the account's key. Delete Account removes them. -->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypePurchaseHistory</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+
 		<!--
 			Deliberately NOT declared, each checked rather than assumed:
 
@@ -198,8 +215,8 @@
 			Email address, phone number, physical address — never asked for and
 			no column exists for them.
 
-			Browsing and search history, purchases, advertising data, crash and
-			performance data — none collected. Link previews and map tiles are
+			Browsing and search history, advertising data, crash and performance
+			data — none collected. Link previews and map tiles are
 			fetched by the device from the third party directly, are never
 			logged, and both can be switched off in Settings.
 

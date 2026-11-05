@@ -45,7 +45,7 @@ val storedVersionCode: Int = run {
 }
 
 val resolvedVersionName: String =
-    (project.findProperty("versionName") as String?)?.takeIf { it.isNotBlank() } ?: "1.2"
+    (project.findProperty("versionName") as String?)?.takeIf { it.isNotBlank() } ?: "1.3"
 
 // Allow opting out of the bump for a single build, e.g. when running a
 // throwaway test or when CI does not want the local file mutated:
@@ -111,15 +111,22 @@ val releaseSigning: Map<String, String>? = run {
 
 android {
     namespace = "me.nettrash.familyconnect"
-    compileSdk = 36
-    // 36.1 (Android 16.1): what core-telecom 1.1.x — the Phone app's call
-    // log for Family calls (TelecomCalls) — compiles against. targetSdk
-    // stays 36; nothing in behaviour changes with the compile floor.
-    compileSdkMinor = 1
+    // 37 (Android 17). core-telecom 1.1.x — the Phone app's call log for
+    // Family calls (TelecomCalls) — needs at least 36.1, and core 1.19 and
+    // Compose 1.12 need 37, so 37.0 covers all of them without a minor.
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "me.nettrash.familyconnect"
         minSdk = 26
+        // 36, not 37, on purpose (2026-10-19): on an Android 17 emulator a
+        // build targeting 37 cannot re-compress an oversized video —
+        // SELinux stops the codec service reading the app's buffers, and
+        // MediaPrep.compressAsBefore fails — while the same build targeting
+        // 36 passes there. Raise it once that path has been checked on a
+        // real Android 17 phone; the local network permission it brings is
+        // already handled (data/net/LocalNetworkAccess.kt).
+        //noinspection OldTargetApi
         targetSdk = 36
         versionCode = storedVersionCode
         versionName = resolvedVersionName
@@ -174,6 +181,13 @@ android {
             // is signed. See the note above `releaseSigning`.
             signingConfig = signingConfigs.findByName("release")
             isMinifyEnabled = true
+            // Unreferenced resources go too, after R8. Nothing in the app
+            // looks a resource up by name (no getIdentifier), and what is
+            // read at run time without an R reference is not a resource:
+            // the rich-block engines are assets/rich/ and the emoji names
+            // are a Java resource (resources/emoji-names.tsv) — neither is
+            // touched by the resource shrinker.
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -188,6 +202,10 @@ android {
         compilerOptions {
             jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
         }
+    }
+    lint {
+        // lint.xml says what is ignored, and why, one issue at a time.
+        lintConfig = file("lint.xml")
     }
     buildFeatures {
         compose = true
@@ -209,10 +227,36 @@ android {
             all {
                 it.maxHeapSize = "3g"
                 it.forkEvery = 150
+                // Robolectric's native runtime calls System.load, which
+                // JDK 24+ warns about unless native access is granted.
+                it.jvmArgs("--enable-native-access=ALL-UNNAMED")
+                // Robolectric on SDK 36+ (src/test/resources/robolectric.properties
+                // pins 36) sets up ApplicationSharedMemory by writing a raw
+                // FileDescriptor through jdk.internal.access.SharedSecrets,
+                // which JDK 17+ hides: without these every test class fails
+                // at runner init with "Failed to interact with raw
+                // FileDescriptor internals". See robolectric.org/getting-started.
+                it.jvmArgs(
+                    "--add-opens=java.base/jdk.internal.access=ALL-UNNAMED",
+                    "--add-opens=java.base/java.io=ALL-UNNAMED",
+                )
+                // DataStore's bundled protobuf reads memory through
+                // sun.misc.Unsafe, which JDK 24+ warns about. The flag exists
+                // from JDK 23; an older JVM would refuse to start with it.
+                if (JavaVersion.current() >= JavaVersion.VERSION_23) {
+                    it.jvmArgs("--sun-misc-unsafe-memory-access=allow")
+                }
             }
         }
     }
     packaging {
+        // The .so files come prebuilt and already stripped inside the AARs
+        // (WebRTC, CameraX, DataStore, graphics-path). Stripping them again
+        // needs an NDK, and without one AGP warns "Unable to strip" and
+        // packages them as they are, which is what this asks for outright.
+        jniLibs {
+            keepDebugSymbols += "**/*.so"
+        }
         resources {
             excludes += setOf(
                 "/META-INF/{AL2.0,LGPL2.1}",
@@ -310,6 +354,12 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
     implementation(libs.androidx.camera.video)
+
+    // androidx.webkit — the hidden WebView that draws formulas, diagrams
+    // and graphs from the bundled engines in assets/rich/ (#97): its asset
+    // loader serves those files and refuses everything else. See the
+    // catalog's header note.
+    implementation(libs.androidx.webkit)
 
     // Firebase Cloud Messaging — push notifications (docs/protocol.md,
     // "Push notifications"). Messaging is the ONLY Firebase artifact: no

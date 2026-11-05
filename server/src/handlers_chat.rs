@@ -24,6 +24,7 @@ use crate::error::{ApiError, AppJson, codes};
 use crate::events;
 use crate::handlers_call::attach_calls;
 use crate::handlers_poll::attach_polls;
+use crate::keyring::{KeyError, Keyring, Owner, SealKey, SealedRow};
 use crate::models::{
     Attachment, Chat, ChatListEntry, Mention, Message, Poll, QuotedParent, Reaction, ReplyTo,
 };
@@ -78,6 +79,12 @@ pub struct PostMessageRequest {
     /// and `false` are the same statement: an ordinary message.
     #[serde(default)]
     pub round: Option<bool>,
+    /// Optional: `true` sends the message's ONE attachment as an ANIMATION
+    /// — a silent looping video drawn as a picture that moves (protocol.md,
+    /// "Animations"; issue #96). Absent and `false` are the same statement:
+    /// an ordinary message.
+    #[serde(default)]
+    pub animation: Option<bool>,
 }
 
 /// At most this many members on one message (protocol.md, "Mentioning a
@@ -136,6 +143,8 @@ pub fn clamp_limit(requested: Option<i64>, default_limit: i64, max_limit: i64) -
 ///
 /// 404 when the chat does not exist at all, 403 when it exists but the
 /// caller is not in it — a member that left sees 403, not a phantom 404.
+/// A GROUP the caller is not in answers 404 as well: a group is visible
+/// only to its members.
 pub async fn ensure_chat_access(
     state: &AppState,
     chat_id: i64,
@@ -143,6 +152,7 @@ pub async fn ensure_chat_access(
 ) -> Result<(), ApiError> {
     let row = sqlx::query(
         "SELECT (cm.user_id IS NOT NULL) AS is_member,
+                c.kind = 'group' AS is_group,
                 (c.kind = 'direct' AND EXISTS (
                      SELECT 1 FROM member_blocks mb
                       WHERE mb.blocker_user_id = $2
@@ -159,6 +169,12 @@ pub async fn ensure_chat_access(
     .await?;
     match row {
         None => Err(ApiError::not_found(codes::CHAT_NOT_FOUND, "no such chat")),
+        // A group is visible only to its members: to anybody else it does
+        // not exist, and `not_chat_member` would say that it does
+        // (protocol.md, "Groups").
+        Some(row) if !row.get::<bool, _>("is_member") && row.get::<bool, _>("is_group") => {
+            Err(ApiError::not_found(codes::CHAT_NOT_FOUND, "no such chat"))
+        }
         Some(row) if !row.get::<bool, _>("is_member") => Err(ApiError::forbidden(
             codes::NOT_CHAT_MEMBER,
             "you are not a member of this chat",
@@ -300,7 +316,7 @@ async fn attach_reactions(state: &AppState, messages: &mut [Message]) -> Result<
             .or_default()
             .push(Reaction {
                 user_id: row.get("user_id"),
-                emoji: row.get("emoji"),
+                emoji: row.text(&state.keys, "emoji")?,
             });
     }
     for message in messages.iter_mut() {
@@ -324,7 +340,7 @@ async fn attach_reactions(state: &AppState, messages: &mut [Message]) -> Result<
 /// first element. Never one without the other, and neither on a message
 /// that carries none — absent, not an empty array, on the wire.
 pub async fn attach_attachments(
-    pool: &sqlx::PgPool,
+    state: &AppState,
     messages: &mut [Message],
 ) -> Result<(), ApiError> {
     if messages.is_empty() {
@@ -333,20 +349,21 @@ pub async fn attach_attachments(
     let message_ids: Vec<i64> = messages.iter().map(|message| message.id).collect();
     let rows = sqlx::query(
         "SELECT message_id, id, kind, mime, size_bytes, width, height, duration_ms,
-                has_preview, name, latitude, longitude, accuracy_m, sticker, round, waveform
+                has_preview, name, latitude, longitude, accuracy_m, sticker, round, animation,
+                waveform
          FROM attachments
          WHERE message_id = ANY($1)
          ORDER BY message_id, position, id",
     )
     .bind(&message_ids)
-    .fetch_all(pool)
+    .fetch_all(&state.pool)
     .await?;
     let mut by_message: HashMap<i64, Vec<Attachment>> = HashMap::new();
     for row in &rows {
         by_message
             .entry(row.get("message_id"))
             .or_default()
-            .push(Attachment::from_row(row));
+            .push(Attachment::from_row(row, &state.keys)?);
     }
     for message in messages.iter_mut() {
         if let Some(list) = by_message.remove(&message.id) {
@@ -362,10 +379,7 @@ pub async fn attach_attachments(
 /// the same members on every read: a page, the edits catch-up, a thread, a
 /// dedup re-ack (protocol.md, "Mentioning a member"). Absent, never an
 /// empty array, on a message that names nobody.
-pub async fn attach_mentions(
-    pool: &sqlx::PgPool,
-    messages: &mut [Message],
-) -> Result<(), ApiError> {
+pub async fn attach_mentions(state: &AppState, messages: &mut [Message]) -> Result<(), ApiError> {
     if messages.is_empty() {
         return Ok(());
     }
@@ -377,7 +391,7 @@ pub async fn attach_mentions(
          ORDER BY message_id, position",
     )
     .bind(&message_ids)
-    .fetch_all(pool)
+    .fetch_all(&state.pool)
     .await?;
     let mut by_message: HashMap<i64, Vec<Mention>> = HashMap::new();
     for row in &rows {
@@ -386,7 +400,7 @@ pub async fn attach_mentions(
             .or_default()
             .push(Mention {
                 user_id: row.get("user_id"),
-                name: row.get("name"),
+                name: row.text(&state.keys, "name")?,
             });
     }
     for message in messages.iter_mut() {
@@ -400,7 +414,9 @@ pub async fn attach_mentions(
 /// The rules a mention list must pass (protocol.md, "Mentioning a
 /// member"), every refusal `validation`. Membership is ONE query over the
 /// whole list against the chat's family: the assistant (in no family), a
-/// member who left and a scrubbed account all fail the same predicate.
+/// member who left and a scrubbed account all fail the same predicate. In a
+/// GROUP each one must also be a member of that group now — somebody
+/// outside it would not even receive the message (protocol.md, "Groups").
 async fn validate_mentions(
     state: &AppState,
     chat_id: i64,
@@ -409,8 +425,10 @@ async fn validate_mentions(
     mentions: &[Mention],
 ) -> Result<(), ApiError> {
     let refuse = |reason: &str| ApiError::bad_request(codes::VALIDATION, reason);
-    if chat_kind != "family" {
-        return Err(refuse("mentions are only accepted in the family chat"));
+    if chat_kind != "family" && chat_kind != "group" {
+        return Err(refuse(
+            "mentions are only accepted in the family chat and in a group",
+        ));
     }
     if mentions.len() > MAX_MENTIONS_PER_MESSAGE {
         return Err(refuse("a message names at most 20 members"));
@@ -429,14 +447,23 @@ async fn validate_mentions(
         }
     }
     let ids: Vec<i64> = mentions.iter().map(|mention| mention.user_id).collect();
+    // A member of the CHAT's family — the one family a family chat or a
+    // group is in — and never of the sender's other families
+    // (docs/protocol.md, "Several families").
     let members: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM users u
          WHERE u.id = ANY($1)
-           AND u.family_id IS NOT NULL
-           AND u.family_id = (SELECT family_id FROM chats WHERE id = $2)",
+           AND EXISTS (SELECT 1 FROM family_members fm
+                        WHERE fm.user_id = u.id
+                          AND fm.family_id = (SELECT family_id FROM chats WHERE id = $2))
+           AND ($3 <> 'group' OR EXISTS (
+                   SELECT 1 FROM chat_members cm
+                    WHERE cm.chat_id = $2 AND cm.user_id = u.id
+               ))",
     )
     .bind(&ids)
     .bind(chat_id)
+    .bind(chat_kind)
     .fetch_one(&state.pool)
     .await?;
     if members as usize != ids.len() {
@@ -526,18 +553,20 @@ fn validate_poll_options(state: &AppState, options: &[String]) -> Result<Vec<Str
 enum ModelSurface {
     /// The member's own `ai` chat: everything sent here goes to the model.
     Private,
-    /// The family chat, where only an `@ai` does (protocol.md, "Mentioning
-    /// the assistant in the family chat"). Family only, deliberately: a
-    /// direct chat is two people who each already have a private
-    /// assistant, and an assistant answering inside someone's one-to-one
-    /// is a third party in a conversation that had two.
+    /// The family chat or a group, where only an `@ai` does (protocol.md,
+    /// "Mentioning the assistant in the family chat", "Groups"). Never a
+    /// direct chat, deliberately: it is two people who each already have a
+    /// private assistant, and an assistant answering inside someone's
+    /// one-to-one is a third party in a conversation that had two.
     Mention,
 }
 
 fn model_surface(chat_kind: &str, body: &str) -> Option<ModelSurface> {
     match chat_kind {
         "ai" => Some(ModelSurface::Private),
-        "family" if crate::mentions::mentions_assistant(body) => Some(ModelSurface::Mention),
+        "family" | "group" if crate::mentions::mentions_assistant(body) => {
+            Some(ModelSurface::Mention)
+        }
         _ => None,
     }
 }
@@ -547,7 +576,7 @@ fn model_surface(chat_kind: &str, body: &str) -> Option<ModelSurface> {
 /// Returns `(message, created)`: `created == false` means the
 /// `(chat, sender, client_msg_id)` triple already existed and the original
 /// message is returned — the caller must not fan out again.
-// Twelve arguments, five over clippy's threshold. Grouping them into a struct
+// Thirteen arguments, six over clippy's threshold. Grouping them into a struct
 // would be a parameter object nothing else ever constructs — the call sites
 // are two, both in this crate, and each argument is a distinct thing the
 // caller genuinely has.
@@ -579,6 +608,11 @@ pub async fn create_message(
     // (protocol.md, "Video messages") — the sticker's pattern: the claim
     // stamps the flag, and every read carries it from then on.
     round: bool,
+    // True when the message's one attachment is sent as an ANIMATION
+    // (protocol.md, "Animations"; issue #96) — the same pattern a third
+    // time: the claim stamps the flag onto a video, and every read carries
+    // it from then on.
+    animation: bool,
     // Which language to answer an assistant question in, from the sending
     // device (docs/protocol.md, "The assistant"). None outside an assistant
     // chat, and harmless there too.
@@ -613,14 +647,15 @@ pub async fn create_message(
     }
 
     // Where a poll may live, checked before anything else about it: a poll
-    // is a family deciding something together, and between two people it is
-    // a question whose answer is the next message (protocol.md, "Polls").
-    // The assistant's chat refuses one for the same reason.
+    // is a family — or some of it, in a group — deciding something together,
+    // and between two people it is a question whose answer is the next
+    // message (protocol.md, "Polls"). The assistant's chat refuses one for
+    // the same reason.
     if poll.is_some() {
-        if chat_kind != "family" {
+        if chat_kind != "family" && chat_kind != "group" {
             return Err(ApiError::bad_request(
                 codes::INVALID_POLL,
-                "polls are only allowed in the family chat",
+                "polls are only allowed in the family chat and in a group",
             ));
         }
         if !attachment_ids.is_empty() {
@@ -646,6 +681,14 @@ pub async fn create_message(
                 "a message is a poll or a video message, not both",
             ));
         }
+        // And for an animation, check 1 of "Animations" — "What the server
+        // checks" (issue #96), in `round`'s place and for its reason.
+        if animation {
+            return Err(ApiError::bad_request(
+                codes::INVALID_POLL,
+                "a message is a poll or an animation, not both",
+            ));
+        }
     }
 
     // Check 2: one presentation per message. Asked before the sticker's own
@@ -656,6 +699,17 @@ pub async fn create_message(
     if round && sticker {
         return Err(ApiError::validation(
             "a message is a sticker or a video message, not both",
+        ));
+    }
+    // And an animation is the third presentation, check 2 of "Animations"
+    // (issue #96): beside either of the other two it is `validation`, asked
+    // here for the same two reasons — one answer to "both", whatever else
+    // is wrong, and no id read yet, so neither of 0055's
+    // `attachments_animation_not_sticker` nor `attachments_animation_not_round`
+    // can ever fire inside a request.
+    if animation && (sticker || round) {
+        return Err(ApiError::validation(
+            "a message is one of a sticker, a video message or an animation, not two",
         ));
     }
 
@@ -694,6 +748,20 @@ pub async fn create_message(
                 "a video message is sent without a body — a circle has no caption",
             ));
         }
+    }
+
+    // AN ANIMATION IS ONE PICTURE (protocol.md, "Animations", check 3;
+    // issue #96): exactly one video, for the sticker's and the video
+    // message's reason — the flag says how ONE attachment is drawn. Unlike
+    // either, it MAY carry a caption: an animation is drawn where a
+    // photograph would be, balloon and all, so the body is held only to the
+    // body's own rules below. What the video itself must be is checked at
+    // the claim.
+    if animation && attachment_ids.len() != 1 {
+        return Err(ApiError::bad_request(
+            codes::INVALID_ATTACHMENT,
+            "an animation is a message's one and only attachment",
+        ));
     }
 
     // Who the message names, checked before the insert and refused as
@@ -789,7 +857,7 @@ pub async fn create_message(
             let grandparent = match (
                 parent.get::<Option<i64>, _>("g_id"),
                 parent.get::<Option<i64>, _>("g_sender_id"),
-                parent.get::<Option<String>, _>("g_body"),
+                parent.text_opt(&state.keys, "g_body")?,
             ) {
                 (Some(id), Some(sender_id), Some(body)) => {
                     Some(QuotedParent::new(id, sender_id, &body))
@@ -800,7 +868,7 @@ pub async fn create_message(
                 ReplyTo::new(
                     parent.get("id"),
                     parent.get("sender_id"),
-                    parent.get::<String, _>("body").as_str(),
+                    &parent.text(&state.keys, "body")?,
                 )
                 .with_parent(grandparent),
             )
@@ -816,6 +884,10 @@ pub async fn create_message(
     // empty body, what everyone would be left with is a permanent, blank,
     // undeletable bubble that is also the chat's newest message.
     let mut tx = state.pool.begin().await?;
+    // The body, the mentions and the poll options are sealed under the
+    // chat's key (#59) — its own for a group, a direct or an assistant chat,
+    // the family's for the family chat.
+    let key = state.keys.key(&mut *tx, Owner::Chat(chat_id)).await?;
 
     // The chain's root, decided here and never again: the quoted message's
     // own root when it is a reply, the quoted message itself when it is
@@ -834,13 +906,13 @@ pub async fn create_message(
     .bind(chat_id)
     .bind(sender_id)
     .bind(client_msg_id)
-    .bind(body)
+    .bind(key.seal_str(body))
     .bind(reply_to_message_id)
     .fetch_optional(&mut *tx)
     .await?;
 
     if let Some(row) = inserted {
-        let mut message = Message::from_row(&row);
+        let mut message = Message::from_row(&row, &state.keys)?;
         // RETURNING cannot join, so the snippet resolved above is attached
         // here rather than re-read.
         message.reply_to = reply_to;
@@ -863,6 +935,15 @@ pub async fn create_message(
             // gets the 409. The `position` stamped is still the index in
             // the SENDER'S array, and the claimed list is put back into
             // that order below — the wire order never changes.
+            // The families this chat is listed in FOR THE SENDER: an upload
+            // may be used only in a chat its family lists (docs/protocol.md,
+            // "Several families"). The sender's view and not the pair's
+            // shared list, because a direct chat the other side has left
+            // shares nothing and is still the stayer's to write in, under
+            // the family their app lists it in. Read inside the
+            // transaction, beside the claims.
+            let chat_families =
+                crate::families::viewer_chat_family_ids(&mut *tx, chat_id, sender_id).await?;
             let mut lock_order: Vec<(usize, i64)> =
                 attachment_ids.iter().copied().enumerate().collect();
             lock_order.sort_unstable_by_key(|(_, id)| *id);
@@ -872,12 +953,16 @@ pub async fn create_message(
                     position,
                     claim_attachment(
                         &mut tx,
+                        &state.keys,
+                        &key,
                         attachment_id,
                         sender_id,
                         message.id,
                         position as i16,
                         sticker,
                         round,
+                        animation,
+                        &chat_families,
                     )
                     .await?,
                 ));
@@ -953,6 +1038,33 @@ pub async fn create_message(
                     ),
                 ));
             }
+            // WHAT AN ANIMATION MAY BE (protocol.md, "Animations", check 4;
+            // issue #96), after the claim for the video message's reason,
+            // and testing the REQUEST's flag for it too: the claim flagged
+            // the row only if it is a video, so a photo — a GIF that was
+            // never turned into a video, say — comes back unflagged and
+            // would otherwise sail through as an ordinary photo. Returning
+            // drops the transaction: no message, the upload unclaimed and
+            // unflagged, and a 400 the outbox treats as terminal.
+            //
+            // No byte ceiling: an animation is held to `max_attachment_bytes`
+            // only, which the upload already enforced. The shape and the
+            // length are the sender's DECLARATION; this server decodes
+            // nothing.
+            if animation
+                && let Some(video) = claimed.first()
+                && !video.fits_animation()
+            {
+                return Err(ApiError::bad_request(
+                    codes::INVALID_ATTACHMENT,
+                    format!(
+                        "an animation is a video/mp4 with a declared width and height of at \
+                         least 1, a short side of at most {} pixels, and a declared length of \
+                         at least 1 ms",
+                        Attachment::ANIMATION_MAX_SHORT_SIDE,
+                    ),
+                ));
+            }
             // Both fields, always together: the legacy `attachment` is the
             // first element, for clients that predate plurality.
             message.attachment = claimed.first().cloned();
@@ -969,7 +1081,7 @@ pub async fn create_message(
                 )
                 .bind(message.id)
                 .bind(mention.user_id)
-                .bind(&mention.name)
+                .bind(key.seal_str(&mention.name))
                 .bind(position as i32)
                 .execute(&mut *tx)
                 .await?;
@@ -983,8 +1095,14 @@ pub async fn create_message(
             // `chat_id` is taken from the row just inserted, not from the
             // request — nothing in the schema ties the two together.
             message.poll = Some(
-                crate::handlers_poll::create_poll(&mut tx, message.chat_id, message.id, options)
-                    .await?,
+                crate::handlers_poll::create_poll(
+                    &mut tx,
+                    &key,
+                    message.chat_id,
+                    message.id,
+                    options,
+                )
+                .await?,
             );
         }
         tx.commit().await?;
@@ -1039,7 +1157,7 @@ pub async fn create_message(
     .bind(client_msg_id)
     .fetch_one(&state.pool)
     .await?;
-    let mut message = Message::from_row(&row);
+    let mut message = Message::from_row(&row, &state.keys)?;
     // A retry re-acks the ORIGINAL message, which is a `Message` like any
     // other and must be hydrated like one. Both of these are load-bearing
     // rather than tidy:
@@ -1055,10 +1173,10 @@ pub async fn create_message(
     //     first write won, poll and all — and a client that retried would
     //     otherwise draw the question with no options.
     attach_reactions(state, std::slice::from_mut(&mut message)).await?;
-    attach_attachments(&state.pool, std::slice::from_mut(&mut message)).await?;
-    attach_polls(&state.pool, std::slice::from_mut(&mut message)).await?;
+    attach_attachments(state, std::slice::from_mut(&mut message)).await?;
+    attach_polls(state, std::slice::from_mut(&mut message)).await?;
     attach_calls(&state.pool, std::slice::from_mut(&mut message)).await?;
-    attach_mentions(&state.pool, std::slice::from_mut(&mut message)).await?;
+    attach_mentions(state, std::slice::from_mut(&mut message)).await?;
     Ok((message, false))
 }
 
@@ -1148,10 +1266,17 @@ pub async fn apply_edit(
     if is_round {
         return Err(ApiError::validation("a video message cannot be edited"));
     }
+    // An ANIMATION is deliberately NOT refused here (protocol.md,
+    // "Animations"; issue #96): it is drawn where a photograph would be,
+    // balloon and caption included, so its caption is the author's to
+    // rewrite like any other. Only the body changes below — the flag lives
+    // on the attachment, which no edit touches.
 
-    let current_body: String = locked.get("body");
+    // Compared opened (#59): two sealings of the same words never match.
+    let current_body = locked.text(&state.keys, "body")?;
     let changed = current_body != body;
     if changed {
+        let key = state.keys.key(&mut *tx, Owner::Chat(chat_id)).await?;
         let seq: i64 = sqlx::query_scalar("SELECT nextval('message_edit_seq')")
             .fetch_one(&mut *tx)
             .await?;
@@ -1159,7 +1284,7 @@ pub async fn apply_edit(
             "UPDATE messages SET body = $2, edit_seq = $3, edited_at = now() WHERE id = $1",
         )
         .bind(message_id)
-        .bind(&body)
+        .bind(key.seal_str(&body))
         .bind(seq)
         .execute(&mut *tx)
         .await?;
@@ -1196,12 +1321,12 @@ pub async fn fetch_message(
     .fetch_optional(&state.pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
-    let mut message = Message::from_row(&row);
+    let mut message = Message::from_row(&row, &state.keys)?;
     attach_reactions(state, std::slice::from_mut(&mut message)).await?;
-    attach_attachments(&state.pool, std::slice::from_mut(&mut message)).await?;
-    attach_polls(&state.pool, std::slice::from_mut(&mut message)).await?;
+    attach_attachments(state, std::slice::from_mut(&mut message)).await?;
+    attach_polls(state, std::slice::from_mut(&mut message)).await?;
     attach_calls(&state.pool, std::slice::from_mut(&mut message)).await?;
-    attach_mentions(&state.pool, std::slice::from_mut(&mut message)).await?;
+    attach_mentions(state, std::slice::from_mut(&mut message)).await?;
     Ok(Some(message))
 }
 
@@ -1225,12 +1350,12 @@ pub async fn fetch_message_by_client_id(
     .fetch_optional(&state.pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
-    let mut message = Message::from_row(&row);
+    let mut message = Message::from_row(&row, &state.keys)?;
     attach_reactions(state, std::slice::from_mut(&mut message)).await?;
-    attach_attachments(&state.pool, std::slice::from_mut(&mut message)).await?;
-    attach_polls(&state.pool, std::slice::from_mut(&mut message)).await?;
+    attach_attachments(state, std::slice::from_mut(&mut message)).await?;
+    attach_polls(state, std::slice::from_mut(&mut message)).await?;
     attach_calls(&state.pool, std::slice::from_mut(&mut message)).await?;
-    attach_mentions(&state.pool, std::slice::from_mut(&mut message)).await?;
+    attach_mentions(state, std::slice::from_mut(&mut message)).await?;
     Ok(Some(message))
 }
 
@@ -1267,8 +1392,17 @@ pub fn merge_attachment_ids(
 /// protocol's error rather than silence.
 /// Runs inside the caller's transaction so that a refusal takes the
 /// message and every sibling claim with it — see the note at the insert.
+// Nine arguments, over clippy's threshold since the animation's flag
+// (issue #96) and one more since uploads name their family (#88). The three
+// flags are the send's three presentations, each stamped in the one UPDATE;
+// folding them into a struct would be a type with one caller.
+#[allow(clippy::too_many_arguments)]
 async fn claim_attachment(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    keys: &Keyring,
+    // The chat's key: a claimed upload's file key and words are re-sealed
+    // under it (#59), so the picture goes with the conversation.
+    holder: &SealKey,
     attachment_id: i64,
     uploader_id: i64,
     message_id: i64,
@@ -1283,14 +1417,26 @@ async fn claim_attachment(
     // a video message is claimed unflagged and refused by the caller's
     // check, as `invalid_attachment`, with the transaction dropped.
     round: bool,
+    // The animation's flag, stamped by the same rule and for the same
+    // reason (protocol.md, "Animations"; issue #96): `animation = ($7 AND
+    // kind = 'video')`, so 0055's `attachments_animation_is_video` can
+    // never fire here, and a photo sent as an animation is claimed
+    // unflagged and refused by the caller's check.
+    animation: bool,
+    // The families the chat is listed in (`Chat.family_ids`): an upload
+    // made for any other family answers exactly as an id that does not
+    // exist (docs/protocol.md, "Several families").
+    chat_families: &[i64],
 ) -> Result<Attachment, ApiError> {
     let row = sqlx::query(
         "UPDATE attachments
-         SET message_id = $3, position = $4, sticker = $5, round = ($6 AND kind = 'video')
+         SET message_id = $3, position = $4, sticker = $5, round = ($6 AND kind = 'video'),
+             animation = ($7 AND kind = 'video')
          WHERE id = $1 AND uploader_id = $2 AND message_id IS NULL AND note_id IS NULL
            AND pack_item_id IS NULL
+           AND family_id = ANY($8)
          RETURNING id, kind, mime, size_bytes, width, height, duration_ms, has_preview, name,
-                   latitude, longitude, accuracy_m, sticker, round, waveform",
+                   latitude, longitude, accuracy_m, sticker, round, animation, waveform",
     )
     .bind(attachment_id)
     .bind(uploader_id)
@@ -1298,10 +1444,14 @@ async fn claim_attachment(
     .bind(position)
     .bind(sticker)
     .bind(round)
+    .bind(animation)
+    .bind(chat_families)
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(row) = row {
-        return Ok(Attachment::from_row(&row));
+        let attachment = Attachment::from_row(&row, keys)?;
+        crate::handlers_attachment::reseal_for(tx, keys, attachment_id, holder).await?;
+        return Ok(attachment);
     }
 
     // Tell "already claimed" apart from "not yours / no such thing" — the
@@ -1311,10 +1461,11 @@ async fn claim_attachment(
     // deleting any of them take the bytes with it.
     let taken: Option<bool> = sqlx::query_scalar(
         "SELECT message_id IS NOT NULL OR note_id IS NOT NULL OR pack_item_id IS NOT NULL
-         FROM attachments WHERE id = $1 AND uploader_id = $2",
+         FROM attachments WHERE id = $1 AND uploader_id = $2 AND family_id = ANY($3)",
     )
     .bind(attachment_id)
     .bind(uploader_id)
+    .bind(chat_families)
     .fetch_optional(&mut **tx)
     .await?;
     if taken == Some(true) {
@@ -1423,24 +1574,41 @@ pub async fn apply_reaction(
     };
     let current_seq: i64 = locked.get("reaction_seq");
 
-    // RETURNING yields a row only when something was actually written, so
-    // a re-PUT of the same emoji or a DELETE of nothing is detected here
-    // and burns neither a sequence value nor a fan-out.
+    // A re-PUT of the same emoji or a DELETE of nothing is detected here
+    // and burns neither a sequence value nor a fan-out. The emoji is sealed
+    // (#59), so "the same" is decided on the opened value rather than by the
+    // database — under the message lock taken above, which no other reaction
+    // to this message can get past.
     let changed = match &emoji {
-        Some(emoji) => sqlx::query(
-            "INSERT INTO message_reactions (message_id, user_id, emoji)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (message_id, user_id) DO UPDATE
-             SET emoji = EXCLUDED.emoji, created_at = now()
-             WHERE message_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
-             RETURNING message_id",
-        )
-        .bind(message_id)
-        .bind(user_id)
-        .bind(emoji)
-        .fetch_optional(&mut *tx)
-        .await?
-        .is_some(),
+        Some(emoji) => {
+            let current: Option<Vec<u8>> = sqlx::query_scalar(
+                "SELECT emoji FROM message_reactions WHERE message_id = $1 AND user_id = $2",
+            )
+            .bind(message_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let current = current
+                .map(|sealed| state.keys.open_text(&sealed))
+                .transpose()?;
+            if current.as_deref() == Some(emoji.as_str()) {
+                false
+            } else {
+                let key = state.keys.key(&mut *tx, Owner::Chat(chat_id)).await?;
+                sqlx::query(
+                    "INSERT INTO message_reactions (message_id, user_id, emoji)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (message_id, user_id) DO UPDATE
+                     SET emoji = EXCLUDED.emoji, created_at = now()",
+                )
+                .bind(message_id)
+                .bind(user_id)
+                .bind(key.seal_str(emoji))
+                .execute(&mut *tx)
+                .await?;
+                true
+            }
+        }
         None => sqlx::query(
             "DELETE FROM message_reactions
              WHERE message_id = $1 AND user_id = $2
@@ -1476,7 +1644,7 @@ pub async fn apply_reaction(
         current_seq
     };
 
-    let reactions = fetch_reaction_rows(&mut *tx, message_id).await?;
+    let reactions = fetch_reaction_rows(&mut *tx, &state.keys, message_id).await?;
     tx.commit().await?;
 
     Ok(ReactionState {
@@ -1489,7 +1657,11 @@ pub async fn apply_reaction(
 }
 
 /// A message's current reactions, in stable (created_at, user_id) order.
-async fn fetch_reaction_rows<'e, E>(executor: E, message_id: i64) -> Result<Vec<Reaction>, ApiError>
+async fn fetch_reaction_rows<'e, E>(
+    executor: E,
+    keys: &Keyring,
+    message_id: i64,
+) -> Result<Vec<Reaction>, ApiError>
 where
     E: sqlx::PgExecutor<'e>,
 {
@@ -1503,11 +1675,13 @@ where
     .await?;
     Ok(rows
         .iter()
-        .map(|row| Reaction {
-            user_id: row.get("user_id"),
-            emoji: row.get("emoji"),
+        .map(|row| {
+            Ok(Reaction {
+                user_id: row.get("user_id"),
+                emoji: row.text(keys, "emoji")?,
+            })
         })
-        .collect())
+        .collect::<Result<_, KeyError>>()?)
 }
 
 /// `GET /chats` — every chat the caller is a member of, with a last-message
@@ -1520,8 +1694,40 @@ pub async fn list_chats(
     // assistant on later needs nobody to re-register and leaving it off
     // costs an empty chat in nobody's list. A no-op when it already exists,
     // or when the server is not configured for it.
-    if let Err(error) = crate::handlers_ai::ensure_ai_chat(&state, auth.user_id).await {
-        tracing::warn!(%error, "could not ensure the assistant chat");
+    //
+    // One per FAMILY since 2026-10-22 (docs/protocol.md, "Several
+    // families"; D6): every family this response will list gets its own —
+    // all of them for a client that knows about several families, the home
+    // family's alone for one that does not.
+    let listed_families: Vec<i64> = if auth.multi {
+        auth.family_ids.clone()
+    } else {
+        auth.home_family().into_iter().collect()
+    };
+    // The families whose thread is missing or unreachable, in ONE query:
+    // every refresh asks, and once each thread exists the answer is empty —
+    // `ensure_ai_chat`'s own reads and transaction are for the rare family
+    // that needs it.
+    let missing: Vec<i64> = if state.cfg.ai.is_usable() && !listed_families.is_empty() {
+        sqlx::query_scalar(
+            "SELECT f.id FROM unnest($2::bigint[]) AS f(id)
+              WHERE NOT EXISTS (SELECT 1 FROM chats c
+                                  JOIN chat_members cm ON cm.chat_id = c.id AND cm.user_id = $1
+                                 WHERE c.kind = 'ai' AND c.user_a_id = $1 AND c.family_id = f.id)",
+        )
+        .bind(auth.user_id)
+        .bind(&listed_families)
+        .fetch_all(&state.pool)
+        .await?
+    } else {
+        Vec::new()
+    };
+    for &family_id in &missing {
+        if let Err(error) =
+            crate::handlers_ai::ensure_ai_chat(&state, auth.user_id, family_id).await
+        {
+            tracing::warn!(%error, "could not ensure the assistant chat");
+        }
     }
     // The other end of a direct chat, from $1's point of view. Written
     // once because it is now needed THREE times in this one statement —
@@ -1532,6 +1738,19 @@ pub async fn list_chats(
     let rows = sqlx::query(&format!(
         "SELECT c.id AS chat_id, c.kind,
                 f.name AS family_name,
+                -- Which families list the chat (protocol.md, \"Several
+                -- families\"): its own one, or for a direct chat every
+                -- family the two share.
+                {family_ids} AS family_ids,
+                -- A group's own name, members (in the order they joined)
+                -- and admin (protocol.md, \"Groups\"); NULL for every
+                -- other kind.
+                c.title AS group_title,
+                c.admin_user_id AS group_admin_user_id,
+                CASE WHEN c.kind = 'group' THEN (
+                    SELECT array_agg(gm.user_id ORDER BY gm.joined_at, gm.user_id)
+                    FROM chat_members gm WHERE gm.chat_id = c.id
+                ) END AS group_member_ids,
                 CASE WHEN c.kind = 'direct' THEN {PEER} END AS peer_user_id,
                 pu.display_name AS peer_display_name,
                 lm.id AS last_id, lm.sender_id AS last_sender_id,
@@ -1609,11 +1828,32 @@ pub async fn list_chats(
                   AND c.kind = 'direct'
                   AND mb.blocked_user_id = {PEER}
            )
-         ORDER BY COALESCE(lm.id, 0) DESC, c.id"
+         ORDER BY COALESCE(lm.id, 0) DESC, c.id",
+        family_ids = crate::families::viewer_chat_family_ids_sql("$1"),
     ))
     .bind(auth.user_id)
     .fetch_all(&state.pool)
     .await?;
+
+    // An app from before several families is answered about its HOME
+    // family alone (docs/protocol.md, "Several families"; D8): the chats
+    // whose `family_ids` contain it. A direct chat whose pair shares no
+    // family any more is listed to the side that stayed under a family of
+    // theirs (`viewer_chat_family_ids_sql`), so it is never `[]` here; the
+    // empty case is kept as "listed" anyway, the answer this server has
+    // always given. A multi-family client gets every chat and sorts them by
+    // `family_ids`.
+    let home = auth.home_family();
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|row| {
+            if auth.multi {
+                return true;
+            }
+            let family_ids: Vec<i64> = row.get("family_ids");
+            family_ids.is_empty() || home.is_some_and(|home| family_ids.contains(&home))
+        })
+        .collect();
 
     // The preview attachments, hydrated with ONE page-sized query rather
     // than joined inside the lateral (see the note there). Trimmed exactly
@@ -1629,7 +1869,8 @@ pub async fn list_chats(
     let mut preview_attachments: HashMap<i64, Vec<Attachment>> = HashMap::new();
     if !preview_ids.is_empty() {
         let attachment_rows = sqlx::query(
-            "SELECT message_id, id, kind, mime, size_bytes, has_preview, name, sticker, round
+            "SELECT message_id, id, kind, mime, size_bytes, has_preview, name, sticker, round,
+                    animation
              FROM attachments
              WHERE message_id = ANY($1)
              ORDER BY message_id, position, id",
@@ -1650,7 +1891,7 @@ pub async fn list_chats(
                     height: None,
                     duration_ms: None,
                     has_preview: row.get("has_preview"),
-                    name: row.get("name"),
+                    name: row.text_opt(&state.keys, "name")?,
                     latitude: None,
                     longitude: None,
                     accuracy_m: None,
@@ -1661,6 +1902,9 @@ pub async fn list_chats(
                     // And this one, so a row can say "Video message" where
                     // it would say "Video" (protocol.md, "Video messages").
                     round: row.get("round"),
+                    // And this one, so a row can say "GIF" where it would
+                    // say "Video" (protocol.md, "Animations"; issue #96).
+                    animation: row.get("animation"),
                     // Not this: a row draws no bubble, so it needs the
                     // shape of a voice note no more than its duration
                     // (protocol.md, "A voice note's waveform").
@@ -1674,70 +1918,91 @@ pub async fn list_chats(
         .map(|row| {
             let kind: String = row.get("kind");
             let peer_user_id: Option<i64> = row.get("peer_user_id");
+            // Whichever name the row needs is opened, and only that one.
             let title: String = match kind.as_str() {
-                "family" => row.get("family_name"),
+                "family" => row.text(&state.keys, "family_name")?,
                 // The assistant has no peer to name it after — and its
                 // reserved account is not in the roster, so a lookup would
                 // find nothing anyway.
                 "ai" => state.cfg.ai.title.clone(),
-                _ => row.get("peer_display_name"),
+                "group" => row
+                    .text_opt(&state.keys, "group_title")?
+                    .unwrap_or_default(),
+                _ => row.text(&state.keys, "peer_display_name")?,
+            };
+            let (member_ids, admin_user_id) = if kind == "group" {
+                (
+                    Some(
+                        row.get::<Option<Vec<i64>>, _>("group_member_ids")
+                            .unwrap_or_default(),
+                    ),
+                    row.get::<Option<i64>, _>("group_admin_user_id"),
+                )
+            } else {
+                (None, None)
             };
             let chat_id: i64 = row.get("chat_id");
-            let last_message = row.get::<Option<i64>, _>("last_id").map(|last_id| {
-                // The attachments DO come along: without them a client has
-                // nothing to write on the row for a caption-less photo.
-                // Hydrated above; the legacy `attachment` is the first
-                // element, exactly as on a full message.
-                let attachments = preview_attachments.remove(&last_id);
-                Message {
-                    id: last_id,
-                    chat_id,
-                    sender_id: row.get("last_sender_id"),
-                    client_msg_id: row.get("last_client_msg_id"),
-                    body: row.get("last_body"),
-                    created_at: row.get("last_created_at"),
-                    reactions: None,
-                    reaction_seq: None,
-                    // Previews carry neither reactions nor the quote: the chat
-                    // list draws one line of text, not a bubble.
-                    reply_to: None,
-                    // Nor the chain: a preview is one line of text, and
-                    // "N replies" is drawn on the bubble it belongs to.
-                    thread_root_id: None,
-                    reply_count: None,
-                    // Nor who it names: the mark is on the row, not the preview.
-                    mentions: None,
-                    // Nor the edit stamps — the preview is the current text,
-                    // and whether it was edited is a bubble's business.
-                    edited_at: None,
-                    edit_seq: None,
-                    attachment: attachments.as_ref().and_then(|list| list.first().cloned()),
-                    attachments,
-                    // Nor the poll. A poll's QUESTION is the body, which the
-                    // preview already carries — the options are a bubble's
-                    // business and three tables' worth of reads per chat.
-                    poll: None,
-                    // The call record DOES come along: its placeholder body is
-                    // not something a client should show, so a preview needs the
-                    // outcome to draw its own line ("Missed voice call", "5:12").
-                    call: row.get::<Option<String>, _>("call_outcome").map(|outcome| {
-                        crate::models::CallRecord {
-                            outcome,
-                            duration_secs: row.get("call_duration_secs"),
-                            video: row.get::<Option<bool>, _>("call_video").unwrap_or(false),
-                        }
-                    }),
-                }
-            });
+            let last_message = row
+                .get::<Option<i64>, _>("last_id")
+                .map(|last_id| -> Result<Message, KeyError> {
+                    // The attachments DO come along: without them a client has
+                    // nothing to write on the row for a caption-less photo.
+                    // Hydrated above; the legacy `attachment` is the first
+                    // element, exactly as on a full message.
+                    let attachments = preview_attachments.remove(&last_id);
+                    Ok(Message {
+                        id: last_id,
+                        chat_id,
+                        sender_id: row.get("last_sender_id"),
+                        client_msg_id: row.get("last_client_msg_id"),
+                        body: row.text(&state.keys, "last_body")?,
+                        created_at: row.get("last_created_at"),
+                        reactions: None,
+                        reaction_seq: None,
+                        // Previews carry neither reactions nor the quote: the chat
+                        // list draws one line of text, not a bubble.
+                        reply_to: None,
+                        // Nor the chain: a preview is one line of text, and
+                        // "N replies" is drawn on the bubble it belongs to.
+                        thread_root_id: None,
+                        reply_count: None,
+                        // Nor who it names: the mark is on the row, not the preview.
+                        mentions: None,
+                        // Nor the edit stamps — the preview is the current text,
+                        // and whether it was edited is a bubble's business.
+                        edited_at: None,
+                        edit_seq: None,
+                        attachment: attachments.as_ref().and_then(|list| list.first().cloned()),
+                        attachments,
+                        // Nor the poll. A poll's QUESTION is the body, which the
+                        // preview already carries — the options are a bubble's
+                        // business and three tables' worth of reads per chat.
+                        poll: None,
+                        // The call record DOES come along: its placeholder body is
+                        // not something a client should show, so a preview needs the
+                        // outcome to draw its own line ("Missed voice call", "5:12").
+                        call: row.get::<Option<String>, _>("call_outcome").map(|outcome| {
+                            crate::models::CallRecord {
+                                outcome,
+                                duration_secs: row.get("call_duration_secs"),
+                                video: row.get::<Option<bool>, _>("call_video").unwrap_or(false),
+                            }
+                        }),
+                    })
+                })
+                .transpose()?;
             let last_reaction_seq: i64 = row.get("last_reaction_seq");
             let last_edit_seq: i64 = row.get("last_edit_seq");
             let last_poll_seq: i64 = row.get("last_poll_seq");
-            ChatListEntry {
+            Ok(ChatListEntry {
                 chat: Chat {
                     id: chat_id,
                     kind,
                     title,
                     peer_user_id,
+                    member_ids,
+                    admin_user_id,
+                    family_ids: row.get("family_ids"),
                 },
                 last_message,
                 unread_count: row.get("unread_count"),
@@ -1746,9 +2011,9 @@ pub async fn list_chats(
                 max_edit_seq: (last_edit_seq > 0).then_some(last_edit_seq),
                 max_poll_seq: (last_poll_seq > 0).then_some(last_poll_seq),
                 mentioned: row.get::<bool, _>("mentioned").then_some(true),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, KeyError>>()?;
 
     Ok((StatusCode::OK, Json(json!({"chats": chats}))).into_response())
 }
@@ -1767,21 +2032,25 @@ pub async fn direct_chat(
             "cannot open a direct chat with yourself",
         ));
     }
-    let Some(family_id) = auth.family_id else {
+    if auth.family_ids.is_empty() {
         // Without a family there is no shared family to be in.
         return Err(ApiError::conflict(
             codes::NOT_IN_FAMILY,
             "you do not belong to a family",
         ));
-    };
-    let peer = sqlx::query("SELECT id, family_id, display_name FROM users WHERE id = $1")
+    }
+    let peer = sqlx::query("SELECT id, display_name FROM users WHERE id = $1")
         .bind(req.user_id)
         .fetch_optional(&state.pool)
         .await?;
     let Some(peer) = peer else {
         return Err(ApiError::not_found(codes::USER_NOT_FOUND, "no such user"));
     };
-    if peer.get::<Option<i64>, _>("family_id") != Some(family_id) {
+    // ONE shared family is enough since 2026-10-22, and the chat is listed
+    // in every family the two share (docs/protocol.md, "Several families"):
+    // a direct chat belongs to the pair, not to a family.
+    let shared = crate::families::shared_families(&state.pool, auth.user_id, req.user_id).await?;
+    if shared.is_empty() {
         return Err(ApiError::conflict(
             codes::NOT_SAME_FAMILY,
             "this user is not in your family",
@@ -1807,20 +2076,38 @@ pub async fn direct_chat(
 
     let (user_a, user_b) = ordered_pair(auth.user_id, req.user_id);
     let mut tx = state.pool.begin().await?;
-    // On conflict the family_id is refreshed: a pair that left family X and
-    // reunited in family Y keeps one chat (and its history) across moves.
-    let chat_id: i64 = sqlx::query_scalar(
-        "INSERT INTO chats (family_id, kind, user_a_id, user_b_id)
-         VALUES ($1, 'direct', $2, $3)
+    // The row's own `family_id` is one of the families the two share — the
+    // lowest — and on conflict it is moved there only when it names a family
+    // they no longer share: a pair that left family X and reunited in family
+    // Y keeps one chat (and its history) across moves, and a family being
+    // deleted can never take by cascade a chat whose row names it while the
+    // pair still shares another.
+    //
+    // A direct chat has a key of its own (#59), so it outlives any one family
+    // and goes with its account. The key made here is used only when the row
+    // is new; a chat that already existed keeps its own, and the new one is
+    // discarded in the same transaction.
+    let key = state.keys.create(&mut tx).await?;
+    let (chat_id, key_id): (i64, i64) = sqlx::query_as(
+        "INSERT INTO chats (family_id, kind, user_a_id, user_b_id, key_id)
+         VALUES ($1, 'direct', $2, $3, $5)
          ON CONFLICT (user_a_id, user_b_id) WHERE kind = 'direct'
-         DO UPDATE SET family_id = EXCLUDED.family_id
-         RETURNING id",
+         DO UPDATE SET family_id = CASE WHEN chats.family_id = ANY($4) THEN chats.family_id
+                                        ELSE EXCLUDED.family_id END
+         RETURNING id, key_id",
     )
-    .bind(family_id)
+    .bind(shared[0])
     .bind(user_a)
     .bind(user_b)
+    .bind(&shared)
+    .bind(key.id())
     .fetch_one(&mut *tx)
     .await?;
+    if key_id == key.id() {
+        state.keys.remember(Owner::Chat(chat_id), &key);
+    } else {
+        state.keys.discard(&mut tx, key).await?;
+    }
     sqlx::query(
         "INSERT INTO chat_members (chat_id, user_id)
          VALUES ($1, $2), ($1, $3)
@@ -1836,8 +2123,11 @@ pub async fn direct_chat(
     let chat = Chat {
         id: chat_id,
         kind: "direct".to_string(),
-        title: peer.get("display_name"),
+        title: peer.text(&state.keys, "display_name")?,
         peer_user_id: Some(req.user_id),
+        member_ids: None,
+        admin_user_id: None,
+        family_ids: shared,
     };
     Ok((StatusCode::OK, Json(json!({"chat": chat}))).into_response())
 }
@@ -1896,12 +2186,15 @@ pub async fn get_messages(
         .await?
     };
 
-    let mut messages: Vec<Message> = rows.iter().map(Message::from_row).collect();
+    let mut messages: Vec<Message> = rows
+        .iter()
+        .map(|row| Message::from_row(row, &state.keys))
+        .collect::<Result<_, KeyError>>()?;
     attach_reactions(&state, &mut messages).await?;
-    attach_attachments(&state.pool, &mut messages).await?;
-    attach_polls(&state.pool, &mut messages).await?;
+    attach_attachments(&state, &mut messages).await?;
+    attach_polls(&state, &mut messages).await?;
     attach_calls(&state.pool, &mut messages).await?;
-    attach_mentions(&state.pool, &mut messages).await?;
+    attach_mentions(&state, &mut messages).await?;
 
     Ok((StatusCode::OK, Json(json!({"messages": messages}))).into_response())
 }
@@ -1936,6 +2229,7 @@ pub async fn post_message(
         req.mentions.as_deref().unwrap_or(&[]),
         req.sticker.unwrap_or(false),
         req.round.unwrap_or(false),
+        req.animation.unwrap_or(false),
         language.as_deref(),
     )
     .await?;
@@ -2083,12 +2377,15 @@ pub async fn get_edits(
     .fetch_all(&state.pool)
     .await?;
 
-    let mut messages: Vec<Message> = rows.iter().map(Message::from_row).collect();
+    let mut messages: Vec<Message> = rows
+        .iter()
+        .map(|row| Message::from_row(row, &state.keys))
+        .collect::<Result<_, KeyError>>()?;
     attach_reactions(&state, &mut messages).await?;
-    attach_attachments(&state.pool, &mut messages).await?;
-    attach_polls(&state.pool, &mut messages).await?;
+    attach_attachments(&state, &mut messages).await?;
+    attach_polls(&state, &mut messages).await?;
     attach_calls(&state.pool, &mut messages).await?;
-    attach_mentions(&state.pool, &mut messages).await?;
+    attach_mentions(&state, &mut messages).await?;
 
     Ok((StatusCode::OK, Json(json!({"messages": messages}))).into_response())
 }
@@ -2150,12 +2447,15 @@ pub async fn get_open_polls(
     .fetch_all(&state.pool)
     .await?;
 
-    let mut messages: Vec<Message> = rows.iter().map(Message::from_row).collect();
+    let mut messages: Vec<Message> = rows
+        .iter()
+        .map(|row| Message::from_row(row, &state.keys))
+        .collect::<Result<_, KeyError>>()?;
     attach_reactions(&state, &mut messages).await?;
-    attach_attachments(&state.pool, &mut messages).await?;
-    attach_polls(&state.pool, &mut messages).await?;
+    attach_attachments(&state, &mut messages).await?;
+    attach_polls(&state, &mut messages).await?;
     attach_calls(&state.pool, &mut messages).await?;
-    attach_mentions(&state.pool, &mut messages).await?;
+    attach_mentions(&state, &mut messages).await?;
 
     Ok((StatusCode::OK, Json(json!({"messages": messages}))).into_response())
 }
@@ -2216,12 +2516,15 @@ pub async fn get_thread(
     .fetch_all(&state.pool)
     .await?;
 
-    let mut messages: Vec<Message> = rows.iter().map(Message::from_row).collect();
+    let mut messages: Vec<Message> = rows
+        .iter()
+        .map(|row| Message::from_row(row, &state.keys))
+        .collect::<Result<_, KeyError>>()?;
     attach_reactions(&state, &mut messages).await?;
-    attach_attachments(&state.pool, &mut messages).await?;
-    attach_polls(&state.pool, &mut messages).await?;
+    attach_attachments(&state, &mut messages).await?;
+    attach_polls(&state, &mut messages).await?;
     attach_calls(&state.pool, &mut messages).await?;
-    attach_mentions(&state.pool, &mut messages).await?;
+    attach_mentions(&state, &mut messages).await?;
 
     Ok((StatusCode::OK, Json(json!({"messages": messages}))).into_response())
 }
@@ -2272,7 +2575,7 @@ pub async fn get_reactions(
                 .or_default()
                 .push(Reaction {
                     user_id: row.get("user_id"),
-                    emoji: row.get("emoji"),
+                    emoji: row.text(&state.keys, "emoji")?,
                 });
         }
     }

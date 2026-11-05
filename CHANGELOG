@@ -1,3 +1,344 @@
+2026-11-05          v1.3.0
+
+                    Groups for part of a family, one account in several
+                    families, Family Hosting for a new family on a server
+                    that charges for it, everything a server stores
+                    encrypted under its own key, formulas, diagrams and
+                    graphs drawn in the message, emoji and capital letters
+                    as you type, animated pictures that move, videos that
+                    keep their sound, the same message row on every
+                    client, and a new client for Linux.
+
+                    GROUPS. A group is a chat for some of a family's
+                    members, with a name and a member list, beside the
+                    family chat, which is untouched. Any member starts one
+                    — New Group in the New Chat sheet on iPhone, iPad and
+                    Android, in the toolbar on the Mac, above the chat
+                    list on the web, Windows and Linux — with at least one
+                    other person, and becomes its admin. Only the admin
+                    renames it, adds and removes people, and deletes it,
+                    which asks first and deletes its messages for
+                    everyone; anybody can leave, an admin who leaves hands
+                    the group to the member who joined it earliest, and
+                    the last one out deletes it. Group Info, from the
+                    title, shows who is in it. Somebody added later sees
+                    the whole history with nothing marked unread. Only its
+                    members can see a group at all: everyone else, the
+                    family owner included, is told it does not exist.
+                    Inside, it is the family chat with fewer people —
+                    sender names, threads, polls, mentions of its members,
+                    stickers, voice and video messages, formulas, and @ai,
+                    which reads only that group. It has no calls, no
+                    "seen" ticks and no daily greeting, and its pushes are
+                    titled "Group — Sender". A name is 1 to 64 characters
+                    and a family has at most 50 groups. Leaving the family
+                    leaves every group in it, and coming back does not
+                    restore them.
+
+                    SEVERAL FAMILIES. One account — one login, name,
+                    picture, birthday, set of blocks and assistant
+                    agreement — can now belong to more than one family:
+                    somebody in their parents' family starts their own and
+                    keeps both. Each family keeps its own chat, groups,
+                    board, sticker pack, assistant chat, settings and
+                    reports, and nobody is told which other families
+                    anybody is in. There are three doors, all inside the
+                    app: New Family…, in Settings, while you own no
+                    family; Join Another Family…, in Settings, with an
+                    invite code; and an owner's Invite…, which offers
+                    members of their other families, who accept or decline
+                    (at most 50 pending a family). The apps show one
+                    family at a time; the family's name at the top of the
+                    chats — a menu in the sidebar's header on the Mac —
+                    switches between them and shows each one's unread
+                    count, and an account in one family sees no switcher.
+                    A one-to-one chat belongs to the two people and is
+                    listed in every family they share. Leaving or being
+                    removed is per family, and the seven-day clock for an
+                    account in no family starts only when it leaves the
+                    last one. An owner can reset a member's password only
+                    if they own every family that member is in. At most 5
+                    families an account by default.
+
+                    FAMILY HOSTING. A server may now charge for a NEW
+                    family. With the operator's switch on, starting one
+                    needs its owner's Family Hosting subscription, monthly
+                    or yearly, sold in the App Store and only by the Apple
+                    app — one purchase serves iPhone, iPad and Mac. The
+                    app shows it on a Host Your Family screen between the
+                    family's name and its creation, with Restore
+                    Purchases, and Settings shows when it renews or ends,
+                    with Manage Subscription. Members never pay, joining
+                    is free everywhere, one subscription covers every
+                    family its account owns, and every family that existed
+                    before the switch, or is created while it is off,
+                    stays free. The web, Windows and Linux say that a new
+                    family on such a server is started in the iPhone, iPad
+                    or Mac app; Android, under Google Play's payments
+                    rules, says only that it cannot be started from this
+                    app. When a paid family's subscription ends, every
+                    member is told, a banner over its chats names the day,
+                    and fourteen days later — warned again the day before
+                    — the family is deleted, unless it is renewed, handed
+                    to a subscriber or made free by the operator;
+                    everything works until then. Leaving a family or
+                    deleting the account cancels nothing at Apple, and the
+                    Apple app says so. A paid family has limits of its
+                    own: 25 members, 10 GiB of files, and a monthly
+                    assistant allowance of 2,000,000 tokens, 30 pictures
+                    and 120 minutes of transcripts, shown in the family's
+                    statistics.
+
+                    STORED ENCRYPTED. What people write, say, show and are
+                    — messages, notes, poll options, transcripts, names,
+                    usernames, password hashes, birthdays, profile
+                    pictures, file names, coordinates, reactions, report
+                    excerpts, invite codes, push tokens, and every
+                    attachment and preview on disk — is sealed by the
+                    server before it reaches PostgreSQL or the disk, under
+                    a key for each family, each conversation and each
+                    account, all of them wrapped by one server key kept in
+                    a file outside the database. A dump, a backup, a
+                    snapshot or a stolen disk opens nothing without that
+                    file. It protects copies, not the running server: the
+                    server still reads what it reads, and whoever runs it
+                    can too, so this is not end-to-end encryption.
+                    Deleting a family, a conversation or an account
+                    destroys its key, and a week later no backup can open
+                    it; a single message or file deleted on its own is not
+                    covered. Nothing changes on the wire, and no client
+                    changes.
+
+                    FORMULAS, DIAGRAMS AND GRAPHS. A message bubble now
+                    draws what was markup: maths between $ signs, or $$,
+                    \[ and \( forms, and fences tagged math, mermaid, dot
+                    (or a Graphviz layout name) and plot. One renderer —
+                    KaTeX with mhchem, Mermaid, Graphviz and md's plotter
+                    — is bundled byte for byte in every client and fetches
+                    nothing: the apps draw in a hidden web view that
+                    refuses every network request, the web loads it from
+                    its own server on the first such bubble. Mermaid runs
+                    strict and KaTeX untrusted, a block that fails or
+                    takes over 15 seconds shows its source, prices like
+                    "$5 and $10" stay text, and nothing inside code is
+                    drawn. A diagram or a graph opens full size with a
+                    tap. Previews, quotes, pushes, Copy and Share keep the
+                    source, and the assistant is told what a bubble draws.
+
+                    CAPITAL LETTERS. A sentence starts with a capital
+                    letter as you type in the composer and the other
+                    multi-line fields. Windows and the web on a computer
+                    do it themselves; the Mac does it while the system's
+                    "Capitalize words automatically" is on; Android now
+                    asks the keyboard for it, which most keyboards did not
+                    do before, and the web on a phone asks the same.
+                    Abbreviations, ellipses and code are left alone, and
+                    Backspace straight after puts the small letter back.
+
+                    EMOJI AS YOU TYPE. Emoticons — :) 😊, :D 😃, ;) 😉, :( 😞,
+                    <3 ❤️ and the rest of Telegram's set, with and without
+                    a nose — and 6,552 :name: shortcodes become emoji the
+                    moment the last character goes in, in every prose
+                    field on every client. Backspace (Delete on the Mac)
+                    straight after puts back what was typed. Times,
+                    indices and code are guarded, paste, dictation and
+                    autocorrect are left alone, and there is no setting.
+                    What is sent is the emoji itself.
+
+                    ANIMATIONS. An animated GIF, WebP or PNG put in a chat
+                    is turned by the sending device into a short silent
+                    looping video — H.264, at most 720 on the short side,
+                    30 frames a second, drawn on white — and shown in a
+                    photo's box with a GIF label, playing while on screen.
+                    It holds its first frame under Reduce Motion,
+                    Android's animations off, Windows' animation effects
+                    off and prefers-reduced-motion, and above 8 MiB, until
+                    it is tapped. Chat lists, quotes and pushes say "GIF".
+                    A still GIF or WebP goes as before, and so does an
+                    animated one in the assistant's chat. Safari has no
+                    ImageDecoder, so there the picture goes as it did in
+                    1.2. Animated stickers now move in the sticker panel
+                    and the pack as well as in the chat, and hold still
+                    under reduced motion on every client. Fixed on the
+                    way: Android's photo picker turned a GIF into a still
+                    JPEG, and an animated PNG was flattened everywhere.
+
+                    VIDEOS KEEP THEIR SOUND. A video made smaller before
+                    sending could lose its sound on every transcoder: a
+                    track the platform could not decode was dropped while
+                    the transcode reported success, and of two tracks — a
+                    screen recording's app sound and microphone — only the
+                    first was kept. Sound tracks are now counted from the
+                    file itself, several are mixed into one AAC track, and
+                    a silent result from a video with sound counts as a
+                    failed transcode, so the original goes instead. On
+                    Firefox, which has no AAC encoder, a video that needs
+                    a mix goes untouched. On iPhone and iPad a video now
+                    plays its sound with the Ring/Silent switch on silent,
+                    and on Android a video message whose microphone is
+                    taken mid-recording stops into review instead of being
+                    sent without sound.
+
+                    NEW LINES YOUR WAY. Return sends everywhere. On the
+                    Mac, Return with Shift, Option, Command or Control
+                    starts a new line — before, Shift sent, Control
+                    inserted a line separator and Command did nothing. On
+                    Windows it is Enter with Shift, Ctrl or Alt, and on
+                    the web Shift, Ctrl, Alt or Meta. With a hardware
+                    keyboard, an iPad or iPhone sends on Return and starts
+                    a line on Shift, Option or Control with Return, and
+                    Android sends on Enter and starts a line on
+                    Shift+Enter. Windows now sends line breaks as LF: a
+                    message written in several lines there reached the web
+                    as one.
+
+                    THE MESSAGE ROW. The composer is the same on every
+                    client: the paperclip alone on the left, and inside
+                    the field the sticker button, always, the video button
+                    while it is empty, and the paintbrush in the
+                    assistant's chat. @ai leaves the row — typing @ lists
+                    the assistant first, and the paperclip in the family
+                    chat has Ask the Assistant. Everything that stacks
+                    over the row stacks in one order: notices, voice
+                    messages not sent, the reply or edit banner, staged
+                    items, the mention list, the busy line. A thread's
+                    composer has the same field and Send. On a wide screen
+                    — iPad, Android tablet, Mac, Windows and the web — the
+                    conversation is a centred column at most 1024 wide,
+                    with bubbles at most 560; on the web the composer
+                    still spans the pane.
+
+                    MORE. On iPhone, a call from a member linked to a
+                    contact is listed under that contact in Recents, not
+                    under Unknown Callers, and follows that contact's
+                    block and Focus settings. On the Mac, clicking a
+                    notification or the Dock brings forward the window
+                    that is already open instead of opening another.
+                    Windows records video messages: the recorder 1.2
+                    shipped switched off is on. In a one-to-one chat, Show
+                    text now works on the other person's recording when
+                    that person has agreed to the assistant. A chat with
+                    many new messages opens faster, and animated stickers
+                    scroll smoothly. Android 17 is asked for its new
+                    local-network permission only for a server on the home
+                    network or a call on the same Wi-Fi.
+
+                    A CLIENT FOR LINUX. Family Connect for Linux is new: a
+                    native GTK 4 and libadwaita app in Rust, with
+                    WebKitGTK for the formulas and diagrams and GStreamer
+                    for calls and media, the Mac's behaviour, and the
+                    Windows client's tested logic ported to it. It runs on
+                    Ubuntu 26.04 and Fedora 44 and later, on amd64 and
+                    arm64, as a .deb, an .rpm or a portable .tar.gz, with
+                    nine localisations. It has the family chat, groups,
+                    one-to-one chats, several families, calls, voice and
+                    video messages, stickers, polls, the board, formulas
+                    and emoji as you type, keeps running behind a top-bar
+                    icon, can start at login, keeps its sign-in in the
+                    Secret Service and reaches the camera and the location
+                    through the desktop portals. It notifies only while it
+                    runs — there is no push on Linux — and a notification
+                    says who wrote, never what. The .deb installs an
+                    AppArmor profile that lets WebKit start its sandbox. A
+                    build has no server built in unless
+                    FAMILY_CONNECT_DEFAULT_SERVER was set when it was
+                    compiled, and asks for an address. It has no spell
+                    checking, no share sheet and no way to buy Family
+                    Hosting. The release workflow attaches its packages to
+                    a tag only once linux/packaging/release-ready exists;
+                    ci.yml builds all six on every push.
+
+                    FIXED. On iOS and the Mac, message times lost AM and
+                    PM on 12-hour locales. On the web, the microphone was
+                    cut off on phones, the field now has a visible
+                    placeholder, a phone shows one surface at a time, a
+                    thread or the open polls open over the chat between
+                    721 and 1024 pixels, and Escape no longer closes a
+                    thread with a draft in it. On Android, opening a chat
+                    with a shared location and map previews on could
+                    crash. Windows has a minimum window width, so the
+                    composer can no longer be squeezed to nothing.
+
+                    UPGRADING A SERVER — READ THIS FIRST. A 1.3 server
+                    refuses to start without [storage] key_file, and its
+                    first start converts everything already stored; after
+                    that a 1.2 server cannot read the database, and the
+                    only way back is a backup taken before. In order
+                    (docs/operations.md, "Encryption at rest"): back up
+                    with 1.2; make the key with family-connect storage-key
+                    new /etc/family-connect/storage.key, owned by
+                    family-connect and mode 0400, and copy it off the box
+                    by hand (storage-key show) — losing it loses every
+                    family on the server, and it is in no backup,
+                    deliberately; install 1.3, the new backup script and
+                    the key_file line, and start it; check that the
+                    database holds sealed bytes and that a photo opens in
+                    the app; run a backup with the new script; then delete
+                    every backup from before the upgrade, which holds
+                    plaintext for ever. The conversion seals 500 rows a
+                    transaction, can be resumed, and vacuums the converted
+                    tables; files are sealed in the background after the
+                    server is up. The server refuses a key file others can
+                    read, a key that is not 32 bytes of base64, and the
+                    wrong key, naming the fingerprint it expected.
+
+                    SERVER. Seven migrations, applied at startup: 0055
+                    (animation), 0056 (groups), 0057 (several_families),
+                    0058 (session_families), 0059 (encryption_at_rest),
+                    0060 (sealed, applied only after the conversion) and
+                    0061 (paid_families). New configuration: [storage]
+                    key_file, required; [families] member_families, which
+                    when unset follows registration so an upgrade reopens
+                    no closed door, and max_families_per_account = 5, from
+                    1 to 100; and [subscriptions], off by default —
+                    enabled, bundle_id, product_ids, environments
+                    (Production and Sandbox), unpaid_days = 14 (1 to 365),
+                    max_members = 25, storage_bytes = 10737418240,
+                    ai_tokens_per_month = 2000000, images_per_month = 30
+                    and transcript_minutes_per_month = 120, each limit off
+                    at 0; the section refuses unknown keys and is checked
+                    even while off, so a misspelt switch fails at startup.
+                    New commands: storage-key new, show and rotate (with
+                    the server stopped; the old key is kept as
+                    key_file.old and must be kept a week), storage
+                    forget-missing, reports, and families list and
+                    families plan <id> free|paid. New routes: the group
+                    routes under /chats, every family route also as
+                    /families/{id}/…, invitations, PUT /me/subscription,
+                    which verifies Apple's signed transaction offline
+                    against Apple Root CA – G3, and POST
+                    /appstore/notifications for App Store Server
+                    Notifications v2, which needs no session and takes up
+                    to 64 KiB. GET /me carries the account's families and
+                    invitations, and, with subscriptions on, the products
+                    and the subscription. The backup script dumps the key
+                    table separately and keeps seven days of it. A GIF's
+                    push says "GIF", and the assistant is told what a
+                    bubble draws.
+
+                    OLD CLIENTS KEEP WORKING. A 1.2 client against a 1.3
+                    server lists a group under its title and reads and
+                    writes in it with none of the group controls; a 1.2
+                    app on iOS or Android keeps a deleted group in its
+                    list until it is updated. It sees only the account's
+                    first family, and if the account leaves that family
+                    while staying in another, the server signs out every
+                    session that predates several families, and the app
+                    signs in again. It cannot buy, so with subscriptions
+                    on it cannot start a family, and it shows that refusal
+                    as a generic one, with no banner. It shows an
+                    animation as an ordinary video that plays silently in
+                    the viewer, a formula or a diagram as its source, and
+                    an emoji typed on a 1.3 client as the emoji it is. A
+                    1.3 client against a 1.2 server sees one family and
+                    offers neither New Family… nor Join Another Family…,
+                    reads the missing subscription switch as off, and
+                    offers New Group, which the old server refuses.
+
+                    The server, web and Linux crates are 1.3.0, the
+                    Windows package 1.3, and the Apple and Android apps
+                    1.3.
+
 2026-10-02          v1.2.0
 
                     A family sticker pack, voice and video messages,

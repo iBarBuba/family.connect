@@ -333,18 +333,23 @@ struct MacConversationView: View {
 
     private var chat: ChatEntity? { chats.first }
 
-    /// The family chat draws no "seen" tick — the marker there is a max
-    /// over N members and means nobody. See `MessagePresentation.isRead`.
-    private var isFamilyChat: Bool { chat?.kind == "family" }
+    /// The family chat or a group — the surface they share: sender names,
+    /// member mentions, polls, `@ai`, and no "seen" tick, because the
+    /// marker there is a max over N members and means nobody (`ChatRules`,
+    /// `MessagePresentation.isRead`; docs/protocol.md, "Groups").
+    private var isFamilyOrGroup: Bool { ChatRules.isFamilyOrGroup(chat?.kind) }
 
 
     // MARK: - Member mentions (docs/protocol.md, "Mentioning a member")
 
     /// Everybody a mention may name: the current roster, by the name the
-    /// app calls them.
+    /// app calls them — in a group, only its own members (`ChatRules`).
     private var mentionRoster: [MentionDTO] {
-        members.filter { !$0.hasLeft && !$0.accountDeleted }
-            .map { MentionDTO(userID: $0.userID, name: $0.resolvedDisplayName) }
+        ChatRules.mentionRoster(
+            members.filter { !$0.hasLeft && !$0.accountDeleted }
+                .map { MentionDTO(userID: $0.userID, name: $0.resolvedDisplayName) },
+            kind: chat?.kind,
+            groupMemberIDs: chat?.groupMemberIDs ?? [])
     }
 
     /// What the strip offers for the prefix being typed: never the reader
@@ -385,16 +390,20 @@ struct MacConversationView: View {
     }
     #endif
 
-    private func mentionCandidates(matching query: String) -> [MentionDTO] {
-        MemberMentions.candidates(
+    /// The phone's strip: the assistant FIRST where it is offered (#106),
+    /// then the roster less the reader and the blocked.
+    private func mentionCandidates(matching query: String) -> [MentionSuggestion] {
+        MemberMentions.suggestions(
             in: mentionRoster, matching: query,
-            excluding: coordinator.blockedUserIDs.union([coordinator.currentUserID]))
+            excluding: coordinator.blockedUserIDs.union([coordinator.currentUserID]),
+            assistantName: offersAssistant
+                ? (AppSettings.assistantName ?? String(localized: "Assistant")) : nil)
     }
 
-    /// The members the text names, resolved at send — family chat only,
-    /// nil when it names nobody so the wire stays as it was.
+    /// The members the text names, resolved at send — the family chat or a
+    /// group only, nil when it names nobody so the wire stays as it was.
     private func resolvedMentions(in body: String) -> [MentionDTO]? {
-        guard isFamilyChat else { return nil }
+        guard isFamilyOrGroup else { return nil }
         let found = MemberMentions.resolve(body: body, roster: mentionRoster)
         return found.isEmpty ? nil : found
     }
@@ -431,21 +440,10 @@ struct MacConversationView: View {
         }
     }
 
-    /// How many open polls in this chat this reader still has to answer.
-    /// Computed from what this window already holds rather than by asking the
-    /// server: the badge has to be right the moment the conversation opens.
-    private var openPollsToAnswer: Int {
-        // Hidden-by-block polls count toward nothing — see ConversationView.
-        let me = AppSettings.currentUserID ?? -1
-        let blocked = coordinator.blockedUserIDs
-        let visible = messages.filter { $0.senderID == me || !blocked.contains($0.senderID) }
-        return OpenPollsBadge.count(polls: visible.compactMap(\.poll), currentUserID: me)
-    }
-
     /// Whether there is somebody to ring from here (docs/protocol.md,
     /// "Voice calls"): a direct chat, on a server that has calls on.
     private var canCall: Bool {
-        session.callsEnabled && chat?.kind == "direct" && chat?.peerUserID != nil
+        session.callsEnabled && ChatRules.offersCalls(chat?.kind) && chat?.peerUserID != nil
             // The blocker calling somebody they blocked is refused with
             // `blocked`, so the button does not offer it. Defence in depth
             // behind the direct-chat prune: if the prune landed this is
@@ -485,9 +483,13 @@ struct MacConversationView: View {
 
     /// How many people a poll could hear from: the live roster, which is
     /// neither the people who have left nor the accounts that were deleted
-    /// — a tally must not go on counting somebody who no longer exists.
+    /// — a tally must not go on counting somebody who no longer exists. In a
+    /// group, its members (`ChatRules.pollAudience`).
     private var familyMemberCount: Int {
-        members.filter { !$0.hasLeft && !$0.accountDeleted }.count
+        ChatRules.pollAudience(
+            kind: chat?.kind,
+            groupMemberIDs: chat?.groupMemberIDs ?? [],
+            liveFamilyMembers: members.filter { !$0.hasLeft && !$0.accountDeleted }.count)
     }
 
     var body: some View {
@@ -637,44 +639,31 @@ struct MacConversationView: View {
                 }
             }
             // The way back to a decision the family has scrolled past
-            // (docs/protocol.md, "Finding the open ones"). Family chat only,
-            // because polls exist nowhere else — which is also why this slot
-            // was empty here: `canCall` is false in the family chat, so it
-            // carried no item at all.
+            // (docs/protocol.md, "Finding the open ones"). The family chat
+            // or a group only, because polls exist nowhere else — which is
+            // also why this slot was empty here: `canCall` is false in both,
+            // so it carried no item at all.
             //
             // The badge counts open polls THIS READER has not voted in
             // (OpenPollsBadge, shared with the phone and mirrored on
             // Android), not all open polls: a count that stays lit after you
             // have answered everything, until somebody else closes them,
             // stops meaning anything within a day.
-            if isFamilyChat {
+            if isFamilyOrGroup {
                 ToolbarItem {
-                    Button {
-                        showsOpenPolls = true
-                    } label: {
-                        // Drawn by hand for the reason ConversationView
-                        // gives: `.badge` on a toolbar item is macOS 26+, and
-                        // this app deploys to 14.
-                        Label("Open polls", systemImage: "chart.bar.doc.horizontal")
-                            .overlay(alignment: .topTrailing) {
-                                if openPollsToAnswer > 0 {
-                                    Text("\(openPollsToAnswer)")
-                                        .font(.caption2.bold())
-                                        .foregroundStyle(.white)
-                                        .padding(.horizontal, 5)
-                                        .padding(.vertical, 1)
-                                        .background(.tint, in: Capsule())
-                                        .offset(x: 9, y: -8)
-                                }
-                            }
-                    }
-                    // ONE literal: a ternary of two string literals is inferred
-                    // as `String`, which `.help` takes verbatim and never
-                    // localizes — the count is on the capsule and, for
-                    // VoiceOver, in the value below.
-                    .help("Open polls")
-                    .accessibilityValue(openPollsToAnswer > 0 ? Text("\(openPollsToAnswer) to answer") : Text(""))
-                    .disabled(recorderOpen)
+                    // The phone's button: its own narrow query, counted once
+                    // per pass of its own body (OpenPollsToolbarButton).
+                    OpenPollsToolbarButton(chatID: chatID) { showsOpenPolls = true }
+                        .disabled(recorderOpen)
+                }
+            }
+            // A group's name, members and the admin's controls
+            // (docs/protocol.md, "Groups") — where a phone reader taps the
+            // title. Its own view, carrying its own sheet.
+            if chat?.kind == ChatRules.group {
+                ToolbarItem {
+                    GroupInfoToolbarButton(chatID: chatID)
+                        .disabled(recorderOpen)
                 }
             }
         }
@@ -781,7 +770,8 @@ struct MacConversationView: View {
                     continue
                 }
                 do {
-                    let prepared = try await MediaPrep.prepare(fileAt: url, limit: MediaPrep.sizeLimit)
+                    let prepared = try await MediaPrep.prepare(
+                        fileAt: url, limit: MediaPrep.sizeLimit, animates: !isAssistantChat)
                     // `prepare` may hand back the source itself (a video
                     // that goes as it is — within the profile, or after a
                     // transcode that failed or did not help); only delete
@@ -814,8 +804,13 @@ struct MacConversationView: View {
         // the quote naming: a reply to a video message says so (#79, S5.7).
         let snapshots = visibleMessages.map { MessageSnapshot($0) }
         let roundIDs = MessagePresentation.roundMessageIDs(snapshots)
+        // ...and one quoting an animation with no caption says "GIF" (#96).
+        let animationIDs = MessagePresentation.animationMessageIDs(snapshots)
         return MessagePresentation.daySections(
-            snapshots.map { MessagePresentation.namingRoundQuotes($0, roundIDs: roundIDs) },
+            snapshots.map {
+                MessagePresentation.namingRoundQuotes(
+                    $0, roundIDs: roundIDs, animationIDs: animationIDs)
+            },
             firstUnreadID: unreadDividerServerID)
     }
 
@@ -823,10 +818,13 @@ struct MacConversationView: View {
     /// phone's rule.
     private func quoteWord(_ quote: ReplyToDTO) -> String {
         guard quote.excerpt.isEmpty,
-              let quoted = messages.first(where: { $0.serverID == quote.messageID }),
-              MessagePresentation.isRoundVideo(MessageSnapshot(quoted))
+              let quoted = messages.first(where: { $0.serverID == quote.messageID })
         else { return quote.excerpt }
-        return String(localized: "Video message")
+        let snapshot = MessageSnapshot(quoted)
+        if MessagePresentation.isRoundVideo(snapshot) { return String(localized: "Video message") }
+        // An animation with no caption says "GIF" (#96).
+        if MessagePresentation.isAnimation(snapshot) { return String(localized: "GIF") }
+        return quote.excerpt
     }
 
     /// Did this open deliberately land the reader in history? Read by
@@ -901,7 +899,7 @@ struct MacConversationView: View {
 
     private func rows(in section: DaySection) -> [Row] {
         let me = coordinator.currentUserID
-        let isFamily = chat?.kind == "family"
+        let isFamily = ChatRules.showsSenderNames(chat?.kind)
         return section.messages.enumerated().map { index, message in
             let previous = index > 0 ? section.messages[index - 1] : nil
             let next = index < section.messages.count - 1 ? section.messages[index + 1] : nil
@@ -911,7 +909,7 @@ struct MacConversationView: View {
                 showsSenderName: MessagePresentation.showsSenderName(
                     at: index,
                     in: section.messages,
-                    isFamilyChat: isFamily,
+                    isFamilyOrGroup: isFamily,
                     currentUserID: me,
                     blockedUserIDs: coordinator.blockedUserIDs),
                 isRunStart: previous?.senderID != message.senderID,
@@ -972,7 +970,7 @@ struct MacConversationView: View {
                                 isRead: MessagePresentation.isRead(
                                     row.message,
                                     othersReadUpTo: chat?.othersReadUpTo ?? 0,
-                                    isFamilyChat: isFamilyChat),
+                                    isFamilyOrGroup: isFamilyOrGroup),
                                 onReply: { beginReply(row.message) },
                                 onEdit: { beginEdit(row.message) },
                                 replyCount: row.message.replyCount,
@@ -1077,27 +1075,43 @@ struct MacConversationView: View {
                     }
                     bottomSentinel
                 }
-                .padding(.horizontal, 18)
+                // The conversation column (#106, 2.2): min(pane − 32, 1024),
+                // centred — a 16-pt margin padded inside a container capped
+                // at 1024 + 32, so no width is measured anywhere. The
+                // composer below is held to the same column. Until #106
+                // nothing was capped here: at 1920 wide the field ran
+                // ~1400 pt while bubbles stopped at 460, and a reply sat a
+                // screen's width from the message it answered.
+                .padding(.horizontal, ComposerRow.margin)
                 .padding(.vertical, 12)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: ComposerRow.containerCap())
+                .frame(maxWidth: .infinity)
             }
             .defaultScrollAnchor(.bottom)
             // The way back down, for a reader an anchored open has
             // deliberately left in history — and for anyone who scrolled
             // there themselves. The phone's overlay, Android's button and
             // icon, one trigger rule (ThreadFollow.showsJumpToNewest).
-            .overlay(alignment: .bottomTrailing) {
-                ZStack {
-                    if showsJumpToNewest {
-                        JumpToNewestButton {
-                            withAnimation(.easeOut(duration: 0.18)) {
-                                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+            .overlay(alignment: .bottom) {
+                // At the trailing edge of the COLUMN, not of the window —
+                // the phone's placement (ConversationView): on a wide window
+                // the window's edge is far from the last bubble, and a
+                // control there is nowhere near the thing it acts on.
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    ZStack {
+                        if showsJumpToNewest {
+                            JumpToNewestButton {
+                                withAnimation(.easeOut(duration: 0.18)) {
+                                    proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+                                }
                             }
+                            .transition(.scale.combined(with: .opacity))
                         }
-                        .transition(.scale.combined(with: .opacity))
                     }
+                    .animation(.spring(duration: 0.25), value: showsJumpToNewest)
                 }
-                .animation(.spring(duration: 0.25), value: showsJumpToNewest)
+                .frame(maxWidth: ComposerRow.containerCap())
             }
             // INSIDE the ScrollViewReader, because the opening routine now
             // has a step that scrolls. It is otherwise the same task, in
@@ -1221,6 +1235,13 @@ struct MacConversationView: View {
                 // visible region into older content. Re-pin, but only for a
                 // reader who was at the bottom — the same rule, and the
                 // same repair, the phone makes.
+                guard followsBottom else { return }
+                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+            }
+            .onChange(of: RichRenderer.shared.generation) {
+                // A formula, a diagram or a graph was drawn (#97): its
+                // bubble changed height, as one does when a card lands.
+                // The same rule and the same repair.
                 guard followsBottom else { return }
                 proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
             }
@@ -1564,6 +1585,62 @@ struct MacConversationView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // One order on every client, top to bottom, the nearest to the
+            // field being what is being written (#106, docs/composer-and-
+            // wide-layout-2026-10-20.md, 2.4): notices, voice messages not
+            // sent, the reply or edit banner, staged attachments, mention
+            // suggestions — then the voice line and the busy/failure line
+            // directly above the row, as on the phone.
+            //
+            // First of the notices: nothing goes to the model until this
+            // member has said so (protocol.md, "Consenting to the
+            // assistant").
+            if assistantConsentNeeded, let processor = AppSettings.assistantProcessor {
+                AssistantConsentBar(processor: processor) {
+                    afterAssistantConsent = { send() }
+                    showAssistantConsent = true
+                }
+            } else if assistantIsUnnamed {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "hand.raised")
+                    Text(AssistantConsent.unnamedProcessorNotice)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+                .accessibilityElement(children: .combine)
+            }
+            // Two strips, never both — the phone's arrangement: the
+            // assistant's own chat, and (#56) the family chat for a photo
+            // an `@ai` draft is about to carry.
+            if let notice = pictureNotice ?? mentionPictureNotice {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "eye")
+                    Text(notice)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityElement(children: .combine)
+            }
+            // While the draft is a `/draw` request — the phone's hint, by
+            // the phone's rule (`PictureRequestHint`).
+            if showsPictureRequestHint {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "paintbrush")
+                        .accessibilityHidden(true)
+                    Text(PictureRequestHint.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityElement(children: .combine)
+            }
             // Voice messages something else stopped — a call, the Mac
             // locking or sleeping, the window minimised or closed — each in
             // its own row, with its own reply and caption, carried by no
@@ -1575,6 +1652,52 @@ struct MacConversationView: View {
                     onSend: { sendParked(entry) },
                     onDelete: { deleteParked(entry) })
             }
+            if let replyDraft {
+                MacComposerBanner(
+                    icon: "arrowshape.turn.up.left",
+                    title: String(localized: "Replying to \(quoteAuthorName(replyDraft.senderID))"),
+                    text: quoteWord(replyDraft),
+                    cancelLabel: String(localized: "Cancel reply"),
+                    onCancel: { self.replyDraft = nil })
+            }
+            if editTarget != nil {
+                MacComposerBanner(
+                    icon: "pencil",
+                    // The banner's `text` is a String (the reply's is an
+                    // excerpt), so this one is localized by hand.
+                    text: String(localized: "Editing message"),
+                    cancelLabel: String(localized: "Cancel editing"),
+                    onCancel: { cancelEdit() })
+            }
+            if !staged.isEmpty {
+                StagedAttachmentRow(items: staged) { item in
+                    // Taken off by the person: the guard lifts, and a
+                    // recording is "Recording deleted" (#79, S1.1, S6 —
+                    // VoiceComposer.tookOff, the phone's own).
+                    voice.tookOff(voiceNote: item.isVoiceNote) { discardStaged(item) }
+                }
+            }
+            // The roster, while a member is being named (protocol.md,
+            // "Mentioning a member") — the phone's strip.
+            if isFamilyOrGroup, let query = MemberMentions.query(in: draft) {
+                let candidates = mentionCandidates(matching: query)
+                if !candidates.isEmpty {
+                    MentionSuggestions(suggestions: candidates) { name in
+                        draft = MemberMentions.accept(draft: draft, name: name)
+                        // A suggestion taken is a change the person made
+                        // (#79, S1.1).
+                        voice.otherAction()
+                    }
+                }
+            }
+            // What the voice flow has to say: the silence warning while a
+            // recording runs, otherwise its latest hint (S2.5, S2.9).
+            if let line = voiceLine {
+                voiceLineView(line)
+            }
+            // The busy/failure line: directly above the row on every client
+            // (#106, doc 2.4).
+            //
             // Phase 0's recording strip stood here, above the row, with a
             // Stop that was the window's default button. The recording row
             // is IN the row now (MacVoiceRecordingRow, #79 S2.4, S8.3).
@@ -1620,97 +1743,6 @@ struct MacConversationView: View {
                     }
                 }
             }
-            // What the voice flow has to say: the silence warning while a
-            // recording runs, otherwise its latest hint (S2.5, S2.9).
-            if let line = voiceLine {
-                voiceLineView(line)
-            }
-            if let replyDraft {
-                MacComposerBanner(
-                    icon: "arrowshape.turn.up.left",
-                    title: String(localized: "Replying to \(quoteAuthorName(replyDraft.senderID))"),
-                    text: quoteWord(replyDraft),
-                    cancelLabel: String(localized: "Cancel reply"),
-                    onCancel: { self.replyDraft = nil })
-            }
-            if editTarget != nil {
-                MacComposerBanner(
-                    icon: "pencil",
-                    // The banner's `text` is a String (the reply's is an
-                    // excerpt), so this one is localized by hand.
-                    text: String(localized: "Editing message"),
-                    cancelLabel: String(localized: "Cancel editing"),
-                    onCancel: { cancelEdit() })
-            }
-            if !staged.isEmpty {
-                StagedAttachmentRow(items: staged) { item in
-                    // Taken off by the person: the guard lifts, and a
-                    // recording is "Recording deleted" (#79, S1.1, S6 —
-                    // VoiceComposer.tookOff, the phone's own).
-                    voice.tookOff(voiceNote: item.isVoiceNote) { discardStaged(item) }
-                }
-            }
-            // The roster, while a member is being named (protocol.md,
-            // "Mentioning a member") — the phone's strip.
-            if isFamilyChat, let query = MemberMentions.query(in: draft) {
-                let candidates = mentionCandidates(matching: query)
-                if !candidates.isEmpty {
-                    MentionSuggestions(candidates: candidates) { name in
-                        draft = MemberMentions.accept(draft: draft, name: name)
-                        // A suggestion taken is a change the person made
-                        // (#79, S1.1).
-                        voice.otherAction()
-                    }
-                }
-            }
-            // Two strips, never both — the phone's arrangement: the
-            // assistant's own chat, and (#56) the family chat for a photo
-            // an `@ai` draft is about to carry.
-            if let notice = pictureNotice ?? mentionPictureNotice {
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "eye")
-                    Text(notice)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .accessibilityElement(children: .combine)
-            }
-            // While the draft is a `/draw` request — the phone's hint, by
-            // the phone's rule (`PictureRequestHint`).
-            if showsPictureRequestHint {
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "paintbrush")
-                        .accessibilityHidden(true)
-                    Text(PictureRequestHint.text)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .accessibilityElement(children: .combine)
-            }
-            // Nothing goes to the model until this member has said so
-            // (protocol.md, "Consenting to the assistant").
-            if assistantConsentNeeded, let processor = AppSettings.assistantProcessor {
-                AssistantConsentBar(processor: processor) {
-                    afterAssistantConsent = { send() }
-                    showAssistantConsent = true
-                }
-            } else if assistantIsUnnamed {
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "hand.raised")
-                    Text(AssistantConsent.unnamedProcessorNotice)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-                .padding(.top, 6)
-                .accessibilityElement(children: .combine)
-            }
             // The input row: the controls and the field — or, while a voice
             // message records, the row that takes their place — and the
             // slot, which never moves (#79, S1.3, S2.4, S8.3). The field is
@@ -1741,7 +1773,12 @@ struct MacConversationView: View {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .strokeBorder(composerFocused ? Color.accentColor.opacity(0.6) : .clear))
         }
-        .padding(12)
+        // The thread's column (#106): the same margin inside the same cap,
+        // so the composer is exactly as wide as the messages above it.
+        .padding(.vertical, 12)
+        .padding(.horizontal, ComposerRow.margin)
+        .frame(maxWidth: ComposerRow.containerCap())
+        .frame(maxWidth: .infinity)
         .onGeometryChange(for: CGFloat.self) { geometry in
             geometry.size.height
         } action: { height in
@@ -1787,7 +1824,8 @@ struct MacConversationView: View {
             hasCamera: false,
             offersVoice: offersVoiceMessages,
             roundAvailable: roundAvailable,
-            isFamilyChat: isFamilyChat)
+            isFamilyOrGroup: isFamilyOrGroup,
+            offersAssistant: offersAssistant)
         ForEach(Array(groups.enumerated()), id: \.offset) { index, group in
             if index > 0 { Divider() }
             ForEach(group, id: \.self) { item in
@@ -1873,6 +1911,15 @@ struct MacConversationView: View {
                 Label("Record Video Message", systemImage: "video.circle")
             }
             .disabled(slotInputs.call)
+        case .askAssistant:
+            // The `@ai` button that stood in the row until #106, worded —
+            // it types `@ai ` and puts the caret back in the field, as the
+            // button did. The menu's guard covers an edit.
+            Button {
+                insertAssistantMention()
+            } label: {
+                Label("Ask the Assistant", systemImage: "sparkles")
+            }
         case .location:
             Button {
                 shareLocation()
@@ -1891,9 +1938,16 @@ struct MacConversationView: View {
         }
     }
 
-    /// The paperclip, the sticker, `@ai` and `/draw` buttons and the field —
-    /// one view, so that the recording row can take its place whole (#79,
-    /// S2.4).
+    /// The paperclip and the field, with the stickers and the video button
+    /// (or the paintbrush) INSIDE the field at its trailing edge — one view,
+    /// so that the recording row can take its place whole (#79, S2.4).
+    ///
+    /// #106 (docs/composer-and-wide-layout-2026-10-20.md, 2.1): the phone's
+    /// row. The `@ai` button left it for the `@` list and the paperclip's
+    /// "Ask the Assistant"; the stickers moved from the front of the row to
+    /// the field's trailing edge, where the video button — a sibling beside
+    /// the slot until now — joins them as the outline glyph every other
+    /// client draws. The field gets the width the chain of buttons took.
     private var composerControls: some View {
         HStack(alignment: .bottom, spacing: 8) {
             Menu {
@@ -1901,6 +1955,10 @@ struct MacConversationView: View {
             } label: {
                 Image(systemName: "paperclip")
                     .font(.system(size: 16))
+                    // The accent colour, as every other control in the row
+                    // and the phone's paperclip; dimmed by hand, because an
+                    // explicit colour is not dimmed for it.
+                    .foregroundStyle(composerIsBusy ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.tint))
                     // Same box as the send button, so the two are
                     // optically level with each other and with the last
                     // line of text — bottom-aligning glyphs of different
@@ -1908,10 +1966,19 @@ struct MacConversationView: View {
                     .frame(width: composerControl, height: composerControl)
                     .contentShape(Rectangle())
             }
-            .menuStyle(.borderlessButton)
+            // A button-style menu drawn by SwiftUI, not `.borderlessButton`:
+            // that one is an AppKit pop-up, which ignores the label's colour
+            // AND its box — it drew the paperclip gray and sized to the bare
+            // glyph, so bottom alignment left it lower than everything else.
+            .menuStyle(.button)
+            .buttonStyle(.plain)
             .menuIndicator(.hidden)
             .fixedSize()
             .help("Attach a photo, video or file")
+            // A tooltip is not a name: VoiceOver read this as "paperclip"
+            // (#106, 3.7). The phone's label, which the UI tests find the
+            // composer by.
+            .accessibilityLabel("Attach a photo, video or file")
             // The Photos library, as on the phone (#78). Only outside the
             // assistant's chat — there "Show the Assistant a Photo…" is the
             // door, an images-only open panel — so photos AND videos here.
@@ -1919,7 +1986,10 @@ struct MacConversationView: View {
                 isPresented: $showPhotoPicker,
                 selection: $pickedMedia,
                 maxSelectionCount: StagedAttachment.maxPerMessage,
-                matching: .any(of: [.images, .videos]))
+                matching: .any(of: [.images, .videos]),
+                // The library's own bytes, so a GIF arrives as a GIF and
+                // can become an animation (#96) — the phone's reason.
+                preferredItemEncoding: .current)
             .onChange(of: pickedMedia) { _, items in
                 guard !items.isEmpty else { return }
                 stagePickedMedia(items)
@@ -1932,45 +2002,18 @@ struct MacConversationView: View {
             // mid-upload would arm a second, concurrent send.
             .disabled(composerIsBusy)
 
-            // The family's stickers, one click from the composer
-            // (docs/protocol.md, "In the panel, one tap sends"). Absent
-            // rather than disabled where there is nothing behind it —
-            // see `showsStickers`.
-            if showsStickers {
-                StickerComposerButton(side: composerControl, glyph: 16) { item in
-                    sendSticker(item)
-                }
-                .disabled(composerIsBusy)
-            }
+            messageField
+        }
+        .onChange(of: videoDoor == .hidden, initial: true) { _, hidden in
+            if !hidden { videoDoorShownAtMS = VoiceComposer.uptimeMS() }
+        }
+    }
 
-            if showsAssistantMention {
-                Button {
-                    insertAssistantMention()
-                } label: {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 15))
-                        .frame(width: composerControl, height: composerControl)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.borderless)
-                .help("Ask the assistant")
-                .disabled(editTarget != nil)
-            }
-
-            if showsPictureRequest {
-                Button {
-                    insertDrawToken()
-                } label: {
-                    Image(systemName: "paintbrush")
-                        .font(.system(size: 15))
-                        .frame(width: composerControl, height: composerControl)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.borderless)
-                .help("Ask for a picture")
-                .disabled(editTarget != nil)
-            }
-
+    /// The text and the glyphs at its trailing edge, in
+    /// `ComposerRow.fieldGlyphs`' order: the stickers innermost, so the
+    /// video button leaving at the first character never moves them.
+    private var messageField: some View {
+        HStack(alignment: .bottom, spacing: 4) {
             // Through `typedDraft`: only the person's own edits lift the
             // slot's activation guard (#79, S1.1).
             TextField("Message", text: typedDraft, axis: .vertical)
@@ -2009,13 +2052,49 @@ struct MacConversationView: View {
                         replyDraft = nil
                     }
                 }
-            // The video button, at the field's trailing edge (S1.4).
-            if videoDoor != .hidden {
-                videoDoorButton
-            }
+                // The text keeps the field's height while it is one line,
+                // so the glyphs beside it sit level with it.
+                .frame(minHeight: composerControl)
+            fieldGlyphs
         }
-        .onChange(of: videoDoor == .hidden, initial: true) { _, hidden in
-            if !hidden { videoDoorShownAtMS = VoiceComposer.uptimeMS() }
+    }
+
+    /// The glyphs inside the field (`ComposerRow.fieldGlyphs`).
+    @ViewBuilder
+    private var fieldGlyphs: some View {
+        let glyphs = ComposerRow.fieldGlyphs(
+            stickers: showsStickers, paintbrush: showsPictureRequest, video: videoDoor != .hidden)
+        if glyphs.contains(.stickers) {
+            // The family's stickers, one click from the composer
+            // (docs/protocol.md, "In the panel, one tap sends"). Absent
+            // rather than disabled where there is nothing behind it —
+            // see `showsStickers`.
+            StickerComposerButton(side: composerControl, glyph: 16) { item in
+                sendSticker(item)
+            }
+            .disabled(composerIsBusy)
+        }
+        if glyphs.contains(.paintbrush) {
+            Button {
+                insertDrawToken()
+            } label: {
+                Image(systemName: "paintbrush")
+                    .font(.system(size: 15))
+                    // The accent colour, as the stickers beside it and the
+                    // phone's paintbrush; dimmed by hand while editing.
+                    .foregroundStyle(editTarget == nil ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
+                    .frame(width: composerControl, height: composerControl)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .help("Ask for a picture")
+            // The tooltip was its only name (#106, 3.7).
+            .accessibilityLabel("Ask for a picture")
+            .disabled(editTarget != nil)
+        }
+        // The video button, at the field's trailing edge (S1.4).
+        if glyphs.contains(.video) {
+            videoDoorButton
         }
     }
 
@@ -2162,8 +2241,11 @@ struct MacConversationView: View {
         }
     }
 
-    private var showsAssistantMention: Bool {
-        chat?.kind == "family" && AppSettings.assistantUserID != nil
+    /// Where `@ai` does something — the first entry of the `@` list and the
+    /// paperclip's "Ask the Assistant" since #106 took its button out of the
+    /// row. The phone's rule (ConversationView.offersAssistant).
+    private var offersAssistant: Bool {
+        ChatRules.offersAssistantMention(chat?.kind) && AppSettings.assistantUserID != nil
             // And a server that names nobody offers no assistant here
             // either: a consent screen with a hole where the recipient
             // goes is not consent (protocol.md, "Consenting to the
@@ -2249,7 +2331,7 @@ struct MacConversationView: View {
     /// most recent photos may go, "up to N", and shows for a bare `@ai`
     /// draft (protocol.md, "Recent photos from the family chat").
     private var mentionPictureNotice: String? {
-        guard isFamilyChat else { return nil }
+        guard isFamilyOrGroup else { return nil }
         return MentionPictureNotice.of(
             draft: draft,
             staged: staged.map(\.assistantPictureCandidate),
@@ -2567,7 +2649,10 @@ struct MacConversationView: View {
                 guard !Task.isCancelled else { break }
                 let prepared: MediaPrep.Prepared
                 do {
-                    prepared = try await PickedMediaPrep.prepare(item, limit: limit)
+                    // An animated picture becomes an animation (#96),
+                    // except in the assistant's chat.
+                    prepared = try await PickedMediaPrep.prepare(
+                        item, limit: limit, animates: !isAssistantChat)
                 } catch PickedMediaPrep.Failure.unreadableVideo {
                     preparationFailed(String(localized: "Couldn't read that video."))
                     continue
@@ -2612,7 +2697,8 @@ struct MacConversationView: View {
                     // the last one landed. (A cancelled one did not, which
                     // ends the batch the same way.)
                     guard stageIfWanted(
-                        try await MediaPrep.prepare(fileAt: url, limit: MediaPrep.sizeLimit),
+                        try await MediaPrep.prepare(
+                            fileAt: url, limit: MediaPrep.sizeLimit, animates: !isAssistantChat),
                         moreToCome: index < urls.count - 1)
                     else { break }
                 } catch MediaPrep.PrepError.tooLargeAfterCompression {
@@ -2841,7 +2927,8 @@ struct MacConversationView: View {
     private func pasteAttachment() {
         prepare {
             do {
-                stageIfWanted(try await ClipboardAttachment.prepare(limit: MediaPrep.sizeLimit))
+                stageIfWanted(try await ClipboardAttachment.prepare(
+                    limit: MediaPrep.sizeLimit, animates: !isAssistantChat))
             } catch ClipboardAttachment.Failure.nothingToPaste {
                 preparationFailed(String(localized: "There's nothing to paste."))
             } catch MediaPrep.PrepError.tooLargeAfterCompression {

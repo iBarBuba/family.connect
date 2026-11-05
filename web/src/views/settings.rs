@@ -9,6 +9,12 @@
 //! while the dialog is open, it is built again. A read that FAILED is not a
 //! family with nobody left in it: that dialog says leaving deletes the
 //! family, and it is shown only when the server said so.
+//!
+//! The family here is the one on screen. For an account in several, leaving
+//! says WHICH, and that its direct chats stay with anybody it shares
+//! another family with; in one family the dialog is today's, word for word
+//! (docs/protocol.md, "Several families"). This is also where a second
+//! family starts: "New Family…" and "Join Another Family…".
 
 use fc_text::i18n::{t, t1, tn, tp};
 use fc_text::lookups;
@@ -19,7 +25,8 @@ use yew::prelude::*;
 
 use crate::actions::{Action, LeaveContext};
 use crate::api::ApiError;
-use crate::model::{Assistant, Family, Me, MemberStats, Stats};
+use crate::live::Panel;
+use crate::model::{Allowance, Assistant, Family, Me, MemberStats, Stats};
 use crate::notify;
 use crate::prep;
 use crate::time;
@@ -48,6 +55,15 @@ pub struct SettingsProps {
     pub on_close: Callback<()>,
     /// Asks the app to sign out — which asks first.
     pub on_sign_out: Callback<()>,
+    /// The account is in more than one family: leaving says which.
+    #[prop_or_default]
+    pub several: bool,
+    /// "New Family…" is offered (fc_text::families::offers_new_family).
+    #[prop_or_default]
+    pub new_family: bool,
+    /// "Join Another Family…" is offered.
+    #[prop_or_default]
+    pub join_another: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -98,6 +114,22 @@ pub fn leave_title(context: &LeaveContext) -> &'static str {
     match context {
         LeaveContext::LastMember => t("Delete the family?"),
         _ => t("Leave the family?"),
+    }
+}
+
+/// The leave dialog's title and words: today's in one family; in one of
+/// several, which family, and that the direct chats shared through another
+/// family stay. Leaving as its LAST member still deletes it, and says so
+/// as it always has: that is a different dialog, not a sentence changed.
+pub fn leave_wording(context: &LeaveContext, several: Option<&str>) -> (String, String) {
+    match (context, several) {
+        (LeaveContext::LastMember, _) | (_, None) => {
+            (leave_title(context).to_string(), leave_message(context))
+        }
+        (_, Some(family)) => (
+            fc_text::families::leave_title(family),
+            fc_text::families::leave_message().to_string(),
+        ),
     }
 }
 
@@ -332,19 +364,32 @@ pub fn settings_pane(props: &SettingsProps) -> Html {
     let has_picture = me.avatar_version > 0;
     let close = props.on_close.reform(|_: MouseEvent| ());
 
+    let several = props
+        .family
+        .as_ref()
+        .filter(|_| props.several)
+        .map(|family| family.name.clone());
     let leave_dialog = match &*leave {
-        Leave::Ready(context) | Leave::Leaving(context) => html! {
+        Leave::Ready(context) | Leave::Leaving(context) => {
+            let (title, message) = leave_wording(context, several.as_deref());
+            html! {
             <Confirm
-                title={leave_title(context)}
-                message={leave_message(context)}
+                {title}
+                {message}
                 confirm={leave_button(context)}
                 busy={matches!(*leave, Leave::Leaving(_))}
                 error={(*leave_error).clone()}
                 on_confirm={confirm_leave}
                 on_cancel={cancel_leave}
             />
-        },
+            }
+        }
         _ => Html::default(),
+    };
+    let open_panel = |panel: Panel| {
+        props
+            .on_action
+            .reform(move |_: MouseEvent| Action::OpenPanel(panel))
     };
     let dialog = match &*open {
         Open::Nothing => Html::default(),
@@ -493,6 +538,21 @@ pub fn settings_pane(props: &SettingsProps) -> Html {
                         </div>
                         if let (Some(message), Leave::Closed) = ((*leave_error).clone(), &*leave) {
                             <p class="error" role="alert">{ message }</p>
+                        }
+                        // The way in to another family — here even with one
+                        // family and nothing pending, where there is no
+                        // switcher to find it in.
+                        if props.new_family || props.join_another {
+                            <div class="setting-row">
+                                <span class="row-actions">
+                                    if props.new_family {
+                                        <button class="link" onclick={open_panel(Panel::NewFamily)}>{ t("New Family…") }</button>
+                                    }
+                                    if props.join_another {
+                                        <button class="link" onclick={open_panel(Panel::JoinFamily)}>{ t("Join Another Family…") }</button>
+                                    }
+                                </span>
+                            </div>
                         }
                     </section>
                 }
@@ -862,6 +922,7 @@ fn statistics(stats: &Stats) -> Html {
                     }
                 </section>
             }
+            { stats.allowance.as_ref().map(allowance).unwrap_or_default() }
             <section class="group">
                 <h3>{ t("Who sends what") }</h3>
                 { for stats.members.iter().map(|member| html! {
@@ -875,6 +936,27 @@ fn statistics(stats: &Stats) -> Html {
                 }) }
             </section>
         </>
+    }
+}
+
+/// A paid family's allowance: a row for each limit the operator has on, and
+/// when the monthly ones start again (docs/protocol.md, "Family
+/// statistics"). The month is a UTC month, and its first day is shown as
+/// that UTC calendar day — the 1st — in the reader's language.
+fn allowance(allowance: &Allowance) -> Html {
+    let renews = allowance
+        .renews_at
+        .as_deref()
+        .map(|at| crate::time::utc_day_in_sentence(at, js_sys::Date::now()))
+        .filter(|day| !day.is_empty());
+    html! {
+        <section class="group allowance">
+            <h3>{ fc_text::paid::allowance_title() }</h3>
+            { for allowance.limits().rows().into_iter().map(|(label, value)| number_row(label, value)) }
+            if let Some(day) = renews {
+                <p class="footnote">{ fc_text::paid::renews_on(&day) }</p>
+            }
+        </section>
     }
 }
 
@@ -1099,6 +1181,9 @@ mod tests {
                 on_action: Callback::from(move |action| sink.borrow_mut().push(action)),
                 on_close: Callback::noop(),
                 on_sign_out: Callback::noop(),
+                several: false,
+                new_family: false,
+                join_another: false,
             };
             yew::Renderer::<SettingsPane>::with_root_and_props(root.clone(), props).render();
             (root, log)
@@ -1134,7 +1219,7 @@ mod tests {
         gloo_timers::future::TimeoutFuture::new(30).await;
         let dialog = root.text_content().unwrap_or_default();
         assert!(
-            dialog.contains("in the family chat, possibly from recent messages too — to Brave Search, Open-Meteo and Wikipedia"),
+            dialog.contains("in the family chat or a group, possibly from recent messages too — to Brave Search, Open-Meteo and Wikipedia"),
             "{dialog}"
         );
         let agree = root.query_selector_all(".dialog-actions button").unwrap();
@@ -1210,6 +1295,7 @@ mod tests {
                     ..Default::default()
                 },
                 members: Vec::new(),
+                allowance: None,
             };
             let root = document.create_element("div").unwrap();
             document.body().unwrap().append_child(&root).unwrap();
@@ -1235,6 +1321,96 @@ mod tests {
             .text_content()
             .unwrap_or_default()
             .contains("Web searches"));
+        root.remove();
+    }
+
+    /// A PAID family's statistics end their numbers with the allowance — a
+    /// row for each limit the server sent, and the day it renews — and a
+    /// free family's have no such section (docs/protocol.md, "Family
+    /// statistics").
+    #[wasm_bindgen_test]
+    async fn a_paid_familys_statistics_show_its_allowance() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let draw = |json: &str| {
+            let stats: Stats = serde_json::from_str(json).expect("reads");
+            let root = document.create_element("div").unwrap();
+            document.body().unwrap().append_child(&root).unwrap();
+            #[derive(Properties, PartialEq)]
+            struct Shown {
+                stats: Stats,
+            }
+            #[function_component(Show)]
+            fn show(props: &Shown) -> Html {
+                statistics(&props.stats)
+            }
+            yew::Renderer::<Show>::with_root_and_props(root.clone(), Shown { stats }).render();
+            root
+        };
+        let root = draw(
+            r#"{"totals": {"members": 3}, "members": [],
+                "allowance": {"renews_at": "2026-12-01T00:00:00Z",
+                              "storage_bytes": {"used": 3221225472, "limit": 10737418240},
+                              "ai_tokens": {"used": 812345, "limit": 2000000},
+                              "images": {"used": 4, "limit": 30},
+                              "transcript_ms": {"used": 600000, "limit": 7200000}}}"#,
+        );
+        gloo_timers::future::TimeoutFuture::new(30).await;
+        let section = root
+            .query_selector(".allowance")
+            .unwrap()
+            .expect("the allowance");
+        let heading = section.query_selector("h3").unwrap().expect("its title");
+        assert_eq!(
+            heading.text_content().as_deref(),
+            Some("This Month’s Allowance")
+        );
+        let rows = section.query_selector_all(".setting-row").unwrap();
+        let said: Vec<String> = (0..rows.length())
+            .map(|at| rows.item(at).unwrap().text_content().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            said,
+            vec![
+                "Storage3.22 GB of 10.74 GB",
+                "Assistant40% used",
+                "Pictures4 of 30",
+                "Transcripts10 of 120 min",
+            ]
+        );
+        let day = crate::time::utc_day_in_sentence("2026-12-01T00:00:00Z", js_sys::Date::now());
+        assert!(
+            day.contains('1') && !day.contains("30"),
+            "the UTC 1st: {day}"
+        );
+        let footnote = section
+            .query_selector(".footnote")
+            .unwrap()
+            .expect("when it renews");
+        assert_eq!(footnote.text_content(), Some(format!("Renews on {day}")));
+        root.remove();
+
+        // Only the limits that are on.
+        let root = draw(
+            r#"{"totals": {}, "allowance": {"renews_at": "2026-12-01T00:00:00Z",
+                                            "images": {"used": 0, "limit": 30}}}"#,
+        );
+        gloo_timers::future::TimeoutFuture::new(30).await;
+        let rows = root.query_selector_all(".allowance .setting-row").unwrap();
+        assert_eq!(rows.length(), 1);
+        assert_eq!(
+            rows.item(0).unwrap().text_content().as_deref(),
+            Some("Pictures0 of 30")
+        );
+        root.remove();
+
+        // A free family, or a server that does not charge: no section.
+        let root = draw(r#"{"totals": {"members": 3}, "members": []}"#);
+        gloo_timers::future::TimeoutFuture::new(30).await;
+        assert!(root.query_selector(".allowance").unwrap().is_none());
+        assert!(!root
+            .text_content()
+            .unwrap_or_default()
+            .contains("Allowance"));
         root.remove();
     }
 }

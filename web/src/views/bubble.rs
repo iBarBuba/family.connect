@@ -4,6 +4,7 @@
 //! (docs/protocol.md, "Threads"; ios MacViews/MacMessageRow.swift).
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use fc_text::i18n::{t, tn};
 use yew::prelude::*;
@@ -115,8 +116,11 @@ impl Transcription {
 pub struct BubbleProps {
     pub message: Message,
     pub my_user_id: i64,
-    pub names: HashMap<i64, String>,
-    pub blocked: HashSet<i64>,
+    /// Shared, like `blocked` and `member_ids`: the same for every bubble in
+    /// a chat, so a chat hands every one of them the same `Rc` — nothing
+    /// copied per row, and "unchanged" seen by the pointer.
+    pub names: Rc<HashMap<i64, String>>,
+    pub blocked: Rc<HashSet<i64>>,
     /// Drawn hidden — a blocked sender, not yet revealed.
     pub hidden: bool,
     /// The quote, and the parent under it, peeked at — each level its own
@@ -132,6 +136,10 @@ pub struct BubbleProps {
     /// #79, S5.7). The quote itself carries only the server's excerpt.
     #[prop_or_default]
     pub quote_round: bool,
+    /// The quoted message is an animation this client holds — its quote,
+    /// where it has no caption, says "GIF" (docs/protocol.md, "Animations").
+    #[prop_or_default]
+    pub quote_animation: bool,
     pub shows_sender: bool,
     /// The sender's `avatar_version`, for the picture beside their name at
     /// the head of a run — 0, and initials, for anybody the roster does not
@@ -153,8 +161,10 @@ pub struct BubbleProps {
     pub ai_failed: Option<AiFailure>,
     /// Why a send of mine failed, if it did.
     pub failed: Option<String>,
-    pub is_family_chat: bool,
-    pub is_ai_chat: bool,
+    /// The chat's kind as the server sent it — `family`, `direct`, `ai` or
+    /// `group` — which decides the seen tick (fc_text::groups::offers) and
+    /// whose recordings "Show text" is offered for (fc_text::transcript).
+    pub chat_kind: AttrValue,
     pub assistant_user_id: Option<i64>,
     /// Drawn on the thread surface: no editing, no reporting, no thread chip.
     pub in_thread: bool,
@@ -166,7 +176,7 @@ pub struct BubbleProps {
     /// The live roster's size, for a poll's "N of M voted".
     pub member_count: usize,
     /// The live roster — who a mention may open a chat with.
-    pub member_ids: HashSet<i64>,
+    pub member_ids: Rc<HashSet<i64>>,
     pub on_action: Callback<Action>,
     /// Asked to reply to this message, or to edit it — the composer's
     /// business, so the bubble only says so.
@@ -206,6 +216,12 @@ pub fn bubble(props: &BubbleProps) -> Html {
     let loader = use_context::<crate::media::MediaLoader>();
     let picker_open = use_state(|| false);
     let reactors_open = use_state(|| false);
+    // A mention's click, made once per `on_action`: a fresh one each draw
+    // drew the body again — its markdown parsed, its links found — for a
+    // bubble whose words had not changed.
+    let open_direct = use_callback(props.on_action.clone(), |user_id: i64, on_action| {
+        on_action.emit(Action::OpenDirect { user_id })
+    });
 
     let message = &props.message;
     let me = props.my_user_id;
@@ -213,8 +229,8 @@ pub fn bubble(props: &BubbleProps) -> Html {
     let id = message.id;
     let mine = message.sender_id == me;
     let acked = id != 0;
-    let is_assistant =
-        Some(message.sender_id) == props.assistant_user_id || (props.is_ai_chat && !mine);
+    let is_assistant = Some(message.sender_id) == props.assistant_user_id
+        || (&*props.chat_kind == fc_text::groups::AI && !mine);
     let is_other_member = !mine && !is_assistant;
     let emit = |action: Action| {
         let on_action = props.on_action.clone();
@@ -367,6 +383,8 @@ pub fn bubble(props: &BubbleProps) -> Html {
                     <span class="quote-text">
                         if quote.excerpt.is_empty() && props.quote_round {
                             { t("Video message") }
+                        } else if quote.excerpt.is_empty() && props.quote_animation {
+                            { t("GIF") }
                         } else {
                             { &quote.excerpt }
                         }
@@ -481,13 +499,9 @@ pub fn bubble(props: &BubbleProps) -> Html {
     // this client can know it, and whatever this device already holds
     // drawn either way (docs/protocol.md, "Transcripts on request").
     let transcribing = {
-        let chat_kind = if props.is_family_chat {
-            crate::model::Chat::FAMILY
-        } else if props.is_ai_chat {
-            crate::model::Chat::AI
-        } else {
-            crate::model::Chat::DIRECT
-        };
+        // The kind as sent — a group follows the direct chat's rule — and
+        // nothing guessed for one this client does not know.
+        let chat_kind = fc_text::groups::known(&props.chat_kind);
         let offered = props
             .transcription
             .as_ref()
@@ -783,7 +797,7 @@ pub fn bubble(props: &BubbleProps) -> Html {
             <span class="meta">
                 { time::clock(&message.created_at) }
                 if message.is_edited() { <span class="edited">{ " · " }{ t("edited") }</span> }
-                if mine && !props.is_family_chat {
+                if mine && fc_text::groups::offers(&props.chat_kind).seen {
                     <span class={classes!("tick", props.seen.then_some("is-seen"))}
                           aria-label={if props.seen { t("Seen") } else { t("Sent") }}>
                         { if props.seen { " ✓✓" } else { " ✓" } }
@@ -844,7 +858,7 @@ pub fn bubble(props: &BubbleProps) -> Html {
             </p>
         }
     } else if props.awaited {
-        if let Some(failure) = props.ai_failed {
+        if let Some(failure) = &props.ai_failed {
             html! { <p class="body ai-failed">{ failure.sentence() }</p> }
         } else {
             html! { <p class="body awaiting" aria-label={t("The assistant is answering")}>{ "▍" }</p> }
@@ -863,11 +877,11 @@ pub fn bubble(props: &BubbleProps) -> Html {
                         text={message.body.clone()}
                         mentions={message.mentions().to_vec()}
                         my_user_id={me}
-                        member_ids={props.member_ids.clone()}
-                        on_open_direct={props.on_action.reform(|user_id| Action::OpenDirect { user_id })}
+                        member_ids={(*props.member_ids).clone()}
+                        on_open_direct={open_direct}
                     />
                 }
-                if let Some(failure) = props.ai_failed {
+                if let Some(failure) = &props.ai_failed {
                     <p class="ai-failed">{ failure.sentence() }</p>
                 }
             </>
@@ -932,8 +946,8 @@ pub fn bubble(props: &BubbleProps) -> Html {
                     message={message.clone()}
                     my_user_id={me}
                     member_count={props.member_count}
-                    names={props.names.clone()}
-                    blocked={props.blocked.clone()}
+                    names={(*props.names).clone()}
+                    blocked={(*props.blocked).clone()}
                     on_vote={props.on_action.reform(move |option_id| Action::Vote { chat_id, message_id: id, option_id })}
                     on_unvote={props.on_action.reform(move |_| Action::Unvote { chat_id, message_id: id })}
                     on_close={props.on_action.reform(move |_| Action::ClosePoll { chat_id, message_id: id })}
@@ -1016,25 +1030,25 @@ mod tests {
             my_user_id: ME,
             calls_enabled: false,
             video_calls_enabled: false,
-            names: HashMap::from([(ANNA, "Anna".to_string())]),
-            blocked: HashSet::new(),
+            names: Rc::new(HashMap::from([(ANNA, "Anna".to_string())])),
+            blocked: Rc::new(HashSet::new()),
             hidden: false,
             quote_revealed: false,
             parent_revealed: false,
             quote_round: false,
+            quote_animation: false,
             shows_sender: true,
             run_end: true,
             seen: false,
             awaited: false,
             ai_failed: None,
             failed: None,
-            is_family_chat: true,
-            is_ai_chat: false,
+            chat_kind: "family".into(),
             assistant_user_id: Some(2),
             in_thread: false,
             can_reply: true,
             member_count: 3,
-            member_ids: HashSet::from([ANNA]),
+            member_ids: Rc::new(HashSet::from([ANNA])),
             on_action: Callback::from(move |action: Action| actions.borrow_mut().push(action)),
             on_reply: Callback::noop(),
             on_edit: Callback::noop(),
@@ -1435,7 +1449,7 @@ mod tests {
         let reported = Rc::new(RefCell::new(Vec::new()));
         let mut hidden = props(message(101, ANNA, "something unkind"), actions.clone());
         hidden.hidden = true;
-        hidden.blocked = HashSet::from([ANNA]);
+        hidden.blocked = Rc::new(HashSet::from([ANNA]));
         hidden.on_report = {
             let reported = reported.clone();
             Callback::from(move |target: (i64, Option<i64>)| reported.borrow_mut().push(target))
@@ -1543,7 +1557,7 @@ mod tests {
             }),
         });
         let mut quoted = props(reply, actions.clone());
-        quoted.blocked = HashSet::from([ANNA]);
+        quoted.blocked = Rc::new(HashSet::from([ANNA]));
         let (root, handle) = render(quoted.clone_for_test()).await;
         assert!(!text(&root).contains("the quote") && !text(&root).contains("the parent"));
         click_text(&root, ".quote button", "Replying to a hidden message");
@@ -1647,15 +1661,21 @@ mod tests {
         const REFUSED: &str = "The assistant's provider refused that. Try putting it another way.";
         let failed_line = |root: &Element| labels(root, ".ai-failed");
 
+        // A paid family's month used up names the day it renews.
+        let spent = AiFailure::AllowanceUsed {
+            renews_at: Some("2026-12-01T00:00:00Z".into()),
+        };
+        let spent_says = spent.sentence();
         for (failure, says, never) in [
             (AiFailure::Failed, ASK_AGAIN, REFUSED),
             (AiFailure::Refused, REFUSED, ASK_AGAIN),
+            (spent, spent_says.as_str(), ASK_AGAIN),
         ] {
             // Still waiting for its first word: the streaming row.
             let mut waiting = props(message(101, 2, ""), Rc::new(RefCell::new(Vec::new())));
-            waiting.is_ai_chat = true;
+            waiting.chat_kind = "ai".into();
             waiting.awaited = true;
-            waiting.ai_failed = Some(failure);
+            waiting.ai_failed = Some(failure.clone());
             let (root, handle) = render(waiting).await;
             assert_eq!(failed_line(&root), vec![says.to_string()], "{failure:?}");
             assert!(!text(&root).contains(never), "{}", text(&root));
@@ -1668,8 +1688,8 @@ mod tests {
                 message(102, 2, "Half an"),
                 Rc::new(RefCell::new(Vec::new())),
             );
-            partial.is_ai_chat = true;
-            partial.ai_failed = Some(failure);
+            partial.chat_kind = "ai".into();
+            partial.ai_failed = Some(failure.clone());
             let (root, handle) = render(partial).await;
             assert_eq!(failed_line(&root), vec![says.to_string()], "{failure:?}");
             assert!(text(&root).contains("Half an"), "{}", text(&root));
@@ -1682,7 +1702,7 @@ mod tests {
             message(103, 2, "All of it."),
             Rc::new(RefCell::new(Vec::new())),
         );
-        fine.is_ai_chat = true;
+        fine.chat_kind = "ai".into();
         let (root, handle) = render(fine).await;
         assert!(failed_line(&root).is_empty(), "{}", text(&root));
         handle.destroy();
@@ -1693,16 +1713,44 @@ mod tests {
     #[wasm_bindgen_test]
     fn the_refusal_sentence_is_chosen_only_for_refused() {
         assert_eq!(
-            AiFailure::from_reason(Some("refused")).sentence(),
+            AiFailure::from_reason(Some("refused"), None).sentence(),
             "The assistant's provider refused that. Try putting it another way."
         );
         for absent in [None, Some("rate_limited"), Some(""), Some("Refused")] {
             assert_eq!(
-                AiFailure::from_reason(absent).sentence(),
+                AiFailure::from_reason(absent, None).sentence(),
                 "Couldn't answer that. Ask again.",
                 "{absent:?} reads as absent"
             );
         }
+    }
+
+    /// `"allowance_used"` says the month is used up and names the day it
+    /// renews — the frame's `renews_at`, else the 1st of the next month, UTC
+    /// — as its UTC calendar day, in the reader's language (docs/protocol.md,
+    /// "Paid families").
+    #[wasm_bindgen_test]
+    fn a_used_allowance_names_the_day_it_renews() {
+        const LEAD: &str = "This family has used this month’s assistant allowance. It renews on ";
+        let now = js_sys::Date::now();
+        let said =
+            AiFailure::from_reason(Some("allowance_used"), Some("2026-12-01T00:00:00Z")).sentence();
+        let day = crate::time::utc_day_in_sentence("2026-12-01T00:00:00Z", now);
+        assert!(!day.is_empty() && !day.contains("2026-12"), "{day}");
+        // Its UTC day, the 1st, wherever this machine is — never "30 November".
+        assert!(day.contains('1') && !day.contains("30"), "{day}");
+        assert_eq!(said, format!("{LEAD}{day}."));
+        // Without a day from the frame, the month's own rule finds it.
+        let next = fc_text::paid::next_month_utc(now);
+        assert_eq!(
+            AiFailure::from_reason(Some("allowance_used"), None).sentence(),
+            format!("{LEAD}{}.", crate::time::utc_day_in_sentence(&next, now))
+        );
+        // A day beside any other reason means nothing.
+        assert_eq!(
+            AiFailure::from_reason(Some("refused"), Some("2026-12-01T00:00:00Z")),
+            AiFailure::Refused
+        );
     }
 
     fn recording(id: i64, mime: &str) -> crate::model::Attachment {
@@ -1735,47 +1783,62 @@ mod tests {
     }
 
     /// "SHOW TEXT" IS DRAWN BY THE RULE: under a voice note this member may
-    /// ask about — their own anywhere; another member's in the family chat
+    /// ask about — their own anywhere; the other person's in a direct chat
+    /// whatever the switch (2026-10-21); another member's in the family chat
     /// only with the owner's switch on — whether the server sends it as
     /// stored or this device supplies its sound (an Ogg file), and never on
     /// a server with no transcription deployment. Pressed, it asks for THAT
     /// attachment, with the metadata the device path needs.
     #[wasm_bindgen_test]
     async fn show_text_is_offered_by_the_rule_and_asks_for_its_attachment() {
-        let with = |sender: i64, family: bool, allows: bool, attachments| {
+        let with = |sender: i64, kind: &'static str, allows: bool, attachments| {
             let actions = Rc::new(RefCell::new(Vec::new()));
             let mut message = message(1338, sender, "");
             message.attachments = Some(attachments);
             let mut props = props(message, actions.clone());
-            props.is_family_chat = family;
+            props.chat_kind = kind.into();
             props.transcription = Some(transcription(allows));
             (props, actions)
         };
-        // (sender, family chat, switch, offered)
-        for (sender, family, allows, offered) in [
-            (ME, false, false, true),
-            (ME, true, false, true),
-            (ANNA, true, true, true),
-            (ANNA, true, false, false),
-            (ANNA, false, true, false),
-            (2, true, true, false),
+        // (sender, chat, switch, offered)
+        for (sender, kind, allows, offered) in [
+            (ME, "direct", false, true),
+            (ME, "family", false, true),
+            (ANNA, "family", true, true),
+            (ANNA, "family", false, false),
+            (ANNA, "direct", true, true),
+            (ANNA, "direct", false, true),
+            // A group follows the direct chat's rule (2026-10-22, D4).
+            (ANNA, "group", true, true),
+            (ANNA, "group", false, true),
+            (ME, "group", false, true),
+            (2, "family", true, false),
+            (2, "group", true, false),
         ] {
-            let (props, _) = with(sender, family, allows, vec![recording(34, "audio/mp4")]);
+            let (props, _) = with(sender, kind, allows, vec![recording(34, "audio/mp4")]);
             let (root, handle) = render(props).await;
             assert_eq!(
                 show_buttons(&root).len(),
                 usize::from(offered),
-                "sender {sender}, family {family}, switch {allows}"
+                "sender {sender}, {kind}, switch {allows}"
             );
             handle.destroy();
             root.remove();
         }
 
+        // In the assistant's chat nobody else's message is ever offered.
+        let (mut props, _) = with(ANNA, "direct", true, vec![recording(34, "audio/mp4")]);
+        props.chat_kind = "ai".into();
+        let (root, handle) = render(props).await;
+        assert!(show_buttons(&root).is_empty(), "the assistant's chat");
+        handle.destroy();
+        root.remove();
+
         // An Ogg file is offered too — this device supplies its sound —
         // and each button asks for its own recording.
         let (props, actions) = with(
             ME,
-            true,
+            "family",
             false,
             vec![recording(33, "audio/ogg"), recording(34, "audio/mp4")],
         );
@@ -1809,7 +1872,7 @@ mod tests {
         root.remove();
 
         // No transcription deployment: nothing offered at all.
-        let (mut props, _) = with(ME, true, true, vec![recording(34, "audio/mp4")]);
+        let (mut props, _) = with(ME, "family", true, vec![recording(34, "audio/mp4")]);
         props.transcription = None;
         let (root, handle) = render(props).await;
         assert!(show_buttons(&root).is_empty());
@@ -1934,21 +1997,48 @@ mod tests {
         handle.destroy();
         root.remove();
 
-        // What this device could not make: terminal, no retry.
+        // What this device could not make: terminal, no retry — and a paid
+        // family's minutes used up, which names the day they renew and is
+        // terminal until then.
         for (failure, said) in [
             (
                 Failure::TooLong,
                 "This recording is too long to turn into text.",
             ),
             (Failure::Unreadable, "Couldn't read the sound in this file."),
+            (
+                Failure::AllowanceUsed {
+                    renews_on: "1 December".into(),
+                    renews_at_ms: fc_text::paid::next_month_utc_ms(js_sys::Date::now()),
+                },
+                "This family has used this month’s assistant allowance. It renews on 1 December.",
+            ),
         ] {
-            let (props, _) = drawn(State::Failed(failure));
+            let (props, _) = drawn(State::Failed(failure.clone()));
             let (root, handle) = render(props).await;
             assert!(text(&root).contains(said), "{failure:?}");
             assert!(show_buttons(&root).is_empty(), "{failure:?}: no retry");
             handle.destroy();
             root.remove();
         }
+
+        // ...until the month renews: drawn after that, the line is "Show
+        // text" again, and nothing of the refusal is left on it.
+        let (props, actions) = drawn(State::Failed(Failure::AllowanceUsed {
+            renews_on: "1 December".into(),
+            renews_at_ms: 0,
+        }));
+        let (root, handle) = render(props).await;
+        assert!(!text(&root).contains("assistant allowance"));
+        let show = show_buttons(&root);
+        assert_eq!(show[0].text_content().as_deref(), Some("Show text"));
+        show[0].click();
+        assert!(actions.borrow().iter().any(|action| matches!(
+            action,
+            Action::ShowTranscript { attachment, .. } if attachment.id == 34
+        )));
+        handle.destroy();
+        root.remove();
     }
 
     fn video(id: i64) -> crate::model::Attachment {
@@ -1976,7 +2066,7 @@ mod tests {
             let mut message = message(1338, sender, "");
             message.attachments = Some(attachments);
             let mut props = props(message, actions.clone());
-            props.is_family_chat = true;
+            props.chat_kind = "family".into();
             props.transcription = Some(transcription(allows));
             (props, actions)
         };
@@ -2198,6 +2288,109 @@ mod tests {
         assert!(!crate::views::conversation::quotes_round(&reply, &[]));
     }
 
+    fn animation(id: i64, flagged: bool) -> crate::model::Attachment {
+        crate::model::Attachment {
+            id,
+            kind: "video".into(),
+            mime: Some("video/mp4".into()),
+            size: Some(182_330),
+            width: Some(480),
+            height: Some(270),
+            duration_ms: Some(2_100),
+            has_preview: true,
+            animation: flagged,
+            ..Default::default()
+        }
+    }
+
+    /// AN ANIMATION IS DRAWN AS A PICTURE THAT MOVES (docs/protocol.md,
+    /// "Animations"): a photo's box with "GIF" in its corner — no play
+    /// button, no duration — caption or not; the same video without the flag
+    /// is the ordinary video tile. A reply quoting one with no caption says
+    /// "GIF".
+    #[wasm_bindgen_test]
+    async fn an_animation_is_a_tile_that_says_gif_and_so_does_its_quote() {
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let mut sent = message(1600, ANNA, "");
+        sent.attachments = Some(vec![animation(93, true)]);
+        let (root, handle) = render(props(sent.clone(), actions.clone())).await;
+        let tile = root
+            .query_selector(".tile.is-animation")
+            .unwrap()
+            .expect("drawn as an animation");
+        assert_eq!(
+            tile.query_selector(".gif-label")
+                .unwrap()
+                .and_then(|label| label.text_content())
+                .as_deref(),
+            Some("GIF")
+        );
+        assert!(
+            tile.query_selector(".play").unwrap().is_none(),
+            "no play button"
+        );
+        assert_eq!(
+            tile.get_attribute("aria-label").as_deref(),
+            Some("Open GIF")
+        );
+        assert!(
+            tile.get_attribute("style")
+                .unwrap_or_default()
+                .contains("aspect-ratio:320/180"),
+            "a photo's box of its shape"
+        );
+        handle.destroy();
+        root.remove();
+
+        let mut captioned = sent.clone();
+        captioned.body = "look at him go".into();
+        let (root, handle) = render(props(captioned, actions.clone())).await;
+        assert!(root.query_selector(".tile.is-animation").unwrap().is_some());
+        assert!(text(&root).contains("look at him go"));
+        handle.destroy();
+        root.remove();
+
+        let mut plain = sent.clone();
+        plain.attachments = Some(vec![animation(93, false)]);
+        let (root, handle) = render(props(plain.clone(), actions.clone())).await;
+        assert!(root.query_selector(".tile.is-animation").unwrap().is_none());
+        assert!(
+            root.query_selector(".tile .play").unwrap().is_some(),
+            "a video"
+        );
+        handle.destroy();
+        root.remove();
+
+        let mut reply = message(1606, ME, "ha");
+        reply.reply_to = Some(crate::model::ReplyTo {
+            message_id: 1600,
+            sender_id: ANNA,
+            excerpt: String::new(),
+            parent: None,
+        });
+        let mut quoting = props(reply.clone(), actions.clone());
+        quoting.quote_animation = true;
+        let (root, handle) = render(quoting).await;
+        assert_eq!(
+            root.query_selector(".quote .quote-text")
+                .unwrap()
+                .and_then(|text| text.text_content())
+                .as_deref(),
+            Some("GIF")
+        );
+        handle.destroy();
+        root.remove();
+        assert!(crate::views::conversation::quotes_animation(
+            &reply,
+            &[sent]
+        ));
+        assert!(!crate::views::conversation::quotes_animation(
+            &reply,
+            &[plain]
+        ));
+        assert!(!crate::views::conversation::quotes_animation(&reply, &[]));
+    }
+
     impl BubbleProps {
         fn clone_for_test(&self) -> BubbleProps {
             BubbleProps {
@@ -2211,14 +2404,14 @@ mod tests {
                 quote_revealed: self.quote_revealed,
                 parent_revealed: self.parent_revealed,
                 quote_round: self.quote_round,
+                quote_animation: self.quote_animation,
                 shows_sender: self.shows_sender,
                 run_end: self.run_end,
                 seen: self.seen,
                 awaited: self.awaited,
-                ai_failed: self.ai_failed,
+                ai_failed: self.ai_failed.clone(),
                 failed: self.failed.clone(),
-                is_family_chat: self.is_family_chat,
-                is_ai_chat: self.is_ai_chat,
+                chat_kind: self.chat_kind.clone(),
                 assistant_user_id: self.assistant_user_id,
                 in_thread: self.in_thread,
                 can_reply: self.can_reply,
@@ -2252,7 +2445,7 @@ mod tests {
         let mut voice = message(1601, ANNA, "");
         voice.attachments = Some(vec![recording(96, "audio/mp4")]);
         let mut asked = props(voice, actions.clone());
-        asked.is_family_chat = true;
+        asked.chat_kind = "family".into();
         asked.transcription = Some(transcription(true));
         let (root, handle) = render(asked).await;
         // The speed changed AFTER this bubble was drawn — by a chip on a

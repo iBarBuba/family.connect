@@ -23,7 +23,25 @@ public sealed record StagedMedia(
     /// recording itself (<see cref="VoiceWaveform"/>) and sent with the upload; null for everything else and for a note
     /// whose sound could not be read.
     /// </summary>
-    string? Waveform = null);
+    string? Waveform = null,
+    /// <summary>
+    /// An ANIMATION (docs/protocol.md, "Animations"): an animated picture this device made into the protocol's silent looping
+    /// MP4. Not on the upload — that is an ordinary <c>kind=video</c> — but on the message, which says <c>animation: true</c>
+    /// when this is the one thing it carries (<see cref="AnimationSend"/>). Held in memory only: the outbox row carries the
+    /// flag from the moment the message is queued.
+    /// </summary>
+    bool Animation = false);
+
+/// <summary>Whether a send of staged media is an ANIMATION — and so says <c>animation: true</c>.</summary>
+public static class AnimationSend
+{
+    /// <summary>
+    /// The server's own condition (docs/protocol.md, "What the server checks"): exactly ONE attachment, and it is an
+    /// animation this device made. An animation staged beside other things goes as the ordinary video it also is — it
+    /// still plays, in its viewer — because a message is one of the shapes, never two.
+    /// </summary>
+    public static bool Is(IReadOnlyList<StagedMedia> items) => items is [{ Kind: "video", Animation: true }];
+}
 
 /// <summary>
 /// Where a send's bytes wait while it is being sent. The seam exists because WHERE that is, is a
@@ -65,7 +83,7 @@ public interface IMediaStore
 /// to wait for.
 /// </para>
 /// </remarks>
-public sealed class MediaOutbox(OutboxStore outbox, ApiClient api, IMediaStore media)
+public sealed class MediaOutbox(OutboxStore outbox, ApiClient api, IMediaStore media, Func<long, long?>? familyFor = null)
 {
     /// <summary>How many times a preview is sent before this device stops trying.</summary>
     public const int PreviewAttempts = 3;
@@ -127,12 +145,15 @@ public sealed class MediaOutbox(OutboxStore outbox, ApiClient api, IMediaStore m
                         new ApiError(ErrorCodes.MediaMissing, "the file is no longer here"));
                     break;
                 }
+                // For the family the CHAT is in, not whichever is shown by the time the upload goes (docs/protocol.md,
+                // "Several families"): a message may use an attachment only in a chat its family lists.
+                var family = familyFor?.Invoke(row.ChatId);
                 var answer = staged is { Kind: "location", Latitude: { } latitude, Longitude: { } longitude }
                     // A place has no bytes: its three numbers are the whole upload.
-                    ? await api.UploadLocation(latitude, longitude, staged.AccuracyM, staged.Name, ct).ConfigureAwait(false)
+                    ? await api.UploadLocation(latitude, longitude, staged.AccuracyM, staged.Name, ct, family).ConfigureAwait(false)
                     : await api.Upload(
                         staged.Kind, staged.Mime, staged.Bytes,
-                        staged.Width, staged.Height, staged.DurationMs, staged.Name, ct, staged.Waveform)
+                        staged.Width, staged.Height, staged.DurationMs, staged.Name, ct, staged.Waveform, family)
                         .ConfigureAwait(false);
                 if (answer.Ok && answer.Value is not null)
                 {

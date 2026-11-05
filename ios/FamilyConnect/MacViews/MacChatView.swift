@@ -49,6 +49,26 @@ struct MacChatView: View {
     /// Files were shared into the app and are waiting for a chat: the
     /// picker sheet is up. See ShareImport.
     @State private var showsShareTarget = false
+    /// Several families (docs/protocol.md, "Several families"): the two
+    /// ways in, opened from the sidebar's family menu, and what an
+    /// invitation answered from that menu had to say.
+    @State private var showsNewFamily = false
+    @State private var showsJoinAnother = false
+    @State private var switcherFailure: String?
+
+    /// The chats the CURRENT family lists — every chat, with one family.
+    private var listedChats: [ChatEntity] {
+        chats.filter {
+            FamilyRules.isListed(
+                chatFamilyIDs: $0.familyIDs, in: session.currentFamilyID, home: session.homeFamilyID)
+        }
+    }
+
+    /// The current family's notes, for its board's badge.
+    private var familyNotes: [NoteEntity] {
+        let familyKey = coordinator.currentFamilyKey
+        return notes.filter { $0.familyID == familyKey }
+    }
 
     /// userID → profile-picture version, worked out once for the whole
     /// sidebar rather than per row.
@@ -71,7 +91,7 @@ struct MacChatView: View {
                     // made it total by extending the gesture over the space
                     // that still worked. Opening in a window is the context
                     // menu's job; selection is the List's, uncontested.
-                    ForEach(chats) { chat in
+                    ForEach(listedChats) { chat in
                         MacChatRow(
                             chat: chat,
                             peerAvatarVersion: chat.peerUserID.flatMap { avatarVersions[$0] } ?? 0)
@@ -84,12 +104,29 @@ struct MacChatView: View {
             }
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 380)
+            // The chat list's header: the family menu — the Mac's switcher —
+            // and any invitation waiting (docs/protocol.md, "Several
+            // families"). Both draw nothing for one family and nothing
+            // pending, so the sidebar is unchanged then.
+            .safeAreaInset(edge: .top) {
+                VStack(spacing: 0) {
+                    if session.showsFamilySwitcher {
+                        familyMenu
+                            .padding(.horizontal, 12)
+                            .padding(.top, 6)
+                    }
+                    InvitationBanner()
+                    // A paid family's deadline (docs/protocol.md, "Paid
+                    // families"); nothing for any other family.
+                    FamilyPlanBanner()
+                }
+            }
             .safeAreaInset(edge: .bottom) {
                 ConnectionBanner()
                     .padding(.bottom, 8)
             }
         } detail: {
-            if let selectedChatID, chats.contains(where: { $0.chatID == selectedChatID }) {
+            if let selectedChatID, listedChats.contains(where: { $0.chatID == selectedChatID }) {
                 MacConversationView(chatID: selectedChatID)
                     // Rebuild cleanly when the selection moves: the thread
                     // holds per-chat state (draft, scroll, reply) that must
@@ -155,6 +192,14 @@ struct MacChatView: View {
                 }
             }
             ToolbarItem {
+                // A new group (docs/protocol.md, "Groups", 2026-10-22): the
+                // Mac's door to what the phone offers in its New Chat sheet.
+                // Its own view with its own sheet; the group it creates is
+                // selected, as a chat opened from the Family sheet is.
+                NewGroupToolbarButton { selectedChatID = $0 }
+                    .disabled(recorderOpen)
+            }
+            ToolbarItem {
                 Button {
                     showingFamily = true
                 } label: {
@@ -176,6 +221,25 @@ struct MacChatView: View {
         }
         .sheet(isPresented: $showingFamily) {
             MacFamilyView(onOpenChat: { selectedChatID = $0 })
+        }
+        .familyDoorSheets(showsNewFamily: $showsNewFamily, showsJoinAnother: $showsJoinAnother)
+        .alert(
+            "Invitations",
+            isPresented: Binding(get: { switcherFailure != nil }, set: { if !$0 { switcherFailure = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(switcherFailure ?? "")
+        }
+        // The phone's alert: a send refused for the family's used storage
+        // (`storage_allowance_used`) says why, once.
+        .alert(
+            coordinator.sendRefusalNotice ?? "",
+            isPresented: Binding(
+                get: { coordinator.sendRefusalNotice != nil },
+                set: { if !$0 { coordinator.sendRefusalNotice = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
         }
         // Where a share INTO the app lands: pick a chat, and the files
         // stage in its composer — nothing is sent until Send there.
@@ -200,7 +264,7 @@ struct MacChatView: View {
             // thread has to be in front of somebody first (ChatPresence),
             // which is what stops a Mac launched at login behind every other
             // window from quietly clearing the family chat's badge.
-            if selectedChatID == nil { selectedChatID = chats.first?.chatID }
+            if selectedChatID == nil { selectedChatID = listedChats.first?.chatID }
             consumePendingRoute() // clicked before this window existed
             if session.pendingShareImport != nil { showsShareTarget = true }
             #if DEBUG
@@ -241,7 +305,9 @@ struct MacChatView: View {
             showingFamily = false
             showsShareTarget = true
         }
-        .onChange(of: chats.map(\.chatID)) { _, ids in
+        // A switch to another family lands here too: the open chat is not in
+        // the new family's list, so its first chat — its family chat — is.
+        .onChange(of: listedChats.map(\.chatID)) { _, ids in
             if let selectedChatID, ids.contains(selectedChatID) { return }
             selectedChatID = ids.first
         }
@@ -281,6 +347,11 @@ struct MacChatView: View {
             // sheet, so this is the same destination.
             guard session.isOwner else { return }
             showingFamily = true
+        case .invitations, .familyPlan:
+            // Answered from the sidebar's header, which is already on screen
+            // — as is a paid family's deadline banner, in the family the
+            // push opened.
+            break
         case .chatList:
             break // Already here.
         }
@@ -289,7 +360,28 @@ struct MacChatView: View {
     private var recorderOpen: Bool { videoRecorder?.isOpen ?? false }
 
     private var newNoteCount: Int {
-        BoardBadge.unreadCount(notes: notes, marks: AppSettings.boardMarks)
+        BoardBadge.unreadCount(
+            notes: familyNotes, marks: AppSettings.boardMarks(family: coordinator.currentFamilyKey))
+    }
+
+    /// The Mac's switcher: a menu in the chat list's header, titled with the
+    /// family on screen (docs/protocol.md, "Several families").
+    private var familyMenu: some View {
+        Menu {
+            FamilySwitcherMenuContent(
+                onNewFamily: { showsNewFamily = true },
+                onJoinAnother: { showsJoinAnother = true },
+                onFailure: { switcherFailure = $0 })
+        } label: {
+            Label(session.family?.name ?? String(localized: "Family"), systemImage: "person.3")
+                .lineLimit(1)
+        }
+        .menuStyle(.borderlessButton)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .help(Text("Switch Family"))
+        .accessibilityLabel(Text("Switch Family"))
+        .accessibilityValue(Text(session.family?.name ?? String(localized: "Family")))
+        .disabled(recorderOpen)
     }
 
 
@@ -314,8 +406,10 @@ struct MacChatView: View {
     }
 
     private func markBoardSeen() {
-        AppSettings.boardMarks = BoardBadge.marksAfterShowing(
-            notes: notes, marks: AppSettings.boardMarks)
+        let familyKey = coordinator.currentFamilyKey
+        AppSettings.setBoardMarks(
+            BoardBadge.marksAfterShowing(notes: familyNotes, marks: AppSettings.boardMarks(family: familyKey)),
+            family: familyKey)
     }
 
     /// Open one conversation on its own. Keyed by chat id, so asking
@@ -323,6 +417,25 @@ struct MacChatView: View {
     /// a second copy of the same thread.
     private func openInWindow(_ chatID: Int64) {
         openWindow(id: MacWindow.conversation, value: chatID)
+    }
+}
+
+/// The toolbar's New Group button and the sheet it opens.
+private struct NewGroupToolbarButton: View {
+    let onCreate: (Int64) -> Void
+
+    @State private var showsNewGroup = false
+
+    var body: some View {
+        Button {
+            showsNewGroup = true
+        } label: {
+            Label("New Group", systemImage: "person.3")
+        }
+        .help(Text("New Group"))
+        .sheet(isPresented: $showsNewGroup) {
+            NewGroupView(onCreate: onCreate)
+        }
     }
 }
 
@@ -356,6 +469,7 @@ private struct MacChatRow: View {
             InitialsAvatar(
                 title: chat.title,
                 isFamily: chat.kind == "family",
+                isGroup: chat.kind == ChatRules.group,
                 userID: chat.peerUserID,
                 avatarVersion: peerAvatarVersion,
                 size: 34)
@@ -364,10 +478,11 @@ private struct MacChatRow: View {
                     Text(chat.title)
                         .font(.body.weight(chat.unreadCount > 0 ? .semibold : .regular))
                         // The family chat's title is the family's NAME,
-                        // the one title here that is not a person's, and
-                        // a sidebar column cuts a long one; it gets a
-                        // second line (the iPad's rule).
-                        .lineLimit(chat.kind == "family" ? 2 : 1)
+                        // and a group's is the group's — the titles here
+                        // that are not a person's — and a sidebar column
+                        // cuts a long one; they get a second line (the
+                        // iPad's rule).
+                        .lineLimit(ChatRules.isFamilyOrGroup(chat.kind) ? 2 : 1)
                     Spacer(minLength: 0)
                     if let date = chat.lastMessageDate {
                         // Relative, and short: a sidebar column is narrow

@@ -42,6 +42,18 @@ fn main() {
         waveform_vectors();
         return;
     }
+    // `emoji-typing` prints fc_text::emoji_typing — emoji as you type (issue #101) — which every port implements
+    // whole; copied likewise.
+    if std::env::args().nth(1).as_deref() == Some("emoji-typing") {
+        emoji_typing_vectors();
+        return;
+    }
+    // `animation-plan` prints fc_text::animation — an animated picture sent as a silent looping video (issue #96):
+    // the frame timing, size and bitrate every port's encoder follows; copied likewise.
+    if std::env::args().nth(1).as_deref() == Some("animation-plan") {
+        animation_plan_vectors();
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("markdown") {
         markdown_vectors(std::env::args().nth(2).expect("the corpus path"));
         return;
@@ -174,7 +186,8 @@ fn main() {
     }
     out.push_str("  ],\n");
 
-    let geometry_cases: Vec<((f64, f64), (f64, f64), (f64, f64), (f64, f64))> = vec![
+    type Pair = (f64, f64);
+    let geometry_cases: Vec<(Pair, Pair, Pair, Pair)> = vec![
         ((0.5, 0.25), (150.0, 110.0), (900.0, 600.0), (20.0, -20.0)),
         ((0.98, 0.98), (150.0, 110.0), (900.0, 600.0), (0.0, 0.0)),
         ((-1.0, -1.0), (150.0, 110.0), (900.0, 600.0), (5.0, 5.0)),
@@ -379,7 +392,8 @@ fn chat() {
     let long_a = "a".repeat(200);
     let long_ya = "\u{44f}".repeat(120);
     let long_b = "\u{431}".repeat(90);
-    let events: Vec<(&str, &str, &str, Option<&str>, Option<&str>)> = vec![
+    type Event<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, Option<&'a str>);
+    let events: Vec<Event> = vec![
         ("fc-note-12@nettrash", "Christmas dinner", "20261224T160000Z",
          Some("20261224T200000Z"), Some("Gran's house")),
         ("fc-note-13@nettrash", "Lunch, then a walk; bring boots", "20261225T120000Z",
@@ -613,7 +627,7 @@ fn chat() {
         let names: Vec<String> = vec![
             "report.pdf".into(), "  spaced  ".into(), "a/b:c.txt".into(),
             format!("invoice{}fdp.exe", ch(0x202E)), format!("tab{}here.txt", ch(9)), String::new(), "   ".into(),
-            format!("caf{}.txt", ch(0x301).replace("", "")).replacen("caf", "cafe", 1),
+            format!("caf{}.txt", ch(0x301)).replacen("caf", "cafe", 1),
             format!("{}.pdf", "a".repeat(300)), "x".repeat(260), format!("{}.docx", ch(0x431).repeat(250)),
             ".hiddenfile".into(), format!("{}.png", family.repeat(60)), format!("a.{}", "b".repeat(260)),
             format!("zero{}width.txt", ch(0x200B)), format!("soft{}hyphen.txt", ch(0xAD)),
@@ -747,7 +761,7 @@ fn chat() {
             .map(|c| char::from_u32(*c).unwrap())
             .collect();
         let cyrillic = char::from_u32(0x44F).unwrap().to_string();
-        let bodies = vec![
+        let bodies = [
             String::new(),
             "short".to_string(),
             "a".repeat(120),
@@ -1137,7 +1151,8 @@ fn md_text(text: &fc_text::markdown::Text) -> serde_json::Value {
                 };
                 serde_json::json!({"text": span.text, "emphasis": style.emphasis, "strong": style.strong,
                     "code": style.code, "strikethrough": style.strikethrough, "line_break": style.line_break,
-                    "html": style.html, "link": md_link(&style.link), "image": md_link(&style.image), "font": font})
+                    "html": style.html, "link": md_link(&style.link), "image": md_link(&style.image), "font": font,
+                    "math": style.math})
             })
             .collect(),
     )
@@ -1158,6 +1173,11 @@ fn md_blocks(body: &str) -> serde_json::Value {
                     }).collect::<Vec<_>>(),
                     "header": table.header.iter().map(md_text).collect::<Vec<_>>(),
                     "rows": table.rows.iter().map(|row| row.iter().map(md_text).collect::<Vec<_>>()).collect::<Vec<_>>(),
+                }}),
+                // Issue #97: a formula, a diagram or a graph standing on its own.
+                Block::Rich(rich) => serde_json::json!({"rich": {
+                    "kind": rich.kind.word(), "engine": rich.engine, "source": rich.source,
+                    "shown": rich.shown,
                 }}),
             })
             .collect(),
@@ -2902,6 +2922,133 @@ fn waveform_vectors() {
             "played_bars",
             json!({"position_ms": position_ms, "duration_ms": duration_ms, "bars": bars}),
             json!({"played": w::played_bars(position_ms, duration_ms, bars)}),
+        );
+    }
+
+    let lines: Vec<String> = cases
+        .iter()
+        .map(|case| serde_json::to_string(case).unwrap())
+        .collect();
+    println!("[\n  {}\n]", lines.join(",\n  "));
+}
+
+/// The vectors for `fc_text::emoji_typing` (docs/emoji-as-you-type-2026-10-18.md): the emoticon
+/// table itself, and keys typed into an empty field with what the field then holds — the design
+/// table, every emoticon behind every kind of character the guards tell apart (and taken back),
+/// and a spread of the shortcode table, so a port that reads the names file differently shows up.
+/// The keys use the module's own notation: `⌫` is a Backspace, `→` drops the live swap.
+fn emoji_typing_vectors() {
+    use fc_text::emoji_typing as e;
+    use serde_json::json;
+
+    let emoticons: Vec<serde_json::Value> =
+        e::EMOTICONS.iter().map(|(text, emoji)| json!({"text": text, "emoji": emoji})).collect();
+
+    let mut typing: Vec<serde_json::Value> = Vec::new();
+    let mut add = |keys: String| {
+        let text = e::typing(&keys);
+        typing.push(json!({"keys": keys, "text": text}));
+    };
+    for (keys, _) in e::TYPING_TABLE {
+        add(keys.to_string());
+    }
+    // Behind each kind of character the guards and the code rule tell apart.
+    let prefixes = ["", " ", "a", "Z", "7", "Я", "(", ":", ";", "}", "`", "``", "\n", "x ", "😊"];
+    for (text, _) in e::EMOTICONS {
+        for prefix in prefixes {
+            add(format!("{prefix}{text}"));
+            add(format!("{prefix}{text}⌫"));
+        }
+        // Growing, and a face after a face.
+        add(format!("{text}("));
+        add(format!("{text}{text}"));
+    }
+    // Every 97th name, and every name with anything but lower-case ASCII, digits and `_` in it.
+    let names = include_str!("../../../../web/text/data/emoji-names.tsv");
+    for (index, name) in names
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_once('\t').map(|(name, _)| name))
+        .enumerate()
+    {
+        if index % 97 == 0 || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
+            add(format!(":{name}:"));
+            add(format!("x :{name}:⌫"));
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({"emoticons": emoticons, "typing": typing})).unwrap()
+    );
+}
+
+/// fc_text::animation's vectors (issue #96): the constants, each format's delay, the shortest-frame rule and every
+/// plan in `PLAN_CASES`, as one JSON array of `{name, function, input, expected}` like the waveform vectors.
+fn animation_plan_vectors() {
+    use fc_text::animation as a;
+    use serde_json::json;
+
+    let mut cases: Vec<serde_json::Value> = Vec::new();
+    let mut case =
+        |name: &str, function: &str, input: serde_json::Value, expected: serde_json::Value| {
+            cases.push(
+                json!({"name": name, "function": function, "input": input, "expected": expected}),
+            );
+        };
+
+    case(
+        "the constants",
+        "constants",
+        json!({}),
+        json!({
+            "ticks_per_second": a::TICKS_PER_SECOND,
+            "shortest_frame_ms": a::SHORTEST_FRAME_MS,
+            "default_frame_ms": a::DEFAULT_FRAME_MS,
+            "background_rgb": a::BACKGROUND_RGB,
+        }),
+    );
+    for &centiseconds in a::GIF_DELAY_CASES {
+        case(
+            &format!("gif delay {centiseconds} cs"),
+            "gif_delay_ms",
+            json!({"centiseconds": centiseconds}),
+            json!({"ms": a::gif_delay_ms(centiseconds)}),
+        );
+    }
+    for &(num, den) in a::APNG_DELAY_CASES {
+        case(
+            &format!("apng delay {num}/{den}"),
+            "apng_delay_ms",
+            json!({"num": num, "den": den}),
+            json!({"ms": a::apng_delay_ms(num, den)}),
+        );
+    }
+    for stated in [0, 1, 9, 10, 11, 20, 100, 65_535_000] {
+        case(
+            &format!("frame duration {stated} ms"),
+            "frame_duration_ms",
+            json!({"stated_ms": stated}),
+            json!({"ms": a::frame_duration_ms(stated)}),
+        );
+    }
+    for (index, &(width, height, stated)) in a::PLAN_CASES.iter().enumerate() {
+        let expected = match a::plan(width, height, stated) {
+            Some(plan) => json!({
+                "width": plan.width,
+                "height": plan.height,
+                "samples": plan.samples.iter().map(|s| json!([s.frame, s.ticks])).collect::<Vec<_>>(),
+                "total_ticks": plan.total_ticks,
+                "duration_ms": plan.duration_ms,
+                "video_bitrate": plan.video_bitrate,
+            }),
+            None => serde_json::Value::Null,
+        };
+        case(
+            &format!("plan {index}: {width}x{height}, {} frames", stated.len()),
+            "plan",
+            json!({"width": width, "height": height, "stated_ms": stated}),
+            expected,
         );
     }
 

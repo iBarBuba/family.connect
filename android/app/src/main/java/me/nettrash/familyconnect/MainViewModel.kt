@@ -26,11 +26,13 @@
 package me.nettrash.familyconnect
 
 import android.net.Uri
+import androidx.annotation.PluralsRes
 import androidx.annotation.StringRes
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -40,6 +42,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.nettrash.familyconnect.data.push.PendingRoute
+import me.nettrash.familyconnect.data.push.PushFamilyRouter
 import me.nettrash.familyconnect.calls.CallState
 import me.nettrash.familyconnect.calls.CallStarter
 import me.nettrash.familyconnect.calls.CallStateSource
@@ -64,6 +67,8 @@ class MainViewModel @Inject constructor(
     private val shareImporter: ShareImporter = ShareImporter.NONE,
     /** And the app-wide stash the chosen chat's composer drains. */
     private val shareStash: ShareStash = ShareStash(),
+    /** Same trick: a push opened in its family (#88); Dagger injects FamilyPushRouter. */
+    private val familyRouter: PushFamilyRouter = PushFamilyRouter.NONE,
 ) : ViewModel() {
 
     /** The one voice call this device can be on — AppNavHost shows the call screen off it. */
@@ -103,9 +108,25 @@ class MainViewModel @Inject constructor(
         }
     }
 
-    /** A newer tap wins — the user tapped it last, it's what they want. */
-    fun onPendingRoute(route: PendingRoute) {
-        _pendingRoute.value = route
+    /**
+     * A newer tap wins — the user tapped it last, it's what they want.
+     *
+     * In its family (docs/protocol.md, "Several families" — "Pushes"): the
+     * app switches to [familyId] — or, for a chat that names none, to a
+     * family that lists the chat — BEFORE the route is published, so the
+     * screen it opens is already the right family's. Undispatched, so a
+     * switch that does not need to wait publishes at once.
+     */
+    fun onPendingRoute(route: PendingRoute, familyId: Long? = null) {
+        val chatId = (route as? PendingRoute.Chat)?.chatId
+        if (familyId == null && chatId == null) {
+            _pendingRoute.value = route
+            return
+        }
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            familyRouter.openIn(familyId, chatId)
+            _pendingRoute.value = route
+        }
     }
 
     fun consumePendingRoute() {
@@ -128,7 +149,12 @@ class MainViewModel @Inject constructor(
     }
 
     /** One sentence the activity shows as a toast, then consumes. */
-    data class ShareNotice(@param:StringRes val resId: Int, val arg: Int? = null)
+    sealed interface ShareNotice {
+        data class Words(@param:StringRes val resId: Int) : ShareNotice
+
+        /** A sentence about [count] things, in the form the language gives that number. */
+        data class Counted(@param:PluralsRes val resId: Int, val count: Int) : ShareNotice
+    }
 
     private val _shareFlow = MutableStateFlow<ShareFlow?>(null)
     val shareFlow: StateFlow<ShareFlow?> = _shareFlow
@@ -162,7 +188,7 @@ class MainViewModel @Inject constructor(
             val snapshot = sessionRepository.snapshot()
             if (!snapshot.canChat) {
                 if (uris.isNotEmpty() || !text.isNullOrBlank()) {
-                    _shareNotice.value = ShareNotice(R.string.e_share_unavailable)
+                    _shareNotice.value = ShareNotice.Words(R.string.e_share_unavailable)
                 }
                 return@launch
             }
@@ -176,8 +202,8 @@ class MainViewModel @Inject constructor(
                 is ShareIn.Verdict.Attach -> {
                     _shareFlow.value = ShareFlow.Preparing
                     if (verdict.dropped > 0) {
-                        _shareNotice.value = ShareNotice(
-                            R.string.e_share_too_many,
+                        _shareNotice.value = ShareNotice.Counted(
+                            R.plurals.e_share_too_many,
                             AttachmentDto.MAX_PER_MESSAGE,
                         )
                     }
@@ -192,7 +218,7 @@ class MainViewModel @Inject constructor(
                         return@launch
                     }
                     if (prepared.isEmpty()) {
-                        _shareNotice.value = ShareNotice(R.string.e_share_failed)
+                        _shareNotice.value = ShareNotice.Words(R.string.e_share_failed)
                         _shareFlow.value = null
                     } else {
                         shareStash.deposit(prepared, text = null)

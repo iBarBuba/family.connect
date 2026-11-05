@@ -91,22 +91,22 @@ struct AttachmentView: View {
     /// The preview when there is one; the full photo otherwise, so a
     /// message sent before its preview landed still shows something.
     ///
-    /// READING `store.generation` HERE IS LOAD-BEARING. The store's caches
-    /// are @ObservationIgnored (a dictionary that changes on every scroll
-    /// frame would invalidate every reader), so `generation` is the only
-    /// observable thing it has — and without touching it this view
-    /// registers no dependency at all and never redraws when the fetch
-    /// lands. The bubble then sits on its spinner until something else
-    /// happens to rebuild it, which is why leaving the chat and coming
-    /// back "fixed" it. Same reason AttachmentViewer reads it.
+    /// THE LOOKUP IS THE DEPENDENCY. The store's caches are
+    /// @ObservationIgnored (a dictionary that changes on every scroll frame
+    /// would invalidate every reader), and each lookup registers the calling
+    /// view on that attachment's OWN key instead — so this redraws when its
+    /// fetch lands and for no other picture. Without a dependency at all the
+    /// bubble sat on its spinner until something else happened to rebuild
+    /// it, which is why leaving the chat and coming back "fixed" it. It used
+    /// to be a store-wide `generation` every image view read, so every
+    /// landing redrew every picture on screen.
     private var image: Image? {
-        _ = store.generation
-        return Self.image(for: attachment, in: store)
+        Self.image(for: attachment, in: store)
     }
 
     /// The lookup behind `image`, for any view that draws a bubble-sized
-    /// preview of an attachment. The caller reads `store.generation` — the
-    /// paragraph above is about the caller, not this function.
+    /// preview of an attachment — called from a body, it registers that body
+    /// on the key it reads.
     ///
     /// `hasPreview` IS A HINT, NOT A FACT, and the difference is the whole
     /// reason the two kinds are treated differently here.
@@ -192,7 +192,7 @@ struct AttachmentView: View {
             }
         } else if attachment.isFile {
             fileRow
-        } else if attachment.isVideo, transcriptSubject != nil {
+        } else if attachment.isVideo, !attachment.isAnimation, transcriptSubject != nil {
             // A video's text sits under its tile like a voice note's under
             // its player, and outside the tile's gestures for the same
             // reason. Only where there is a message to name: a viewer or
@@ -288,7 +288,13 @@ struct AttachmentView: View {
             } else if isAwaitingBytes {
                 ProgressView()
             }
-            if attachment.isVideo {
+            if attachment.isAnimation {
+                // A picture that moves (#96): its video over the poster,
+                // muted and looping while on screen, and the small "GIF" —
+                // no play button, no duration.
+                AnimationSurface(attachment: attachment, cornerRadius: 14)
+                AnimationBadge()
+            } else if attachment.isVideo {
                 VideoBadgeOverlay(attachment: attachment)
             }
         }
@@ -313,7 +319,7 @@ struct AttachmentView: View {
         .onTapGesture(count: 1) { onOpen() }
         .simultaneousGesture(LongPressGesture().onEnded { _ in onLongPress() })
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(attachment.isVideo ? "Video" : "Photo")
+        .accessibilityLabel(attachment.isAnimation ? "GIF" : attachment.isVideo ? "Video" : "Photo")
         .accessibilityAddTraits(.isButton)
         // A bare gesture publishes no accessibility action — measured, see
         // ZZAXProbeTests.

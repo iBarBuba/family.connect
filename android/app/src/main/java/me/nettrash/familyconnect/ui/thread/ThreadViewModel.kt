@@ -48,6 +48,8 @@ import me.nettrash.familyconnect.data.net.dto.AttachmentDto
 import me.nettrash.familyconnect.data.net.dto.ReplyToDto
 import me.nettrash.familyconnect.util.resolvedDisplayName
 import me.nettrash.familyconnect.util.MemberMention
+import me.nettrash.familyconnect.util.GroupRules
+import me.nettrash.familyconnect.util.goneAfterSeen
 import me.nettrash.familyconnect.data.repo.ChatRepository
 import me.nettrash.familyconnect.data.repo.FamilyRepository
 import me.nettrash.familyconnect.data.net.dto.MentionDto
@@ -63,6 +65,7 @@ import me.nettrash.familyconnect.ui.chat.ChatViewModel
 import me.nettrash.familyconnect.ui.chat.buildChatItems
 import me.nettrash.familyconnect.util.Clock
 import me.nettrash.familyconnect.util.resolvedDisplayNames
+import me.nettrash.familyconnect.data.repo.observeCurrentActiveMembers
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @HiltViewModel
@@ -101,6 +104,14 @@ class ThreadViewModel @Inject constructor(
         .flatMapLatest { chatDao.observeById(it.first) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
+    /**
+     * The chat this thread belongs to has left this device — a group left,
+     * removed from or deleted, or a direct chat whose peer deleted their
+     * account ([goneAfterSeen]). The screen leaves on it, as ChatScreen does.
+     */
+    val chatGone: StateFlow<Boolean> = chat.goneAfterSeen()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
     val myUserId: StateFlow<Long?> = settings.state
         .map { it.myUserId }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
@@ -122,9 +133,19 @@ class ThreadViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
 
     /** Everybody a mention may name (docs/protocol.md, "Mentioning a member"). */
-    val mentionRoster: StateFlow<List<MentionDto>> = memberDao.observeActiveMembers()
+    val mentionRoster: StateFlow<List<MentionDto>> = memberDao.observeCurrentActiveMembers(settings)
         .map { members -> members.map { MentionDto(it.userId, it.resolvedDisplayName(appContext)) } }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /**
+     * Who a mention may name in THIS chat: [mentionRoster], narrowed to the
+     * group's members in a group ([GroupRules.mentionRoster]) — the server
+     * refuses anybody else there.
+     */
+    val nameableRoster: StateFlow<List<MentionDto>> =
+        combine(mentionRoster, chat) { roster, chatEntity ->
+            GroupRules.mentionRoster(roster, chatEntity?.kind, chatEntity?.memberIds.orEmpty())
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     /** A tap on a name opens the one-to-one chat with that member. */
     fun openDirectChat(userId: Long, onOpened: (Long) -> Unit) {
@@ -150,20 +171,21 @@ class ThreadViewModel @Inject constructor(
         target.filterNotNull().flatMapLatest { messageDao.observeThread(it.second) },
         chat,
         memberDao.observeMembers(),
-        memberDao.observeActiveMembers(),
+        memberDao.observeCurrentActiveMembers(settings),
         settings.state,
     ) { rows, chat, members, active, settingsState ->
         buildChatItems(
             // The builder reads newest-first, the chat list's order; the
             // thread reads the other way, so both ends are reversed.
             messagesNewestFirst = rows.asReversed(),
-            isFamilyChat = chat?.kind == "family",
+            // Sender names wherever several people write (docs/protocol.md, "Groups").
+            isFamilyChat = GroupRules.showsSenderNames(chat?.kind),
             myUserId = settingsState.myUserId ?: -1L,
             memberNames = members.resolvedDisplayNames(appContext),
             nowMillis = clock.now(),
             assistantUserId = settingsState.assistantUserId,
             assistantName = settingsState.assistantName,
-            familyMemberCount = active.size,
+            familyMemberCount = GroupRules.pollAudience(chat?.kind, chat?.memberIds.orEmpty(), active.size),
             blockedUserIds = settingsState.blockedUserIds,
         ).filterNot { it is ChatListItem.NewMessagesDivider }.asReversed()
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
@@ -187,9 +209,10 @@ class ThreadViewModel @Inject constructor(
         val trimmed = body.trim()
         if (trimmed.isEmpty()) return
         // The members named, resolved from the text as the chat's composer
-        // does (docs/protocol.md, "Mentioning a member") — family chat only.
-        val mentions = if (chat.value?.kind == "family") {
-            MemberMention.resolve(trimmed, mentionRoster.value).takeIf { it.isNotEmpty() }
+        // does (docs/protocol.md, "Mentioning a member") — the family chat
+        // and groups only, and in a group only its members.
+        val mentions = if (GroupRules.offersMemberMentions(chat.value?.kind)) {
+            MemberMention.resolve(trimmed, nameableRoster.value).takeIf { it.isNotEmpty() }
         } else {
             null
         }

@@ -10,11 +10,10 @@
 //  assistant's provider, so it is the asker's consent the server checks,
 //  the way a `/draw` checks the drawer's. Whose VOICE it is matters too:
 //  a member's own recording may be asked about in any chat they are in;
-//  somebody else's only in the family chat (its threads are the same
-//  chat), only while the owner's `ai_transcripts` is on — and, a check this
-//  client cannot make, only when that sender has agreed to the assistant
-//  themselves. Never another member's in a direct chat, never the
-//  assistant's own.
+//  the other person's in a direct chat; somebody else's in the family chat
+//  (its threads are the same chat) only while the owner's `ai_transcripts`
+//  is on — and, a check this client cannot make, only when that sender has
+//  agreed to the assistant themselves. Never the assistant's own.
 //
 //  One rule for the phone's bubble and the Mac's row, so the two cannot
 //  come to disagree, and a test can pin every row with no view on screen.
@@ -90,6 +89,9 @@ nonisolated enum TranscriptDoor: Equatable {
     /// trying and said under the action (the header above).
     static func route(for attachment: AttachmentDTO, maxBytes: Int64?) -> TranscriptRoute? {
         guard attachment.size > 0 else { return nil }
+        // An ANIMATION has no sound track at all (#96, "transcripts find no
+        // sound"), so there is nothing to offer the text of.
+        guard !attachment.isAnimation else { return nil }
         if storedCopyQualifies(attachment, maxBytes: maxBytes) { return .stored }
         switch attachment.kind {
         case "audio", "video": return .supplied
@@ -121,8 +123,13 @@ nonisolated enum TranscriptDoor: Equatable {
     /// The protocol's "who may ask", as far as this client can know it.
     ///
     /// - Your own message: in any chat you are in, direct chats included.
-    /// - Another member's: only in the family chat (threads included —
-    ///   they are messages of the same chat) and only while the owner's
+    /// - The other person's in a direct chat: yes — no owner's switch
+    ///   reaches a direct chat (amended 2026-10-21; until then never).
+    /// - Another member's in a GROUP, threads included: as in a direct chat
+    ///   — the owner's switch is about the family chat and does not reach a
+    ///   group (amended 2026-10-22, D4; docs/protocol.md, "Groups").
+    /// - Another member's in the family chat (threads included — they are
+    ///   messages of the same chat): only while the owner's
     ///   `ai_transcripts` is on.
     /// - The assistant's own messages: never.
     ///
@@ -139,7 +146,12 @@ nonisolated enum TranscriptDoor: Equatable {
     ) -> Bool {
         if let assistantUserID, senderID == assistantUserID { return false }
         if senderID == currentUserID, currentUserID > 0 { return chatKind != nil }
-        return chatKind == "family" && familyAllowsTranscripts
+        switch ChatRules.transcriptRule(chatKind) {
+        // "The other person" needs a reader who is known.
+        case .sendersConsent: return currentUserID > 0
+        case .ownersSwitch: return familyAllowsTranscripts
+        case .never: return false
+        }
     }
 
     /// The whole door, from every fact it turns on.
@@ -207,6 +219,10 @@ nonisolated enum TranscriptFailure: Equatable, Sendable {
     /// This device could not take the sound out of the file: no sound
     /// track, or a format this OS cannot open. Terminal on this device.
     case unreadable
+    /// `ai_allowance_used`: a paid family past this month's transcript
+    /// minutes (docs/protocol.md, "Paid families"). Terminal until the
+    /// allowance renews on `renewsAt`, the 1st of the next UTC month.
+    case allowanceUsed(renewsAt: Date)
 
     /// The sentence the row draws.
     var message: String {
@@ -216,11 +232,21 @@ nonisolated enum TranscriptFailure: Equatable, Sendable {
         case .notAvailable: String(localized: "Not available for this message.")
         case .tooLong: String(localized: "This recording is too long to turn into text.")
         case .unreadable: String(localized: "Couldn't read the sound in this file.")
+        case .allowanceUsed(let renewsAt): PaidFamilies.assistantAllowanceUsed(renewsAt: renewsAt)
         }
     }
 
     /// Whether the row offers to ask again.
     var offersRetry: Bool { self == .retry }
+
+    /// Whether this is still the row's answer at `now`. Only a used-up month
+    /// runs out: from the renewal it named, the server takes the request
+    /// again, and the row is back to "Show text" (docs/protocol.md,
+    /// "Transcripts on request").
+    func holds(at now: Date) -> Bool {
+        if case .allowanceUsed(let renewsAt) = self { return now < renewsAt }
+        return true
+    }
 }
 
 /// What asking for a recording's text came to.
@@ -236,7 +262,7 @@ nonisolated enum TranscriptOutcome: Equatable, Sendable {
     /// Sorted from what the request threw. Only the protocol's codes decide
     /// a refusal; anything the server did not answer on purpose is worth
     /// asking again.
-    init(error: Error) {
+    init(error: Error, now: Date = .now) {
         switch error {
         // What this device found when it tried to make the sound itself.
         case TranscriptSound.Failure.tooLong:
@@ -250,6 +276,10 @@ nonisolated enum TranscriptOutcome: Equatable, Sendable {
             self = .failed(.tooLong)
         case APIError.forbidden(let code) where code == "assistant_consent_required":
             self = .consentRequired
+        // Before the catch-all 403 below: this refusal renews on a day the
+        // row can name, where the others never change by waiting.
+        case APIError.forbidden(let code) where code == "ai_allowance_used":
+            self = .failed(.allowanceUsed(renewsAt: PaidFamilies.nextMonthStartUTC(after: now)))
         case APIError.conflict(let code, _) where code == "transcript_refused":
             self = .failed(.refused)
         case APIError.conflict(let code, _)

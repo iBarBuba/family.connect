@@ -48,6 +48,8 @@ struct ThreadView: View {
     @State private var isLoading = true
     @State private var loadFailed = false
     @State private var draft = ""
+    /// The reply field's emoji as you type (#101).
+    @State private var emojiTyping = EmojiTypingField()
     /// Rows this reader has peeked at — per row, per surface, never stored
     /// (protocol.md, "Blocking a member").
     @State private var revealed: Set<String> = []
@@ -197,7 +199,11 @@ struct ThreadView: View {
         // A reply quoting a video message says "Video message" (#79, S5.7).
         let plain = rows.map { MessageSnapshot($0) }
         let roundIDs = MessagePresentation.roundMessageIDs(plain)
-        return plain.map { MessagePresentation.namingRoundQuotes($0, roundIDs: roundIDs) }
+        // ...and one quoting an animation with no caption says "GIF" (#96).
+        let animationIDs = MessagePresentation.animationMessageIDs(plain)
+        return plain.map {
+            MessagePresentation.namingRoundQuotes($0, roundIDs: roundIDs, animationIDs: animationIDs)
+        }
     }
 
     private var sections: [DaySection] {
@@ -212,12 +218,19 @@ struct ThreadView: View {
         chats.first { $0.chatID == chatID }
     }
 
-    private var isFamilyChat: Bool { chat?.kind == "family" }
+    /// The family chat or a group — the surface a thread inherits from its
+    /// chat (docs/protocol.md, "Groups"; `ChatRules`).
+    private var isFamilyOrGroup: Bool { ChatRules.isFamilyOrGroup(chat?.kind) }
 
     private var currentUserID: Int64 { AppSettings.currentUserID ?? -1 }
 
+    /// The "of N" under a poll: the family's live roster, or a group's
+    /// members (`ChatRules.pollAudience`).
     private var familyMemberCount: Int {
-        members.filter { !$0.hasLeft && !$0.accountDeleted }.count
+        ChatRules.pollAudience(
+            kind: chat?.kind,
+            groupMemberIDs: chat?.groupMemberIDs ?? [],
+            liveFamilyMembers: members.filter { !$0.hasLeft && !$0.accountDeleted }.count)
     }
 
     private var memberNames: [Int64: String] {
@@ -251,9 +264,9 @@ struct ThreadView: View {
                 coordinator.assistantFailure(messageID: $0)
             },
             isMine: isMine,
-            showsSenderName: !isMine && isFamilyChat,
+            showsSenderName: !isMine && isFamilyOrGroup,
             isRead: MessagePresentation.isRead(
-                message, othersReadUpTo: chat?.othersReadUpTo ?? 0, isFamilyChat: isFamilyChat),
+                message, othersReadUpTo: chat?.othersReadUpTo ?? 0, isFamilyOrGroup: isFamilyOrGroup),
             // Reply from a row is the composer below: whatever the row, a
             // reply from this surface answers the root. Edit and Report are
             // the chat's, and are not offered here rather than offered inert.
@@ -280,12 +293,12 @@ struct ThreadView: View {
             assistantFailure: message.serverID.flatMap {
                 coordinator.assistantFailure(messageID: $0)
             },
-            showsSenderName: !isMine && isFamilyChat,
+            showsSenderName: !isMine && isFamilyOrGroup,
             senderName: memberNames[message.senderID],
             senderID: message.senderID,
             senderAvatarVersion: avatarVersions[message.senderID] ?? 0,
             isRead: MessagePresentation.isRead(
-                message, othersReadUpTo: chat?.othersReadUpTo ?? 0, isFamilyChat: isFamilyChat),
+                message, othersReadUpTo: chat?.othersReadUpTo ?? 0, isFamilyOrGroup: isFamilyOrGroup),
             reactionChips: MessagePresentation.reactionChips(
                 message.reactions, currentUserID: currentUserID),
             reactionDetails: MessagePresentation.reactionDetails(
@@ -349,10 +362,13 @@ struct ThreadView: View {
     // MARK: - Member mentions (docs/protocol.md, "Mentioning a member")
 
     /// Everybody a mention may name: the current roster, by the name the
-    /// app calls them.
+    /// app calls them — in a group, only its own members (`ChatRules`).
     private var mentionRoster: [MentionDTO] {
-        members.filter { !$0.hasLeft && !$0.accountDeleted }
-            .map { MentionDTO(userID: $0.userID, name: $0.resolvedDisplayName) }
+        ChatRules.mentionRoster(
+            members.filter { !$0.hasLeft && !$0.accountDeleted }
+                .map { MentionDTO(userID: $0.userID, name: $0.resolvedDisplayName) },
+            kind: chat?.kind,
+            groupMemberIDs: chat?.groupMemberIDs ?? [])
     }
 
     /// What the strip offers for the prefix being typed: never the reader
@@ -364,10 +380,10 @@ struct ThreadView: View {
             excluding: coordinator.blockedUserIDs.union([currentUserID]))
     }
 
-    /// The members the text names, resolved at send — family chat only,
-    /// nil when it names nobody so the wire stays as it was.
+    /// The members the text names, resolved at send — the family chat or a
+    /// group only, nil when it names nobody so the wire stays as it was.
     private func resolvedMentions(in body: String) -> [MentionDTO]? {
-        guard isFamilyChat else { return nil }
+        guard isFamilyOrGroup else { return nil }
         let found = MemberMentions.resolve(body: body, roster: mentionRoster)
         return found.isEmpty ? nil : found
     }
@@ -395,7 +411,7 @@ struct ThreadView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if isFamilyChat, let query = MemberMentions.query(in: draft) {
+            if isFamilyOrGroup, let query = MemberMentions.query(in: draft) {
                 let candidates = mentionCandidates(matching: query)
                 if !candidates.isEmpty {
                     MentionSuggestions(candidates: candidates) { name in
@@ -429,45 +445,162 @@ struct ThreadView: View {
             agreedAt: session.assistantConsentAt)
     }
 
-    /// The side and glyph of the sticker button — the chat composer's own
-    /// on each platform, so the button is the one people already know.
+    /// The row's sizes — the chat composer's own on each platform, so the
+    /// capsule, the sticker glyph and the Send disc are the ones people
+    /// already know (#106). Scaled on the phone, as the chat's are.
     #if os(macOS)
-    private let stickerControl: (side: CGFloat, glyph: CGFloat) = (24, 16)
+    private let control: CGFloat = 24
+    private let sendGlyph: CGFloat = 22
+    private let stickerGlyph: CGFloat = 16
+    private let fieldGlyph: CGFloat = 24
     #else
-    private let stickerControl: (side: CGFloat, glyph: CGFloat) = (36, 20)
+    @ScaledMetric(relativeTo: .body) private var control: CGFloat = 36
+    @ScaledMetric(relativeTo: .body) private var sendGlyph: CGFloat = 26
+    @ScaledMetric(relativeTo: .body) private var stickerGlyph: CGFloat = 20
+    @ScaledMetric(relativeTo: .body) private var fieldGlyph: CGFloat = 30
     #endif
 
+    /// The thread's row (#106, docs/composer-and-wide-layout-2026-10-20.md,
+    /// 2.1): the chat composer's capsule with the sticker glyph inside it at
+    /// the trailing edge, and the chat's Send disc — disabled while the
+    /// draft is blank. No paperclip and no microphone: a thread has neither
+    /// an attach menu nor a recorder (#79, S1.3), and that is unchanged.
+    /// It used to be a bare 22-pt arrow beside a plain field, with the
+    /// sticker button in front of it — a second product inside the first.
     private var composerRow: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            // A sticker answers from here as words do (docs/protocol.md,
-            // "Sending one": "It may be a reply, which is how one answers
-            // something" — and a thread is nothing but replies). Without
-            // it, answering a chain with a sticker meant leaving the chain,
-            // arming a reply in the chat and sending from there.
-            if showsStickers {
-                StickerComposerButton(
-                    side: stickerControl.side, glyph: stickerControl.glyph
-                ) { item in
-                    sendSticker(item)
-                }
-            }
-            TextField("Reply in thread", text: $draft, axis: .vertical)
-                .lineLimit(1...5)
-                .textFieldStyle(.plain)
-                .focused($composerFocused)
-                .onSubmit(send)
-            Button(action: send) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
-            }
-            .buttonStyle(.plain)
-            .disabled(!canSend)
-            .keyboardShortcut(.return, modifiers: .command)
-            .accessibilityLabel(Text("Send"))
+            replyField
+            sendButton
         }
+        #if os(macOS)
+        // The Mac chat's box around the whole row, its focus ring with it.
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.appSecondaryFill.opacity(0.5)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(composerFocused ? Color.accentColor.opacity(0.6) : .clear))
+        .padding(12)
+        #else
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        #endif
     }
+
+    /// The field, with the sticker glyph inside it.
+    @ViewBuilder
+    private var replyField: some View {
+        #if os(macOS)
+        HStack(alignment: .bottom, spacing: 4) {
+            TextField("Reply in thread", text: emojiTyping.binding($draft), axis: .vertical)
+                .proseTextEntry()
+                .lineLimit(1...5)
+                .textFieldStyle(.plain)
+                .font(.body)
+                .focused($composerFocused)
+                // Return sends on the Mac, as in the chat; every modified
+                // Return is a new line (#95, MacNewLineKeys).
+                .onSubmit(send)
+                .frame(minHeight: control)
+            if showsStickers {
+                stickerGlyphButton
+            }
+        }
+        #else
+        TextField("Reply in thread", text: emojiTyping.binding($draft), axis: .vertical)
+            .proseTextEntry()
+            .lineLimit(1...5)
+            .textFieldStyle(.plain)
+            .focused($composerFocused)
+            // The chat's keys (#106, 2.3): a HARDWARE Return sends and
+            // Shift+Return breaks the line. It arrives as the field's submit
+            // (HardwareReturn) — the on-screen keyboard's Return never
+            // submits a multi-line field, and stays a new line.
+            .onSubmit { hardwareReturn() }
+            .background(ReturnKeyCommands(active: composerFocused) {
+                if let extended = HardwareReturn.appendingLine(to: draft) { draft = extended }
+            })
+            .padding(.leading, 12)
+            .padding(.trailing, ComposerRow.trailingInset(
+                glyphs: showsStickers ? 1 : 0, glyphWidth: fieldGlyph, spacing: 2,
+                endInset: 6, bareInset: 12))
+            .padding(.vertical, 7)
+            .composerFieldBackground()
+            .overlay(alignment: .bottomTrailing) {
+                if showsStickers {
+                    stickerGlyphButton
+                        .padding(.trailing, 6)
+                }
+            }
+        #endif
+    }
+
+    /// A sticker answers from here as words do (docs/protocol.md, "Sending
+    /// one": "It may be a reply, which is how one answers something" — and
+    /// a thread is nothing but replies). Without it, answering a chain with
+    /// a sticker meant leaving the chain, arming a reply in the chat and
+    /// sending from there.
+    private var stickerGlyphButton: some View {
+        StickerComposerButton(
+            side: control, glyph: stickerGlyph, width: fieldGlyph,
+            hitOverhang: ComposerRow.targetOverhang(side: fieldGlyph)
+        ) { item in
+            sendSticker(item)
+        }
+    }
+
+    /// The chat's Send disc: the same glyph, size and tint, dimmed while
+    /// there is nothing to send.
+    private var sendButton: some View {
+        Button(action: send) {
+            Image(systemName: "arrow.up.circle.fill")
+                .font(.system(size: sendGlyph))
+                .foregroundStyle(canSend ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
+                .frame(width: control, height: control)
+                #if os(macOS)
+                .contentShape(Rectangle())
+                #else
+                .contentShape(Rectangle().inset(by: -ComposerRow.targetOverhang(side: control)))
+                #endif
+        }
+        .buttonStyle(.plain)
+        .disabled(!canSend)
+        #if !os(macOS)
+        // A hardware keyboard's ⌘↩ on iPhone and iPad, as in the chat. On
+        // the Mac ⌘↩ is a new line, as every modified Return is (#95), and
+        // Return alone already sends through `onSubmit`.
+        .keyboardShortcut(.return, modifiers: .command)
+        #endif
+        .accessibilityLabel(Text("Send"))
+    }
+
+    #if !os(macOS)
+    /// A hardware Return in the reply field — the chat's rule with this
+    /// sheet's Send for the slot (`ComposerRow.threadHardwareReturn`). The
+    /// submit took the focus; it is given back, as in the chat.
+    private func hardwareReturn() {
+        // A Shift+Return the key command saw: a line, never a send.
+        if ReturnKeyCommands.takeShiftReturn() {
+            if let extended = HardwareReturn.appendingLine(to: draft) { draft = extended }
+            composerFocused = true
+            return
+        }
+        let held = HardwareReturn.held()
+        switch ComposerRow.threadHardwareReturn(
+            shift: held.shift, option: held.option, command: held.command, control: held.control,
+            canSend: canSend) {
+        case .activateSlot:
+            send()
+        case .newLine:
+            if let extended = HardwareReturn.appendingLine(to: draft) { draft = extended }
+        case .nothing, .shortcut:
+            break
+        }
+        composerFocused = true
+    }
+    #endif
 
     /// A reply to the ROOT, whatever the reader was looking at — the
     /// iMessage rule, and the one that keeps the root's count honest

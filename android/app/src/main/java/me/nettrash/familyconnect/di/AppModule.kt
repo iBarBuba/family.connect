@@ -45,6 +45,7 @@ import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.SharedFlow
@@ -53,6 +54,10 @@ import me.nettrash.familyconnect.BuildConfig
 import me.nettrash.familyconnect.data.db.AppDatabase
 import me.nettrash.familyconnect.data.db.ChatDao
 import me.nettrash.familyconnect.data.db.LocalDataWiper
+import me.nettrash.familyconnect.data.push.FamilyPushRouter
+import me.nettrash.familyconnect.data.push.PushFamilyRouter
+import me.nettrash.familyconnect.data.repo.FamilyLocalData
+import me.nettrash.familyconnect.data.repo.RoomFamilyLocalData
 import me.nettrash.familyconnect.data.db.MemberDao
 import me.nettrash.familyconnect.data.db.MessageDao
 import me.nettrash.familyconnect.data.db.PendingAttachmentDao
@@ -78,6 +83,9 @@ import me.nettrash.familyconnect.data.net.DefaultBoardApi
 import me.nettrash.familyconnect.data.net.DefaultPackApi
 import me.nettrash.familyconnect.data.net.PackApi
 import me.nettrash.familyconnect.data.net.DefaultChatApi
+import me.nettrash.familyconnect.data.net.DefaultGroupApi
+import me.nettrash.familyconnect.data.net.GroupApi
+import me.nettrash.familyconnect.data.repo.ChatDrafts
 import me.nettrash.familyconnect.data.net.DefaultFamilyApi
 import me.nettrash.familyconnect.data.net.FamilyApi
 import me.nettrash.familyconnect.data.net.ws.ChatSocket
@@ -92,6 +100,7 @@ import me.nettrash.familyconnect.data.repo.PackRepository
 import me.nettrash.familyconnect.data.repo.ParkedRecordings
 import me.nettrash.familyconnect.data.repo.VoiceRecorder
 import me.nettrash.familyconnect.data.repo.MediaUploadScheduler
+import me.nettrash.familyconnect.data.db.DbTransactions
 import me.nettrash.familyconnect.data.repo.MediaUploadWorker
 import me.nettrash.familyconnect.data.repo.PosterCache
 import me.nettrash.familyconnect.data.repo.ShareImporter
@@ -117,6 +126,16 @@ import javax.inject.Singleton
 @Qualifier
 @Retention(AnnotationRetention.BINARY)
 annotation class AppScope
+
+/**
+ * Where CPU work that must stay off the main thread runs — today the chat's
+ * row builder (ChatViewModel.items). A qualifier rather than a bare
+ * Dispatchers.Default at the use site so a test hands in its own scheduler
+ * and its assertions stay deterministic.
+ */
+@Qualifier
+@Retention(AnnotationRetention.BINARY)
+annotation class ComputeDispatcher
 
 /** ApiClient's "session is gone" broadcast, injectable without ApiClient. */
 @Qualifier
@@ -163,6 +182,15 @@ abstract class AppModule {
     @Binds
     abstract fun bindChatApi(impl: DefaultChatApi): ChatApi
 
+    // Groups (#107): their own five endpoints, their own seam.
+    @Binds
+    abstract fun bindGroupApi(impl: DefaultGroupApi): GroupApi
+
+    // What a chat leaving this device takes with it besides its rows: the
+    // voice messages parked there (docs/protocol.md, "Groups").
+    @Binds
+    abstract fun bindChatDrafts(impl: ParkedRecordings): ChatDrafts
+
     @Binds
     abstract fun bindConnectivityObserver(impl: AndroidConnectivityObserver): ConnectivityObserver
 
@@ -180,6 +208,16 @@ abstract class AppModule {
 
     @Binds
     abstract fun bindChatSocket(impl: OkHttpChatSocket): ChatSocket
+
+    // Several families (#88): one family's rows dropped without the whole
+    // database, and a push opened in its family — both seams so the
+    // session's and the main screen's tests need neither Room nor the
+    // repositories.
+    @Binds
+    abstract fun bindFamilyLocalData(impl: RoomFamilyLocalData): FamilyLocalData
+
+    @Binds
+    abstract fun bindPushFamilyRouter(impl: FamilyPushRouter): PushFamilyRouter
 
     // Voice calls. The media seam is what keeps org.webrtc out of every
     // test; the audio seam does the same for AudioManager.
@@ -245,6 +283,16 @@ abstract class AppModule {
         @AppScope
         fun provideAppScope(): CoroutineScope =
             CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        @Provides
+        @ComputeDispatcher
+        fun provideComputeDispatcher(): CoroutineDispatcher = Dispatchers.Default
+
+        // A page of history or catch-up committed as ONE transaction
+        // (MessageRepository, DbTransactions says why).
+        @Provides
+        @Singleton
+        fun provideDbTransactions(database: AppDatabase): DbTransactions = DbTransactions.of(database)
 
         @Provides
         @Singleton

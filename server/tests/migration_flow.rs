@@ -10,7 +10,9 @@
 mod common;
 
 use common::{TestServer, spawn_server};
+use family_connect::keyring::Owner;
 use family_connect::migrate::MIGRATIONS;
+use family_connect::vault::Lookup;
 use sqlx::Row;
 use time::OffsetDateTime;
 
@@ -43,11 +45,12 @@ async fn insert_orphan_device(
     updated_at: OffsetDateTime,
 ) -> i64 {
     sqlx::query_scalar(
-        "INSERT INTO devices (user_id, platform, push_token, session_id, updated_at)
-         VALUES ($1, 'ios', $2, NULL, $3) RETURNING id",
+        "INSERT INTO devices (user_id, platform, push_token, push_token_key, session_id, updated_at)
+         VALUES ($1, 'ios', $2, $3, NULL, $4) RETURNING id",
     )
     .bind(user_id)
-    .bind(push_token)
+    .bind(ts.seal(Owner::Account(user_id), push_token).await)
+    .bind(ts.lookup(Lookup::PushToken, push_token))
     .bind(updated_at)
     .fetch_one(&ts.state.pool)
     .await
@@ -375,6 +378,130 @@ async fn the_0052_checks_keep_round_on_videos_and_off_stickers() {
         .expect("round on a video is the allowed state");
 }
 
+/// 0055's three CHECKs (protocol.md, "Animations"; issue #96), at the level
+/// they are enforced: `animation` only ever on a video, never beside
+/// `sticker`, never beside `round`.
+///
+/// No request can reach any of them — the send refuses `animation` with
+/// `sticker` or `round` before any id is read, and the claim writes
+/// `animation = ($7 AND kind = 'video')`; animation_flow.rs proves every
+/// wrong-kind send is a 400. This is the half no request path can reach: a
+/// write that bypasses the claim meets the constraint rather than a row the
+/// protocol forbids. And the column's default is the truth about the past:
+/// nothing uploaded is an animation.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn the_0055_checks_keep_animation_on_videos_and_off_stickers_and_rounds() {
+    let ts = spawn_server().await;
+    let (owner, _) = ts.register("owner", "Olive").await;
+    ts.create_family(&owner, "The Smiths").await;
+
+    let upload = |query: &'static str, mime: &'static str, bytes: Vec<u8>| {
+        let ts = &ts;
+        let owner = owner.clone();
+        async move {
+            let response = ts
+                .put_bytes_method(
+                    "POST",
+                    &owner,
+                    &format!("/attachments?{query}"),
+                    mime,
+                    bytes,
+                )
+                .await;
+            assert_eq!(response.status(), 201, "uploading {query}");
+            let body: serde_json::Value = response.json().await.expect("JSON");
+            body["attachment"]["id"].as_i64().expect("id")
+        }
+    };
+    let mut mp4 = vec![0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p'];
+    mp4.extend_from_slice(b"isom");
+    mp4.resize(256, 0x01);
+    let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    jpeg.resize(256, 0x02);
+    let mut audio = mp4.clone();
+    audio.resize(256, 0x03);
+    let mut gif = b"GIF89a".to_vec();
+    gif.resize(256, 0x04);
+
+    let video = upload(
+        "kind=video&width=480&height=270&duration_ms=2100",
+        "video/mp4",
+        mp4,
+    )
+    .await;
+    let others = [
+        upload("kind=photo", "image/jpeg", jpeg).await,
+        upload("kind=audio&duration_ms=2100", "audio/mp4", audio).await,
+        upload("kind=file&name=cat.gif", "image/gif", gif).await,
+        upload(
+            "kind=location&latitude=55.7558&longitude=37.6173",
+            "",
+            Vec::new(),
+        )
+        .await,
+    ];
+
+    let unflagged: i64 = sqlx::query_scalar("SELECT count(*) FROM attachments WHERE animation")
+        .fetch_one(&ts.state.pool)
+        .await
+        .expect("counting");
+    assert_eq!(
+        unflagged, 0,
+        "NOT NULL DEFAULT false: no upload starts an animation"
+    );
+
+    let constraint_of = |result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| match result {
+        Err(sqlx::Error::Database(error)) => error.constraint().map(str::to_string),
+        Ok(_) => None,
+        Err(other) => panic!("not a constraint refusal: {other}"),
+    };
+
+    // On anything that is not a video: refused by the schema.
+    for id in others {
+        let refused = sqlx::query("UPDATE attachments SET animation = true WHERE id = $1")
+            .bind(id)
+            .execute(&ts.state.pool)
+            .await;
+        assert_eq!(
+            constraint_of(refused).as_deref(),
+            Some("attachments_animation_is_video"),
+            "attachment {id}"
+        );
+    }
+
+    // Beside `sticker` on a video — which 0048 leaves free to carry the
+    // sticker flag — refused by the second CHECK.
+    let refused =
+        sqlx::query("UPDATE attachments SET animation = true, sticker = true WHERE id = $1")
+            .bind(video)
+            .execute(&ts.state.pool)
+            .await;
+    assert_eq!(
+        constraint_of(refused).as_deref(),
+        Some("attachments_animation_not_sticker")
+    );
+
+    // Beside `round` on a video — which 0052 allows on its own — refused by
+    // the third: no kind check can keep two video presentations apart.
+    let refused =
+        sqlx::query("UPDATE attachments SET animation = true, round = true WHERE id = $1")
+            .bind(video)
+            .execute(&ts.state.pool)
+            .await;
+    assert_eq!(
+        constraint_of(refused).as_deref(),
+        Some("attachments_animation_not_round")
+    );
+
+    // On a video alone: the state the rules allow.
+    sqlx::query("UPDATE attachments SET animation = true WHERE id = $1")
+        .bind(video)
+        .execute(&ts.state.pool)
+        .await
+        .expect("animation on a video is the allowed state");
+}
+
 /// 0039's backfill, run as its own text against a table put back in its
 /// pre-0039 shape: every reply that existed before threads did gets the
 /// root of its chain, however deep — walked over the surviving links, which
@@ -573,11 +700,12 @@ async fn the_0041_default_reads_every_older_note_as_plain() {
         .expect("a board seq");
     sqlx::query(
         "INSERT INTO notes (family_id, author_id, text, color, size, x, y, board_seq, content_seq)
-         VALUES ($1, $2, 'Older than fonts', 'yellow', 'medium', 0.2, 0.3, $3, $3)",
+         VALUES ($1, $2, $4, 'yellow', 'medium', 0.2, 0.3, $3, $3)",
     )
     .bind(family_id)
     .bind(owner_id)
     .bind(seq)
+    .bind(ts.seal(Owner::Family(family_id), "Older than fonts").await)
     .execute(&ts.state.pool)
     .await
     .expect("inserting a pre-0041 note");

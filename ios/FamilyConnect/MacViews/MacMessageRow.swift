@@ -195,7 +195,6 @@ struct MacMessageRow: View {
     private func armRemoteFetches() {
         _ = linkPreview
         if let attachmentStore {
-            _ = attachmentStore.generation
             for attachment in message.attachments where !attachment.isFile {
                 // The store directly: `AttachmentView` is iOS-only.
                 // `preview: true` — a hidden row fetches nothing a visible
@@ -225,7 +224,10 @@ struct MacMessageRow: View {
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 6) {
-            if isMine { Spacer(minLength: 80) }
+            // The room a bubble always leaves on its far side: 48, the
+            // phone's, since #106 made min(column − 48, 560) every client's
+            // bubble (docs/composer-and-wide-layout-2026-10-20.md, 2.2).
+            if isMine { Spacer(minLength: ComposerRow.bubbleGutter) }
             VStack(alignment: isMine ? .trailing : .leading, spacing: 2) {
                 // The run-corner geometry below and the `isRunStart` top
                 // padding are deliberately NOT fed `isHidden`: run GROUPING
@@ -257,7 +259,7 @@ struct MacMessageRow: View {
                     // Double-click is ❤️, as on the phone
                     // (MessagePresentation.doubleTapReaction). On the
                     // BALLOON, not the row: the row spans the full width
-                    // including the 80pt spacer, and double-clicking empty
+                    // including the 48pt spacer, and double-clicking empty
                     // space beside a message must not leave a reaction on
                     // it. Acked only — there is no id to react to before.
                     .onTapGesture(count: 2) { quickHeart() }
@@ -298,9 +300,10 @@ struct MacMessageRow: View {
                     // after it, in .secondary — .tertiary vanished on the
                     // window's grey in dark mode.
                     HStack(spacing: 4) {
-                        Text(
-                            message.createdAt,
-                            format: .dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits))
+                        // The locale's own short time (#106, 3.6): the
+                        // two-digit hour with its AM/PM dropped read 20:58
+                        // as "08:58" on a 12-hour Mac.
+                        Text(message.createdAt, format: .dateTime.hour().minute())
                         if message.isEdited {
                             Text("edited")
                         }
@@ -318,7 +321,7 @@ struct MacMessageRow: View {
                     threadChip
                 }
             }
-            if !isMine { Spacer(minLength: 80) }
+            if !isMine { Spacer(minLength: ComposerRow.bubbleGutter) }
         }
         // Runs breathe less than turns do: 1pt inside a run, 8 between.
         .padding(.top, isRunStart ? 8 : 1)
@@ -648,9 +651,10 @@ struct MacMessageRow: View {
                 MessageBodyBlocks(
                     blocks: bodyBlocks,
                     isStreaming: isStreaming,
-                    isMine: isMine
+                    isMine: isMine,
+                    onDoubleTap: { quickHeart() }
                 ) { text, carriesCursor in
-                    Text(text)
+                    text
                         .font(emojiFont)
                         .fixedSize(horizontal: false, vertical: true)
                         .overlay(alignment: .bottomTrailing) {
@@ -771,7 +775,9 @@ struct MacMessageRow: View {
         // against the window. Same rule as MessageBubbleView.
         .foregroundStyle(
             isMine && !isBare ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
-        .frame(maxWidth: 460, alignment: isMine ? .trailing : .leading)
+        // A bubble's widest, 560 on every client since #106 (it was 460):
+        // after the background, so it bounds the balloon, never fills it.
+        .frame(maxWidth: ComposerRow.maxBubble, alignment: isMine ? .trailing : .leading)
         // A pending row is dimmed until the server has it — the same
         // signal the phone gives, without a status glyph.
         .opacity(message.state == .pending ? 0.55 : 1)
@@ -846,7 +852,7 @@ struct MacMessageRow: View {
                 TranscriptSection(
                     attachment: attachment, subject: transcriptSubject, isMine: attachmentsOnTint)
             }
-        } else if attachment.isVideo {
+        } else if attachment.isVideo, !attachment.isAnimation {
             // A video's text sits under its tile, outside the tile's drag
             // and click pair, as a voice note's sits under its player.
             VStack(alignment: .leading, spacing: 4) {
@@ -1093,7 +1099,8 @@ struct MacMessageRow: View {
     /// against the grid instead of floating narrow beside it — the Mac's
     /// half of what the phone calls `fillsBalloonWidth`.
     private var hasTable: Bool {
-        bodyBlocks.contains { $0.isTable }
+        // A drawing (#97) sets the balloon's width the same way.
+        bodyBlocks.contains { $0.isTable || $0.isRich }
     }
 
     /// A table or a POLL has already decided how wide the balloon is, so
@@ -1340,7 +1347,7 @@ private struct MacQuoteBlock: View {
         // the 420 that used to be here reported ~420pt however short the
         // excerpt was, and every reply balloon on the Mac came out a
         // fixed-width slab regardless of what the reply said. The balloon
-        // already caps itself at 460 after its background, which is the
+        // already caps itself at 560 after its background, which is the
         // bound that was actually wanted. (In an OWN reply the balloon
         // uses BalloonContentLayout, which hugs its widest child and places
         // this block on the leading edge — BalloonEdgeKey's default; it is
@@ -1468,10 +1475,9 @@ private struct MacAttachmentBlock: View {
     @Environment(AttachmentStore.self) private var store
 
     var body: some View {
-        // Reading `generation` is what makes this redraw when the fetch
-        // lands — the store's caches are ObservationIgnored. Same rule as
-        // the iOS bubble, and the same bug if it is left out.
-        let _ = store.generation
+        // The lookups below register this view on their own keys, which is
+        // what redraws it when the fetch lands — the store's caches are
+        // ObservationIgnored. Same rule as the iOS bubble.
         if attachment.isAudio {
             // Nothing to look at — a player, not a tile or a row.
             AudioPlayerView(attachment: attachment, isMine: isMine)
@@ -1502,6 +1508,8 @@ private struct MacAttachmentBlock: View {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .strokeBorder(isMine ? Color.white.opacity(0.16) : Color.primary.opacity(0.06)))
             .hoverCursor(.pointingHand)
+        } else if attachment.isAnimation {
+            animationTile
         } else if let image = Self.bubbleImage(for: attachment, in: store) {
             // Sized from the attachment's METADATA, as the phone's tile is,
             // not from whatever width the row happened to be proposed: a
@@ -1557,6 +1565,40 @@ private struct MacAttachmentBlock: View {
                         .strokeBorder(isMine ? Color.white.opacity(0.18) : Color.primary.opacity(0.08)))
         }
     }
+
+    /// An ANIMATION (#96): a picture that moves, in the box a photo of its
+    /// shape takes — the poster, its video over it, muted and looping while
+    /// on screen, and the small "GIF". No play button, no duration. Sized
+    /// from metadata whether or not the poster is here yet, so the row does
+    /// not change height when it lands.
+    private var animationTile: some View {
+        let poster = Self.bubbleImage(for: attachment, in: store)
+        return ZStack {
+            LinearGradient(
+                colors: isMine
+                    ? [.white.opacity(0.22), .white.opacity(0.10)]
+                    : [.primary.opacity(0.10), .primary.opacity(0.04)],
+                startPoint: .top, endPoint: .bottom)
+            if let poster {
+                poster
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            }
+            AnimationSurface(attachment: attachment, cornerRadius: 12)
+            AnimationBadge()
+        }
+        .frame(width: tileSize.width, height: tileSize.height)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            if MessagePresentation.drawsHairline(onBalloon: onBalloon, hasImage: poster != nil) {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(isMine ? Color.white.opacity(0.18) : Color.primary.opacity(0.08))
+            }
+        }
+        .hoverCursor(.pointingHand)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("GIF"))
+    }
 }
 
 /// Several photos in one Mac balloon, as a pile: the first at its own
@@ -1591,9 +1633,8 @@ private struct MacAlbumStack: View {
     }
 
     var body: some View {
-        // Reading `generation` is what makes this redraw when a fetch
-        // lands — the iOS bubble's rule, and the same bug if left out.
-        let _ = store.generation
+        // Each card's lookup registers this view on its own key — the iOS
+        // bubble's rule.
         ZStack(alignment: .bottom) {
             if album.items.count >= 3 {
                 layer(album.items[2], .third)

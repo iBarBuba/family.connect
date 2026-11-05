@@ -118,30 +118,57 @@ pub enum ServerFrame {
     },
     /// It stopped early; the row keeps what arrived. `reason` is optional
     /// on the wire and read here into what the row will say: `"refused"`
-    /// is the provider's own filter, and absent or anything else is the
-    /// failure it always was (docs/protocol.md, "The assistant").
+    /// is the provider's own filter, `"allowance_used"` a paid family's
+    /// month used up — with the `renews_at` beside it — and absent or
+    /// anything else is the failure it always was (docs/protocol.md, "The
+    /// assistant").
     AiError {
         chat_id: i64,
         message_id: i64,
-        #[serde(
-            default,
-            rename = "reason",
-            deserialize_with = "crate::model::ai_failure"
-        )]
+        #[serde(flatten)]
         failure: crate::model::AiFailure,
     },
+    /// The four roster frames name their family, and are applied to THAT
+    /// family — never to "my family" (docs/protocol.md, "Several
+    /// families"). `family_id` is absent only from a server that predates
+    /// several families, where it is the one family.
     MemberJoined {
+        #[serde(default)]
+        family_id: Option<i64>,
         user: crate::model::User,
+        /// Whether this reader may reset the newcomer's password — on the
+        /// family OWNER's copy alone, exactly as on their roster, and absent
+        /// from everybody else's (docs/protocol.md, "Several families").
+        /// Absent says nothing: whatever flag is already held for that
+        /// member stays (`Store::member_joined`).
+        #[serde(default)]
+        password_reset: Option<bool>,
     },
     MemberLeft {
+        #[serde(default)]
+        family_id: Option<i64>,
         user_id: i64,
     },
-    /// An account was deleted — carrying the tombstone to WRITE.
+    /// An account was deleted — carrying the tombstone to WRITE. Its
+    /// `family_id` is absent too when the account was in no family, and the
+    /// frame is keyed on the member.
     MemberDeleted {
+        #[serde(default)]
+        family_id: Option<i64>,
         member: crate::model::Member,
     },
     FamilyOwner {
+        #[serde(default)]
+        family_id: Option<i64>,
         user_id: i64,
+    },
+    /// A paid family's deadline appeared or went: `delete_at` is when the
+    /// server will delete it, and its ABSENCE clears it — to every member,
+    /// about the family it names (docs/protocol.md, "Paid families").
+    FamilyPlan {
+        family_id: i64,
+        #[serde(default)]
+        delete_at: Option<String>,
     },
     /// Reaches the BLOCKER's own devices and nobody else; full state.
     MemberBlocked {
@@ -158,6 +185,27 @@ pub enum ServerFrame {
     /// every member, a blocker included. Never unread, never notifies.
     PackItem {
         item: crate::model::PackItem,
+    },
+    /// A group created, renamed, or its members or admin changed — to every
+    /// member, one just added included, which is how a group appears on
+    /// their devices at once (docs/protocol.md, "Groups").
+    ChatUpdated {
+        chat: crate::model::Chat,
+    },
+    /// A group this member left or was removed from, or that was deleted:
+    /// drop it, its messages and anything drafted there.
+    ChatRemoved {
+        chat_id: i64,
+    },
+    /// An invitation, to the invited person's connections and the inviting
+    /// family's owner's (docs/protocol.md, "Several families").
+    Invitation {
+        invitation: crate::model::Invitation,
+    },
+    /// An invitation gone — accepted, declined, withdrawn or lapsed: off
+    /// both lists.
+    InvitationRemoved {
+        invitation_id: i64,
     },
     /// Somebody is calling: delivered to every connection the callee has.
     CallOffer {
@@ -206,7 +254,10 @@ pub enum ServerFrame {
 /// `https` becomes `wss` and `http` becomes `ws`, which is the protocol's
 /// rule; the host is whatever served the page, because a browser client has
 /// no server URL of its own (docs/protocol.md, "A browser is a client too").
-/// No token here — see `protocols_for`.
+/// No token here — see `protocols_for`. `families=1` is the one thing in
+/// the query: this client knows about several families, and a browser
+/// cannot say so in a header on an upgrade (docs/protocol.md, "Several
+/// families") — without it, every frame about another family is withheld.
 pub fn url_for(origin: &str) -> String {
     let scheme = if origin.starts_with("https://") {
         "wss://"
@@ -217,7 +268,7 @@ pub fn url_for(origin: &str) -> String {
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/');
-    format!("{scheme}{host}/api/v1/ws")
+    format!("{scheme}{host}/api/v1/ws?families=1")
 }
 
 /// The subprotocols this client offers: the product's name, which the
@@ -382,27 +433,75 @@ mod tests {
         assert!(matches!(
             decode(r#"{"type": "member_joined", "family_id": 3,
                        "user": {"id": 11, "username": "junior", "display_name": "Junior", "avatar_version": 0}}"#),
-            Some(ServerFrame::MemberJoined { ref user }) if user.id == 11
+            Some(ServerFrame::MemberJoined { family_id: Some(3), ref user, password_reset: None })
+                if user.id == 11
+        ));
+        // The owner's copy says whether the newcomer is theirs to reset.
+        assert!(matches!(
+            decode(
+                r#"{"type": "member_joined", "family_id": 3,
+                       "user": {"id": 11, "username": "junior", "display_name": "Junior", "avatar_version": 0},
+                       "password_reset": false}"#
+            ),
+            Some(ServerFrame::MemberJoined {
+                password_reset: Some(false),
+                ..
+            })
         ));
         assert_eq!(
             decode(r#"{"type": "member_left", "family_id": 3, "user_id": 11}"#),
-            Some(ServerFrame::MemberLeft { user_id: 11 })
+            Some(ServerFrame::MemberLeft {
+                family_id: Some(3),
+                user_id: 11
+            })
         );
         assert!(matches!(
             decode(r#"{"type": "member_deleted", "family_id": 3,
                        "member": {"id": 11, "username": "", "display_name": "Deleted account",
                                   "avatar_version": 0, "deleted": true}}"#),
-            Some(ServerFrame::MemberDeleted { ref member }) if member.deleted
+            Some(ServerFrame::MemberDeleted { family_id: Some(3), ref member }) if member.deleted
         ));
         assert_eq!(
             decode(r#"{"type": "family_owner", "family_id": 3, "user_id": 9}"#),
-            Some(ServerFrame::FamilyOwner { user_id: 9 })
+            Some(ServerFrame::FamilyOwner {
+                family_id: Some(3),
+                user_id: 9
+            })
         );
+        // A tombstone for an account that was in no family names none.
+        assert!(matches!(
+            decode(
+                r#"{"type": "member_deleted", "member": {"id": 11, "username": "",
+                       "display_name": "Deleted account", "avatar_version": 0, "deleted": true}}"#
+            ),
+            Some(ServerFrame::MemberDeleted {
+                family_id: None,
+                ..
+            })
+        ));
         assert_eq!(
             decode(r#"{"type": "member_blocked", "user_id": 11, "blocked": true}"#),
             Some(ServerFrame::MemberBlocked {
                 user_id: 11,
                 blocked: true
+            })
+        );
+        // A paid family's deadline, and — with no `delete_at` — its end.
+        assert_eq!(
+            decode(
+                r#"{"type": "family_plan", "family_id": 3, "plan": "paid",
+                    "delete_at": "2026-11-14T09:00:00Z"}"#
+            ),
+            Some(ServerFrame::FamilyPlan {
+                family_id: 3,
+                delete_at: Some("2026-11-14T09:00:00Z".into())
+            })
+        );
+        assert_eq!(
+            decode(r#"{"type": "family_plan", "family_id": 3, "plan": "paid"}"#),
+            Some(ServerFrame::FamilyPlan {
+                family_id: 3,
+                delete_at: None
             })
         );
         assert!(matches!(
@@ -424,6 +523,68 @@ mod tests {
             decode(r#"{"type": "pack_item", "item": {"id": 5, "deleted": true, "pack_seq": 14}}"#),
             Some(ServerFrame::PackItem { ref item }) if item.deleted
         ));
+        // Groups (docs/protocol.md, "Groups"): the chat whole, and the id
+        // of one to drop.
+        let updated = decode(
+            r#"{"type": "chat_updated", "chat": {"id": 77, "kind": "group", "title": "Cousins",
+                "peer_user_id": null, "member_ids": [7, 9], "admin_user_id": 7}}"#,
+        );
+        assert!(matches!(
+            updated,
+            Some(ServerFrame::ChatUpdated { ref chat })
+                if chat.is_group() && chat.group_member_ids() == [7, 9] && chat.admin_user_id == Some(7)
+        ));
+        assert_eq!(
+            decode(r#"{"type": "chat_removed", "chat_id": 77}"#),
+            Some(ServerFrame::ChatRemoved { chat_id: 77 })
+        );
+    }
+
+    /// Several families (docs/protocol.md, "Several families"): a note, a
+    /// sticker and a chat say whose they are, and the two invitation frames
+    /// read as the protocol writes them.
+    #[wasm_bindgen_test]
+    fn the_several_families_frames_read_as_the_protocol_writes_them() {
+        assert!(matches!(
+            decode(r#"{"type": "board_note", "note": {"id": 12, "author_id": 7, "text": "Milk",
+                       "color": "yellow", "x": 0.4, "y": 0.1, "board_seq": 88, "family_id": 4}}"#),
+            Some(ServerFrame::BoardNote { ref note }) if note.family_id == Some(4)
+        ));
+        assert!(matches!(
+            decode(r#"{"type": "pack_item", "item": {"id": 5, "deleted": true, "pack_seq": 14,
+                       "family_id": 4}}"#),
+            Some(ServerFrame::PackItem { ref item }) if item.family_id == Some(4)
+        ));
+        assert!(matches!(
+            decode(r#"{"type": "chat_updated", "chat": {"id": 42, "kind": "direct",
+                       "title": null, "peer_user_id": 9, "family_ids": [3, 4]}}"#),
+            Some(ServerFrame::ChatUpdated { ref chat }) if chat.family_ids == Some(vec![3, 4])
+        ));
+        let invitation = decode(
+            r#"{"type": "invitation", "invitation": {"id": 4, "family_id": 3,
+                "family_name": "The Smiths",
+                "invited_by": {"id": 9, "username": "anna", "display_name": "Anna"},
+                "user": {"id": 7, "username": "me", "display_name": "Me"},
+                "created_at": "2026-10-22T10:00:00Z"}}"#,
+        );
+        assert!(matches!(
+            invitation,
+            Some(ServerFrame::Invitation { ref invitation })
+                if invitation.id == 4 && invitation.family_name == "The Smiths"
+                    && invitation.invited_by.display_name == "Anna" && invitation.user.id == 7
+        ));
+        assert_eq!(
+            decode(r#"{"type": "invitation_removed", "invitation_id": 4}"#),
+            Some(ServerFrame::InvitationRemoved { invitation_id: 4 })
+        );
+        // A server from before several families names no family at all.
+        assert_eq!(
+            decode(r#"{"type": "member_left", "user_id": 11}"#),
+            Some(ServerFrame::MemberLeft {
+                family_id: None,
+                user_id: 11
+            })
+        );
     }
 
     /// `ai_error`'s optional `reason`: `"refused"` is read, and a reason
@@ -448,6 +609,35 @@ mod tests {
             ),
             AiFailure::Refused
         );
+        // A paid family's month used up, with the day it renews beside it.
+        assert_eq!(
+            failure(
+                r#"{"type": "ai_error", "chat_id": 42, "message_id": 1339, "reason": "allowance_used",
+                    "renews_at": "2026-12-01T00:00:00Z"}"#
+            ),
+            AiFailure::AllowanceUsed {
+                renews_at: Some("2026-12-01T00:00:00Z".into())
+            }
+        );
+        // Without one — or with one that is not a word — it is still that
+        // failure, and the sentence finds the day itself.
+        for renews_at in ["", r#", "renews_at": null"#, r#", "renews_at": 7"#] {
+            assert_eq!(
+                failure(&format!(
+                    r#"{{"type": "ai_error", "chat_id": 42, "message_id": 1339, "reason": "allowance_used"{renews_at}}}"#
+                )),
+                AiFailure::AllowanceUsed { renews_at: None },
+                "{renews_at}"
+            );
+        }
+        // A `renews_at` beside another reason means nothing.
+        assert_eq!(
+            failure(
+                r#"{"type": "ai_error", "chat_id": 42, "message_id": 1339, "reason": "refused",
+                    "renews_at": "2026-12-01T00:00:00Z"}"#
+            ),
+            AiFailure::Refused
+        );
         assert_eq!(
             failure(r#"{"type": "ai_error", "chat_id": 42, "message_id": 1339}"#),
             AiFailure::Failed
@@ -455,6 +645,7 @@ mod tests {
         for unknown in [
             r#""rate_limited""#,
             r#""REFUSED""#,
+            r#""ALLOWANCE_USED""#,
             r#""""#,
             "null",
             "7",
@@ -483,16 +674,16 @@ mod tests {
     fn the_socket_url_follows_the_pages_own_scheme_and_host() {
         assert_eq!(
             url_for("https://chat.example.com"),
-            "wss://chat.example.com/api/v1/ws"
+            "wss://chat.example.com/api/v1/ws?families=1"
         );
         assert_eq!(
             url_for("http://192.168.1.10:8080"),
-            "ws://192.168.1.10:8080/api/v1/ws"
+            "ws://192.168.1.10:8080/api/v1/ws?families=1"
         );
         // A trailing slash on the origin must not double up in the path.
         assert_eq!(
             url_for("https://chat.example.com/"),
-            "wss://chat.example.com/api/v1/ws"
+            "wss://chat.example.com/api/v1/ws?families=1"
         );
     }
 

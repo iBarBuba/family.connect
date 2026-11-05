@@ -2,7 +2,9 @@ using System.Diagnostics;
 using FamilyConnect.App.Logic;
 using FamilyConnect.App.Services;
 using Microsoft.UI.Dispatching;
+using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Windows.Foundation;
 
 namespace FamilyConnect.App.Views;
 
@@ -18,21 +20,37 @@ namespace FamilyConnect.App.Views;
 /// and tested where no window exists.
 /// </para>
 /// <para>
-/// <b>AN IMAGE THAT HAS LEFT THE WINDOW IS LET GO.</b> The conversation is rebuilt on every change,
-/// so its elements come and go constantly; an entry whose image was drawn once and no longer is,
-/// is dropped on the next tick, and the timer stops when nothing is left to move.
+/// <b>AND IT WAKES WHEN A FRAME IS DUE, NOT THIRTY TIMES A SECOND.</b> Most stickers' frames stand a tenth of a second or
+/// more, and a fixed thirtieth woke the window's thread two times in three for nothing — with every sticker on screen
+/// walked each time. Each tick sets the next wait from the soonest frame due on screen
+/// (<see cref="StickerAnimation.UntilNext"/>), never faster than the thirtieth it used to be and never slower than a
+/// quarter of a second, so an image that left is still let go promptly.
+/// </para>
+/// <para>
+/// <b>AN IMAGE THAT HAS LEFT THE WINDOW IS LET GO.</b> A row of the conversation that changed is built
+/// again, and a redraw asked for outright builds them all, so its elements still come and go; an entry
+/// whose image was drawn once and no longer is, is dropped on a later tick, and the timer stops when
+/// nothing is left to move.
 /// </para>
 /// <para>
 /// A still picture never reaches the timer at all: it is set and forgotten.
 /// </para>
 /// <para>
+/// <b>ONLY WHILE ON SCREEN</b> (docs/protocol.md, "Sticker pack", amended 2026-10-19, #96). An image scrolled wholly out of its
+/// scroller's view keeps its place on the list but is not drawn to — its clock runs on, so it comes back on the frame that is
+/// due — and when nothing left is on screen the timer stops until something scrolls back.
+/// </para>
+/// <para>
 /// <b>AND IT IS THE ONE PLACE THAT KNOWS WHAT IS ON SCREEN</b>, which is what decides how a picture
 /// may give its frames back: one no image here is drawing is released whole, one that is being
-/// drawn is put back on frame zero first and then made still (<see cref="StickerShelf{TPicture}"/>
-/// asks; <see cref="IsShowing"/>, <see cref="MakeStill"/> and <see cref="Release"/> answer). A frame
-/// disposed under an image that is showing it is a hole in the conversation, so after a tick has
-/// FAILED — when this no longer knows which image shows what — nothing is disposed at all, and the
-/// frames go when the collector says.
+/// drawn is put back on frame zero and then made still (<see cref="StickerShelf{TPicture}"/>
+/// asks; <see cref="IsShowing"/>, <see cref="MakeStill"/> and <see cref="Release"/> answer). After a
+/// tick has FAILED — when this no longer knows which image shows what — every picture counts as shown.
+/// </para>
+/// <para>
+/// <b>A FRAME IS DRAWN INTO THE PICTURE'S ONE SURFACE</b> (<see cref="StickerPicture.Draw"/>), never
+/// put up as a new <c>Source</c>: WinUI draws an image empty for a frame whenever its source changes,
+/// and a sticker swapped that way blinked on every frame.
 /// </para>
 /// </remarks>
 internal sealed class StickerAnimator
@@ -52,9 +70,12 @@ internal sealed class StickerAnimator
         /// <summary>When this image was handed over, which is what "never drawn" is counted from.</summary>
         public long Made { get; } = made;
 
-        public int Shown { get; set; }
-
         public bool WasLoaded { get; set; }
+
+        /// <summary>Whether any of the image is inside its scroller's view; on screen until a viewport says otherwise.</summary>
+        public bool InView { get; set; } = true;
+
+        public TypedEventHandler<FrameworkElement, EffectiveViewportChangedEventArgs>? Watch { get; set; }
     }
 
     private readonly DispatcherQueueTimer timer;
@@ -67,8 +88,8 @@ internal sealed class StickerAnimator
     public StickerAnimator(DispatcherQueue queue)
     {
         timer = queue.CreateTimer();
-        // Thirty a second: stickers are authored at 15 to 30, and the floor for a frame is a tenth of a second.
-        timer.Interval = TimeSpan.FromMilliseconds(33);
+        // At most thirty a second: stickers are authored at 15 to 30, and the floor for a frame is a tenth of a second.
+        timer.Interval = TimeSpan.FromMilliseconds(StickerAnimation.FastestTickMs);
         timer.Tick += (_, _) => Tick();
     }
 
@@ -97,7 +118,34 @@ internal sealed class StickerAnimator
             return;
         }
         var now = clock.ElapsedMilliseconds;
-        playing.Add(new Playing(image, picture, Math.Min(started ?? now, now), now));
+        var entry = new Playing(image, picture, Math.Min(started ?? now, now), now);
+        entry.Watch = (_, args) =>
+        {
+            var seen = args.EffectiveViewport;
+            // An image not laid out yet has no size to test: it counts as on screen until it has one.
+            entry.InView = image.ActualWidth <= 0 || image.ActualHeight <= 0
+                || RoundInline.InView(seen.X, seen.Y, seen.Width, seen.Height, image.ActualWidth, image.ActualHeight);
+            if (entry.InView && !lostTrack)
+            {
+                Hurry();
+            }
+        };
+        image.EffectiveViewportChanged += entry.Watch;
+        playing.Add(entry);
+        Hurry();
+    }
+
+    /// <summary>
+    /// Something new to move — a sticker shown, one scrolled back into view: the timer runs, and its next tick comes within a
+    /// thirtieth of a second rather than after whatever long wait the last tick chose.
+    /// </summary>
+    private void Hurry()
+    {
+        if (timer.Interval.TotalMilliseconds > StickerAnimation.FastestTickMs)
+        {
+            timer.Stop();
+            timer.Interval = TimeSpan.FromMilliseconds(StickerAnimation.FastestTickMs);
+        }
         timer.Start();
     }
 
@@ -111,31 +159,18 @@ internal sealed class StickerAnimator
     /// </summary>
     public void MakeStill(StickerPicture picture)
     {
-        if (lostTrack)
-        {
-            // Some image may be showing any of its frames: they are left for the collector.
-            picture.MakeStill(dispose: false);
-            return;
-        }
+        Drop(entry => ReferenceEquals(entry.Picture, picture));
         try
         {
-            foreach (var entry in playing)
-            {
-                if (ReferenceEquals(entry.Picture, picture))
-                {
-                    entry.Image.Source = picture.First;
-                }
-            }
+            // Every image of it shows its one surface, which is put back on frame zero.
+            picture.MakeStill();
         }
         catch (Exception e)
         {
+            // The surface keeps whichever frame it had — a frame of the sticker — and the bytes still go.
             Diagnostics.Write($"stilling a sticker: {e.GetType().Name}");
-            playing.RemoveAll(entry => ReferenceEquals(entry.Picture, picture));
-            picture.MakeStill(dispose: false);
-            return;
+            picture.Release();
         }
-        playing.RemoveAll(entry => ReferenceEquals(entry.Picture, picture));
-        picture.MakeStill(dispose: true);
     }
 
     /// <summary>That picture is kept nowhere any more: its frames are given back, unless an image here still draws them.</summary>
@@ -148,13 +183,39 @@ internal sealed class StickerAnimator
     }
 
     /// <summary>That image is about to show something else.</summary>
-    public void Forget(Image image) => playing.RemoveAll(entry => ReferenceEquals(entry.Image, image));
+    public void Forget(Image image) => Drop(entry => ReferenceEquals(entry.Image, image));
 
     /// <summary>The view is going: nothing moves any more.</summary>
     public void Stop()
     {
         timer.Stop();
-        playing.Clear();
+        Drop(_ => true);
+    }
+
+    /// <summary>The entries that match leave the list, and their images are no longer watched.</summary>
+    private void Drop(Predicate<Playing> which)
+    {
+        foreach (var entry in playing.Where(entry => which(entry)).ToList())
+        {
+            Unwatch(entry);
+        }
+        playing.RemoveAll(which);
+    }
+
+    private static void Unwatch(Playing entry)
+    {
+        if (entry.Watch is { } watch)
+        {
+            entry.Watch = null;
+            try
+            {
+                entry.Image.EffectiveViewportChanged -= watch;
+            }
+            catch (Exception e)
+            {
+                Diagnostics.Write($"no longer watching a sticker: {e.GetType().Name}");
+            }
+        }
     }
 
     private void Tick()
@@ -162,6 +223,10 @@ internal sealed class StickerAnimator
         try
         {
             var now = clock.ElapsedMilliseconds;
+            // The soonest a frame on screen is due — or a turn for an image not in the window yet, which is asked about at once.
+            var soonest = long.MaxValue;
+            // Every image of a picture shows its one surface: it is drawn once a tick, by the newest image's clock.
+            var drawn = new HashSet<StickerPicture>(ReferenceEqualityComparer.Instance);
             for (var at = playing.Count - 1; at >= 0; at--)
             {
                 var entry = playing[at];
@@ -171,29 +236,54 @@ internal sealed class StickerAnimator
                 }
                 else if (entry.WasLoaded || now - entry.Made > NeverShownMs)
                 {
+                    Unwatch(entry);
                     playing.RemoveAt(at);
                     continue;
                 }
                 else
                 {
-                    // Built and not yet in the window: its turn has not started.
+                    // Built and not yet in the window: its turn has not started, and the next tick looks again soon.
+                    soonest = Math.Min(soonest, StickerAnimation.FastestTickMs);
                     continue;
                 }
-                if (entry.Picture is not { Frames: { } frames, Clock: { } durations })
+                if (entry.Picture is not { Frames: { } frames, Clock: { } durations } picture)
                 {
+                    Unwatch(entry);
                     playing.RemoveAt(at);
                     continue;
                 }
-                var due = Math.Min(StickerAnimation.FrameAt(durations, now - entry.Started), frames.Count - 1);
-                if (due != entry.Shown)
+                if (!entry.InView)
                 {
-                    entry.Shown = due;
-                    entry.Image.Source = frames[due];
+                    // Scrolled away: not drawn to. Its clock runs on, so it comes back on the frame that is due.
+                    continue;
+                }
+                if (drawn.Add(picture))
+                {
+                    // Into the surface the image already shows — never a new Source, which WinUI draws empty for a frame.
+                    picture.Draw(Math.Min(StickerAnimation.FrameAt(durations, now - entry.Started), frames.Count - 1));
+                }
+                // A millisecond past the change, so a timer that fires on the dot does not find the old frame still up.
+                var until = StickerAnimation.UntilNext(durations, now - entry.Started);
+                if (until < long.MaxValue)
+                {
+                    soonest = Math.Min(soonest, until + 1);
                 }
             }
-            if (playing.Count == 0)
+            // Nothing left, or nothing left on screen (one not loaded yet still needs its turn): the timer rests until a viewport
+            // brings something back.
+            if (playing.TrueForAll(entry => !entry.InView && entry.WasLoaded))
             {
                 timer.Stop();
+            }
+            else
+            {
+                var wait = TimeSpan.FromMilliseconds(StickerAnimation.TickAfter(soonest));
+                if (timer.Interval != wait)
+                {
+                    timer.Stop();
+                    timer.Interval = wait;
+                    timer.Start();
+                }
             }
         }
         catch (Exception e)

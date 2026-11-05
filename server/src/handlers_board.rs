@@ -36,6 +36,7 @@ use crate::auth::AuthUser;
 use crate::error::{ApiError, AppJson, codes};
 use crate::events;
 use crate::handlers_chat::{clamp_limit, parse_pagination_param};
+use crate::keyring::{KeyError, Keyring, Owner, SealKey, SealedRow};
 use crate::models::{Attachment, Mention, Note, Rsvp, TaskItem};
 use crate::state::AppState;
 
@@ -182,8 +183,8 @@ async fn validate_note_mentions(
         return Ok(());
     }
     let members: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM users
-         WHERE id = ANY($1) AND family_id IS NOT NULL AND family_id = $2",
+        "SELECT count(*) FROM family_members
+         WHERE user_id = ANY($1) AND family_id = $2",
     )
     .bind(&ids)
     .bind(family_id)
@@ -204,6 +205,7 @@ async fn validate_note_mentions(
 /// highlight nobody can tap.
 async fn write_note_mentions(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key: &SealKey,
     note_id: i64,
     mentions: &[Mention],
 ) -> Result<(), ApiError> {
@@ -218,7 +220,7 @@ async fn write_note_mentions(
         )
         .bind(note_id)
         .bind(mention.user_id)
-        .bind(&mention.name)
+        .bind(key.seal_str(&mention.name))
         .bind(position as i32)
         .execute(&mut **tx)
         .await?;
@@ -226,14 +228,31 @@ async fn write_note_mentions(
     Ok(())
 }
 
-/// The family the caller belongs to, or `not_in_family`.
-async fn caller_family(state: &AppState, user_id: i64) -> Result<i64, ApiError> {
-    let row = sqlx::query("SELECT family_id FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(&state.pool)
-        .await?;
-    row.and_then(|row| row.get::<Option<i64>, _>("family_id"))
+/// The family whose board this request is about — the `{family}` of
+/// `/families/{family}/board…`, `mine` being the home family — or
+/// `not_in_family` (docs/protocol.md, "Several families").
+///
+/// Resolved by the `AuthUser` extractor on this same request, from
+/// `family_members`, so it is exactly as fresh as the per-request read of
+/// `users.family_id` it replaces — and a family the caller is not in has
+/// already been refused there with `family_not_found`.
+fn caller_family(auth: &AuthUser) -> Result<i64, ApiError> {
+    auth.family_id
         .ok_or_else(|| ApiError::conflict(codes::NOT_IN_FAMILY, "you are not in a family"))
+}
+
+/// `…/board/notes/{note_id}`, by NAME: the route also carries `{family}`,
+/// and a positional `Path<i64>` would refuse two parameters.
+#[derive(Debug, Deserialize)]
+pub struct NotePath {
+    pub note_id: i64,
+}
+
+/// `…/board/notes/{note_id}/tasks/{item_id}`, by name for the same reason.
+#[derive(Debug, Deserialize)]
+pub struct TaskPath {
+    pub note_id: i64,
+    pub item_id: i64,
 }
 
 fn validate_text(text: &str) -> Result<String, ApiError> {
@@ -365,7 +384,7 @@ fn validate_font(font: &str) -> Result<String, ApiError> {
 }
 
 const NOTE_COLS: &str = "id, author_id, text, color, size, font, kind, starts_at, ends_at, \
-     place, x, y, board_seq, content_seq, created_at, updated_at, deleted_at";
+     place, x, y, board_seq, content_seq, created_at, updated_at, deleted_at, family_id";
 
 /// Pin one uploaded picture to a note — the board's twin of
 /// `handlers_chat::claim_attachment`, and the same three answers.
@@ -377,17 +396,26 @@ const NOTE_COLS: &str = "id, author_id, text, color, size, font, kind, starts_at
 /// A WALL PINS PICTURES. A video or a voice message on a corkboard is a
 /// thing to play rather than a thing to look at, and a location has no
 /// bytes at all — so the kind is checked here, before the claim.
+///
+/// Only an upload made FOR THIS family may be pinned to its board: since
+/// 2026-10-22 an upload names its family (`POST /attachments?family_id=`),
+/// and one made for another family answers exactly as an id that does not
+/// exist (docs/protocol.md, "Several families") — it is also what keeps
+/// `delete_family_in_tx`'s list of a family's files complete.
 async fn claim_picture(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    keys: &Keyring,
     attachment_id: i64,
     uploader_id: i64,
     note_id: i64,
+    family_id: i64,
 ) -> Result<Attachment, ApiError> {
     let row = sqlx::query(
         "UPDATE attachments SET note_id = $3
          WHERE id = $1 AND uploader_id = $2 AND message_id IS NULL AND note_id IS NULL
            AND pack_item_id IS NULL
            AND kind = $4
+           AND family_id = $5
          RETURNING id, kind, mime, size_bytes, width, height, duration_ms, has_preview, name,
                    latitude, longitude, accuracy_m",
     )
@@ -395,19 +423,25 @@ async fn claim_picture(
     .bind(uploader_id)
     .bind(note_id)
     .bind(Attachment::KIND_PHOTO)
+    .bind(family_id)
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(row) = row {
-        return Ok(Attachment::from_row(&row));
+        // Nothing to re-seal (#59): an upload pinned to its own family's
+        // board stays under the family's key, which is what it was sealed
+        // under.
+        return Ok(Attachment::from_row(&row, keys)?);
     }
 
     // Which of the four it was. `kind` first, because "that is a video"
     // is a different instruction from "that one is taken".
     let existing = sqlx::query(
-        "SELECT kind, message_id, note_id FROM attachments WHERE id = $1 AND uploader_id = $2",
+        "SELECT kind, message_id, note_id FROM attachments
+          WHERE id = $1 AND uploader_id = $2 AND family_id = $3",
     )
     .bind(attachment_id)
     .bind(uploader_id)
+    .bind(family_id)
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(existing) = existing {
@@ -466,7 +500,10 @@ async fn attach_picture(state: &AppState, note: &mut Note) -> Result<(), ApiErro
     .bind(note.id)
     .fetch_optional(&state.pool)
     .await?;
-    note.attachment = row.as_ref().map(Attachment::from_row);
+    note.attachment = row
+        .as_ref()
+        .map(|row| Attachment::from_row(row, &state.keys))
+        .transpose()?;
     Ok(())
 }
 
@@ -503,11 +540,13 @@ async fn attach_mentions(state: &AppState, note: &mut Note) -> Result<(), ApiErr
     }
     note.mentions = Some(
         rows.iter()
-            .map(|row| Mention {
-                user_id: row.get("user_id"),
-                name: row.get("name"),
+            .map(|row| {
+                Ok(Mention {
+                    user_id: row.get("user_id"),
+                    name: row.text(&state.keys, "name")?,
+                })
             })
-            .collect(),
+            .collect::<Result<_, KeyError>>()?,
     );
     Ok(())
 }
@@ -526,7 +565,11 @@ async fn attach_tasks(state: &AppState, note: &mut Note) -> Result<(), ApiError>
     .bind(note.id)
     .fetch_all(&state.pool)
     .await?;
-    note.items = Some(rows.iter().map(TaskItem::from_row).collect());
+    note.items = Some(
+        rows.iter()
+            .map(|row| TaskItem::from_row(row, &state.keys))
+            .collect::<Result<_, KeyError>>()?,
+    );
     Ok(())
 }
 
@@ -552,7 +595,7 @@ async fn attach_tasks_to_page(state: &AppState, notes: &mut [Note]) -> Result<()
         by_note
             .entry(row.get("note_id"))
             .or_default()
-            .push(TaskItem::from_row(row));
+            .push(TaskItem::from_row(row, &state.keys)?);
     }
     for note in notes.iter_mut() {
         // Every list gets a list, empty or not — the `ids` filter above is
@@ -613,7 +656,7 @@ async fn attach_mentions_to_page(state: &AppState, notes: &mut [Note]) -> Result
             .or_default()
             .push(Mention {
                 user_id: row.get("user_id"),
-                name: row.get("name"),
+                name: row.text(&state.keys, "name")?,
             });
     }
     for note in notes.iter_mut() {
@@ -680,6 +723,7 @@ fn validate_task_items(
 /// it (docs/protocol.md, "Board").
 async fn write_task_items(
     tx: &mut sqlx::PgConnection,
+    key: &SealKey,
     note_id: i64,
     lines: &[(Option<i64>, String)],
 ) -> Result<(), ApiError> {
@@ -701,7 +745,7 @@ async fn write_task_items(
                 )
                 .bind(id)
                 .bind(note_id)
-                .bind(text)
+                .bind(key.seal_str(text))
                 .bind(position)
                 .execute(&mut *tx)
                 .await?;
@@ -712,7 +756,7 @@ async fn write_task_items(
                 )
                 .bind(note_id)
                 .bind(position)
-                .bind(text)
+                .bind(key.seal_str(text))
                 .execute(&mut *tx)
                 .await?;
             }
@@ -727,6 +771,7 @@ async fn write_task_items(
 /// anywhere else yet, and their ids are what the answer has to carry.
 async fn read_task_items(
     tx: &mut sqlx::PgConnection,
+    keys: &Keyring,
     note_id: i64,
 ) -> Result<Vec<TaskItem>, ApiError> {
     let rows = sqlx::query(
@@ -736,7 +781,10 @@ async fn read_task_items(
     .bind(note_id)
     .fetch_all(&mut *tx)
     .await?;
-    Ok(rows.iter().map(TaskItem::from_row).collect())
+    Ok(rows
+        .iter()
+        .map(|row| TaskItem::from_row(row, keys))
+        .collect::<Result<_, KeyError>>()?)
 }
 
 /// `GET /families/mine/board` — the whole board, tombstones excluded.
@@ -744,7 +792,7 @@ pub async fn get_board(
     auth: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
-    let family_id = caller_family(&state, auth.user_id).await?;
+    let family_id = caller_family(&auth)?;
     // The high-water mark FIRST, then the notes (protocol.md, "Board"). The
     // two are separate statements, and a change can commit between them:
     // read in this order the mark can only be BELOW a change the notes
@@ -765,7 +813,10 @@ pub async fn get_board(
     .bind(family_id)
     .fetch_all(&state.pool)
     .await?;
-    let mut notes: Vec<Note> = rows.iter().map(Note::from_row).collect();
+    let mut notes: Vec<Note> = rows
+        .iter()
+        .map(|row| Note::from_row(row, &state.keys))
+        .collect::<Result<_, KeyError>>()?;
     attach_pictures(&state, &mut notes).await?;
 
     Ok((
@@ -782,7 +833,7 @@ pub async fn get_board_changes(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let family_id = caller_family(&state, auth.user_id).await?;
+    let family_id = caller_family(&auth)?;
     let after_seq = parse_pagination_param(&params, "after_seq")?.unwrap_or(0);
     let requested_limit = parse_pagination_param(&params, "limit")?;
     let limit = clamp_limit(
@@ -801,7 +852,10 @@ pub async fn get_board_changes(
     .bind(limit)
     .fetch_all(&state.pool)
     .await?;
-    let mut notes: Vec<Note> = rows.iter().map(Note::from_row).collect();
+    let mut notes: Vec<Note> = rows
+        .iter()
+        .map(|row| Note::from_row(row, &state.keys))
+        .collect::<Result<_, KeyError>>()?;
     attach_pictures(&state, &mut notes).await?;
 
     Ok((StatusCode::OK, Json(json!({"notes": notes}))).into_response())
@@ -813,7 +867,7 @@ pub async fn create_note(
     State(state): State<AppState>,
     AppJson(req): AppJson<CreateNoteRequest>,
 ) -> Result<Response, ApiError> {
-    let family_id = caller_family(&state, auth.user_id).await?;
+    let family_id = caller_family(&auth)?;
     let kind = match req.kind.as_deref() {
         Some(kind) => validate_kind(kind)?,
         None => Note::DEFAULT_KIND.to_string(),
@@ -902,6 +956,9 @@ pub async fn create_note(
     let seq: i64 = sqlx::query_scalar("SELECT nextval('family_board_seq')")
         .fetch_one(&mut *tx)
         .await?;
+    // The words, the place, the names and the list are sealed under the
+    // family's key (#59).
+    let key = state.keys.key(&mut *tx, Owner::Family(family_id)).await?;
     // A new note IS new text, so both stamps take the same value: there is
     // nothing on the wall yet that anybody could have read.
     let row = sqlx::query(&format!(
@@ -912,14 +969,14 @@ pub async fn create_note(
     ))
     .bind(family_id)
     .bind(auth.user_id)
-    .bind(&text)
+    .bind(key.seal_str(&text))
     .bind(&color)
     .bind(&size)
     .bind(&font)
     .bind(&kind)
     .bind(starts_at)
     .bind(ends_at)
-    .bind(place.as_deref())
+    .bind(key.seal_opt(place.as_deref()))
     .bind(Note::clamp_position(req.x))
     .bind(Note::clamp_position(req.y))
     .bind(seq)
@@ -927,12 +984,22 @@ pub async fn create_note(
     .await?;
     advance_family_seq(&mut tx, family_id, seq).await?;
 
-    let mut note = Note::from_row(&row);
+    let mut note = Note::from_row(&row, &state.keys)?;
     // Claimed INSIDE the transaction, so a refusal takes the note with it:
     // a photo note committed beside an unclaimed picture would be a note
     // pointing at nothing, and the sweeper would take the picture later.
     if let Some(attachment_id) = req.attachment_id {
-        note.attachment = Some(claim_picture(&mut tx, attachment_id, auth.user_id, note.id).await?);
+        note.attachment = Some(
+            claim_picture(
+                &mut tx,
+                &state.keys,
+                attachment_id,
+                auth.user_id,
+                note.id,
+                family_id,
+            )
+            .await?,
+        );
     }
     // An event is born with nobody having answered, which is `[]` and not
     // absent (protocol.md, "Board").
@@ -943,15 +1010,15 @@ pub async fn create_note(
     // the picture is: a note whose words name somebody the list does not is
     // a highlight nobody can tap.
     if !mentions.is_empty() {
-        write_note_mentions(&mut tx, note.id, &mentions).await?;
+        write_note_mentions(&mut tx, &key, note.id, &mentions).await?;
         note.mentions = Some(mentions.clone());
     }
     // A list is born with the ids the server just made, and with `[]`
     // when nothing has been written into it — an empty list is a list
     // (protocol.md, "Board").
     if is_tasks {
-        write_task_items(&mut tx, note.id, &lines).await?;
-        note.items = Some(read_task_items(&mut tx, note.id).await?);
+        write_task_items(&mut tx, &key, note.id, &lines).await?;
+        note.items = Some(read_task_items(&mut tx, &state.keys, note.id).await?);
     }
     tx.commit().await?;
     // Creation is the one board event that notifies (protocol.md, "Board").
@@ -967,10 +1034,10 @@ pub async fn create_note(
 pub async fn patch_note(
     auth: AuthUser,
     State(state): State<AppState>,
-    Path(note_id): Path<i64>,
+    Path(NotePath { note_id }): Path<NotePath>,
     AppJson(req): AppJson<PatchNoteRequest>,
 ) -> Result<Response, ApiError> {
-    let family_id = caller_family(&state, auth.user_id).await?;
+    let family_id = caller_family(&auth)?;
     // Validated AFTER the row is locked, because whether an empty caption
     // is allowed depends on the note's kind (protocol.md, "Board").
     let raw_text = req.text.clone();
@@ -995,6 +1062,11 @@ pub async fn patch_note(
             "no such note on this board",
         ));
     };
+    // Opened once (#59): the patch compares against them and keeps what it
+    // was not sent. A tombstone's are opened too, harmlessly — it is
+    // refused just below.
+    let locked_text = locked.text(&state.keys, "text")?;
+    let locked_place = locked.text_opt(&state.keys, "place")?;
     if locked
         .get::<Option<time::OffsetDateTime>, _>("deleted_at")
         .is_some()
@@ -1059,7 +1131,7 @@ pub async fn patch_note(
     }
 
     let sent_text = text.is_some();
-    let next_text = text.unwrap_or_else(|| locked.get("text"));
+    let next_text = text.unwrap_or_else(|| locked_text.clone());
     let next_color = color.unwrap_or_else(|| locked.get("color"));
     let next_size = size.unwrap_or_else(|| locked.get("size"));
     let next_font = font.unwrap_or_else(|| locked.get("font"));
@@ -1075,7 +1147,7 @@ pub async fn patch_note(
         // Empty CLEARS: a place somebody wiped is no place, not a blank one.
         Some(value) if value.is_empty() => None,
         Some(value) => Some(value),
-        None => locked.get("place"),
+        None => locked_place.clone(),
     };
     // Checked against the STORED pair, not only the sent one: a PATCH that
     // moves the start past an untouched end is the ordinary way to get here.
@@ -1122,7 +1194,7 @@ pub async fn patch_note(
     // The author's lines, if they sent any: the ids the note already holds
     // are what a replacement may keep, and an entry keeping one keeps its
     // TICK (protocol.md, "Board").
-    let held_items = read_task_items(&mut tx, note_id).await?;
+    let held_items = read_task_items(&mut tx, &state.keys, note_id).await?;
     let next_lines = match &req.items {
         Some(items) => Some(validate_task_items(
             items,
@@ -1149,7 +1221,7 @@ pub async fn patch_note(
     // badge. A LINE the author wrote counts: adding "bread" to the
     // shopping list is something to read, and it is the one thing on a
     // task list worth a badge — a tick, which is not the author's, is not.
-    let text_changed = next_text != locked.get::<String, _>("text");
+    let text_changed = next_text != locked_text;
     let says_something_new = text_changed || items_changed;
     let changed = text_changed
         || items_changed
@@ -1162,10 +1234,12 @@ pub async fn patch_note(
         || next_font != locked.get::<String, _>("font")
         || next_starts != locked.get::<Option<time::OffsetDateTime>, _>("starts_at")
         || next_ends != locked.get::<Option<time::OffsetDateTime>, _>("ends_at")
-        || next_place != locked.get::<Option<String>, _>("place")
+        || next_place != locked_place
         || next_x != locked.get::<f64, _>("x")
         || next_y != locked.get::<f64, _>("y");
 
+    // The family's key, for whatever this patch seals (#59).
+    let key = state.keys.key(&mut *tx, Owner::Family(family_id)).await?;
     let row = if changed {
         let seq: i64 = sqlx::query_scalar("SELECT nextval('family_board_seq')")
             .fetch_one(&mut *tx)
@@ -1187,13 +1261,13 @@ pub async fn patch_note(
              RETURNING {NOTE_COLS}"
         ))
         .bind(note_id)
-        .bind(&next_text)
+        .bind(key.seal_str(&next_text))
         .bind(&next_color)
         .bind(&next_size)
         .bind(&next_font)
         .bind(next_starts)
         .bind(next_ends)
-        .bind(next_place.as_deref())
+        .bind(key.seal_opt(next_place.as_deref()))
         .bind(next_x)
         .bind(next_y)
         .bind(seq)
@@ -1202,10 +1276,10 @@ pub async fn patch_note(
         .await?;
         advance_family_seq(&mut tx, family_id, seq).await?;
         if let Some(mentions) = &next_mentions {
-            write_note_mentions(&mut tx, note_id, mentions).await?;
+            write_note_mentions(&mut tx, &key, note_id, mentions).await?;
         }
         if let Some(lines) = &next_lines {
-            write_task_items(&mut tx, note_id, lines).await?;
+            write_task_items(&mut tx, &key, note_id, lines).await?;
         }
         row
     } else {
@@ -1218,7 +1292,7 @@ pub async fn patch_note(
     };
     tx.commit().await?;
 
-    let mut note = Note::from_row(&row);
+    let mut note = Note::from_row(&row, &state.keys)?;
     // A MOVE must not lose the picture. The frame IS the note, and a photo
     // note fanned out without its attachment would blank the picture on
     // every other device until the next full board read (protocol.md,
@@ -1237,9 +1311,9 @@ pub async fn patch_note(
 pub async fn delete_note(
     auth: AuthUser,
     State(state): State<AppState>,
-    Path(note_id): Path<i64>,
+    Path(NotePath { note_id }): Path<NotePath>,
 ) -> Result<Response, ApiError> {
-    let family_id = caller_family(&state, auth.user_id).await?;
+    let family_id = caller_family(&auth)?;
 
     let mut tx = state.pool.begin().await?;
     lock_board(&mut tx, family_id).await?;
@@ -1298,7 +1372,7 @@ pub async fn delete_note(
         crate::handlers_attachment::remove_if_unreferenced(&state, &storage_key).await?;
     }
 
-    let note = Note::from_row(&row);
+    let note = Note::from_row(&row, &state.keys)?;
     events::log_fanout_error(
         "board_note",
         events::deliver_board_note(&state, family_id, &note).await,
@@ -1324,7 +1398,7 @@ async fn lock_board(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     family_id: i64,
 ) -> Result<(), ApiError> {
-    sqlx::query("SELECT id FROM families WHERE id = $1 FOR UPDATE")
+    sqlx::query("SELECT id FROM families WHERE id = $1 FOR NO KEY UPDATE")
         .bind(family_id)
         .execute(&mut **tx)
         .await?;
@@ -1365,7 +1439,7 @@ pub struct RsvpRequest {
 pub async fn put_rsvp(
     auth: AuthUser,
     State(state): State<AppState>,
-    Path(note_id): Path<i64>,
+    Path(NotePath { note_id }): Path<NotePath>,
     AppJson(req): AppJson<RsvpRequest>,
 ) -> Result<Response, ApiError> {
     let answer = req.answer.trim();
@@ -1383,7 +1457,7 @@ pub async fn put_rsvp(
 pub async fn delete_rsvp(
     auth: AuthUser,
     State(state): State<AppState>,
-    Path(note_id): Path<i64>,
+    Path(NotePath { note_id }): Path<NotePath>,
 ) -> Result<Response, ApiError> {
     set_rsvp(auth, state, note_id, None).await
 }
@@ -1423,9 +1497,9 @@ pub async fn delete_rsvp(
 pub async fn draw_backdrop(
     auth: AuthUser,
     State(state): State<AppState>,
-    Path(note_id): Path<i64>,
+    Path(NotePath { note_id }): Path<NotePath>,
 ) -> Result<Response, ApiError> {
-    let family_id = caller_family(&state, auth.user_id).await?;
+    let family_id = caller_family(&auth)?;
     // Before anything is drawn: this server can draw at all, and this
     // caller may ask for this note.
     let Some(route) = state.cfg.ai.images_route() else {
@@ -1477,7 +1551,18 @@ pub async fn draw_backdrop(
             "you have not agreed that your words may be sent to the assistant",
         ));
     }
-    let title: String = held.get("text");
+    let title = held.text(&state.keys, "text")?;
+    // A PAID family past this month's pictures is told so, and nothing is
+    // drawn (protocol.md, "Paid families"). After consent, like the
+    // refusals a client cannot act on by changing the request.
+    if !crate::subscriptions::may_spend(&state, family_id, crate::subscriptions::Spend::Images)
+        .await?
+    {
+        return Err(ApiError::forbidden(
+            codes::AI_ALLOWANCE_USED,
+            "this family has used this month's pictures",
+        ));
+    }
 
     // The slow part, with nothing locked.
     //
@@ -1552,10 +1637,14 @@ pub async fn draw_backdrop(
             .bind(note_id)
             .fetch_optional(&mut *tx)
             .await?;
+    // The backdrop's file key, sealed under the family's key (#59): a board
+    // note's picture is the family's.
+    let holder = state.keys.key(&mut *tx, Owner::Family(family_id)).await?;
     let inserted = sqlx::query(
         "INSERT INTO attachments
-            (uploader_id, note_id, kind, mime, size_bytes, storage_key, family_id, position)
-         VALUES ($1, $2, 'photo', $3, $4, $5, $6, 0)",
+            (uploader_id, note_id, kind, mime, size_bytes, storage_key, family_id, position,
+             file_key)
+         VALUES ($1, $2, 'photo', $3, $4, $5, $6, 0, $7)",
     )
     .bind(assistant_id)
     .bind(note_id)
@@ -1563,6 +1652,10 @@ pub async fn draw_backdrop(
     .bind(written.bytes)
     .bind(&written.storage_key)
     .bind(family_id)
+    .bind(crate::handlers_attachment::seal_file_key(
+        &holder,
+        &written.file_key,
+    ))
     .execute(&mut *tx)
     .await;
     if let Err(error) = inserted {
@@ -1612,7 +1705,7 @@ pub async fn draw_backdrop(
         tracing::warn!(%error, "could not record the backdrop against the family's pictures");
     }
 
-    let mut note = Note::from_row(&row);
+    let mut note = Note::from_row(&row, &state.keys)?;
     hydrate(&state, &mut note).await?;
     // Fanned out, never pushed: only creation notifies, and nobody should
     // be woken because an event got a picture.
@@ -1637,10 +1730,10 @@ pub async fn draw_backdrop(
 pub async fn put_task_done(
     auth: AuthUser,
     State(state): State<AppState>,
-    Path((note_id, item_id)): Path<(i64, i64)>,
+    Path(TaskPath { note_id, item_id }): Path<TaskPath>,
     AppJson(req): AppJson<TaskDoneRequest>,
 ) -> Result<Response, ApiError> {
-    let family_id = caller_family(&state, auth.user_id).await?;
+    let family_id = caller_family(&auth)?;
 
     let mut tx = state.pool.begin().await?;
     lock_board(&mut tx, family_id).await?;
@@ -1698,7 +1791,7 @@ pub async fn put_task_done(
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
-        let mut note = Note::from_row(&row);
+        let mut note = Note::from_row(&row, &state.keys)?;
         hydrate(&state, &mut note).await?;
         return Ok((StatusCode::OK, Json(json!({"note": note}))).into_response());
     }
@@ -1737,7 +1830,7 @@ pub async fn put_task_done(
     advance_family_seq(&mut tx, family_id, seq).await?;
     tx.commit().await?;
 
-    let mut note = Note::from_row(&row);
+    let mut note = Note::from_row(&row, &state.keys)?;
     hydrate(&state, &mut note).await?;
     // Fanned out, never pushed: only creation notifies, and nobody should
     // be woken because somebody else bought the milk.
@@ -1754,7 +1847,7 @@ async fn set_rsvp(
     note_id: i64,
     answer: Option<String>,
 ) -> Result<Response, ApiError> {
-    let family_id = caller_family(&state, auth.user_id).await?;
+    let family_id = caller_family(&auth)?;
 
     let mut tx = state.pool.begin().await?;
     lock_board(&mut tx, family_id).await?;
@@ -1804,7 +1897,7 @@ async fn set_rsvp(
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
-        let mut note = Note::from_row(&row);
+        let mut note = Note::from_row(&row, &state.keys)?;
         hydrate(&state, &mut note).await?;
         return Ok((StatusCode::OK, Json(json!({"note": note}))).into_response());
     }
@@ -1849,7 +1942,7 @@ async fn set_rsvp(
     advance_family_seq(&mut tx, family_id, seq).await?;
     tx.commit().await?;
 
-    let mut note = Note::from_row(&row);
+    let mut note = Note::from_row(&row, &state.keys)?;
     hydrate(&state, &mut note).await?;
     // Fanned out, never pushed: `deliver_board_note` is the no-push path
     // (only creation notifies), and nobody should be woken because

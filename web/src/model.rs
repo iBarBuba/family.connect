@@ -100,6 +100,43 @@ pub struct Family {
     /// chose").
     #[serde(default, deserialize_with = "names_or_none")]
     pub greeting_places: Vec<String>,
+    /// `owner` | `member` — the caller's own role IN THIS family, on each
+    /// entry of `GET /me`'s `families` (docs/protocol.md, "Several
+    /// families"). Absent from every other read of a family, where a client
+    /// keeps the role it holds.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// The most members this family may have whatever its owner sets: the
+    /// operator's ceiling, or a paid family's lower limit. The owner's cap
+    /// picker draws its range from this, and from `GET /me`'s
+    /// `max_family_members` on a server that predates it (docs/protocol.md,
+    /// "Paid families").
+    #[serde(default)]
+    pub member_ceiling: Option<i64>,
+    /// When the server will delete this family — present only while it is a
+    /// PAID family its owner's subscription no longer covers, and the reason
+    /// for the banner over its chat list. Absent is no deadline: a
+    /// `family_plan` frame without it clears one (docs/protocol.md, "Paid
+    /// families").
+    #[serde(default)]
+    pub delete_at: Option<String>,
+}
+
+impl Family {
+    pub fn is_owner(&self) -> bool {
+        self.role.as_deref() == Some("owner")
+    }
+}
+
+/// The caller's own App Store subscription, as `GET /me` reports it — only
+/// whether it is active matters to a client that cannot sell one
+/// (docs/protocol.md, "Paid families").
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct Subscription {
+    /// Not revoked or refunded, and its expiry — or Apple's grace period's
+    /// end, when later — still ahead.
+    #[serde(default)]
+    pub active: bool,
 }
 
 fn yes() -> bool {
@@ -184,11 +221,54 @@ pub struct Me {
     /// "Consenting to the assistant", amended 2026-10-03).
     #[serde(default)]
     pub assistant_lookup_consent_at: Option<String>,
+    /// Every family the caller is in, the home family first and then in
+    /// the order they were joined, each with the caller's own `role` —
+    /// ALWAYS present on a server that knows several families, and absent
+    /// (so empty) from one that predates them, where `family` is the one
+    /// (docs/protocol.md, "Several families").
+    #[serde(default)]
+    pub families: Vec<Family>,
+    /// Every join request of the caller's still waiting on an owner.
+    #[serde(default)]
+    pub pending_join_requests: Vec<PendingJoin>,
+    /// The caller's pending invitations, oldest first.
+    #[serde(default)]
+    pub invitations: Vec<Invitation>,
+    /// Whether a member may start another family in the app
+    /// (`[families] member_families`). Absent is a server that lets nobody.
+    #[serde(default)]
+    pub member_families_enabled: bool,
+    /// How many families one account may be in. Absent is a server that
+    /// predates several, and a client offers no other family there.
+    #[serde(default)]
+    pub max_families_per_account: Option<i64>,
+    /// Whether a new family on this server needs its owner's App Store
+    /// subscription. Absent is false: a server from before paid families,
+    /// where nothing about them applies (docs/protocol.md, "Paid families").
+    #[serde(default)]
+    pub subscriptions_enabled: bool,
+    /// The caller's own subscription — the active one, or else the one that
+    /// ended last — and None for an account that never had one.
+    #[serde(default)]
+    pub subscription: Option<Subscription>,
 }
 
 impl Me {
     pub fn is_owner(&self) -> bool {
         self.role.as_deref() == Some("owner")
+    }
+
+    /// Whether this account may start a family here — "Create a family" and
+    /// "New Family…" — as far as paying goes: this client cannot sell the
+    /// subscription, so on a server that charges it offers them only while
+    /// the account's own is active (fc_text::paid::may_start_family).
+    pub fn may_start_family(&self) -> bool {
+        fc_text::paid::may_start_family(
+            self.subscriptions_enabled,
+            self.subscription
+                .as_ref()
+                .is_some_and(|subscription| subscription.active),
+        )
     }
 }
 
@@ -208,6 +288,13 @@ pub struct Member {
     pub avatar_version: i64,
     #[serde(default)]
     pub birthday: Option<Birthday>,
+    /// In the OWNER's read of their own family only: whether this owner may
+    /// reset this member's password, which needs them to own every family
+    /// the member is in (docs/protocol.md, "Owners, per family"). Absent is
+    /// a server from before several families, under the old rule — the
+    /// reset is offered; only an explicit `false` hides it.
+    #[serde(default)]
+    pub password_reset: Option<bool>,
 }
 
 impl Member {
@@ -343,6 +430,23 @@ pub struct Roster {
     /// A prediction, read fresh before the leave dialog names anybody.
     #[serde(default)]
     pub next_owner_user_id: Option<i64>,
+}
+
+/// An owner's invitation into their family, pending until the invited
+/// person accepts or declines (docs/protocol.md, "Several families"). The
+/// invited person sees theirs on `GET /me`; the owner reads the family's
+/// with `GET /families/{id}/invitations`; both hear the `invitation` and
+/// `invitation_removed` frames.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct Invitation {
+    pub id: i64,
+    pub family_id: i64,
+    pub family_name: String,
+    pub invited_by: User,
+    /// The invited person.
+    pub user: User,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 /// Somebody asking to join, for the owner (`GET /families/join-requests`).
@@ -481,6 +585,43 @@ pub struct MemberStats {
     pub ai: AiCounts,
 }
 
+/// One limit of a paid family's allowance: what is used of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct Usage {
+    pub used: i64,
+    pub limit: i64,
+}
+
+/// What a PAID family has used of its limits, and when the monthly ones
+/// start again (docs/protocol.md, "Family statistics", amended for paid
+/// families). Each limit is absent when the operator turned it off.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct Allowance {
+    #[serde(default)]
+    pub renews_at: Option<String>,
+    #[serde(default)]
+    pub storage_bytes: Option<Usage>,
+    #[serde(default)]
+    pub ai_tokens: Option<Usage>,
+    #[serde(default)]
+    pub images: Option<Usage>,
+    #[serde(default)]
+    pub transcript_ms: Option<Usage>,
+}
+
+impl Allowance {
+    /// The limits, as the shared wording reads them.
+    pub fn limits(&self) -> fc_text::paid::Allowance {
+        let pair = |usage: Option<Usage>| usage.map(|usage| (usage.used, usage.limit));
+        fc_text::paid::Allowance {
+            storage_bytes: pair(self.storage_bytes),
+            ai_tokens: pair(self.ai_tokens),
+            images: pair(self.images),
+            transcript_ms: pair(self.transcript_ms),
+        }
+    }
+}
+
 /// The family's numbers. The rows do NOT add up to the totals when the
 /// reader has blocked somebody, and the gap is the block: never sum them.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -490,6 +631,10 @@ pub struct Stats {
     pub totals: StatsTotals,
     #[serde(default)]
     pub members: Vec<MemberStats>,
+    /// A paid family's allowance — absent for a free family and on a server
+    /// that does not charge, and then there is no section for it.
+    #[serde(default)]
+    pub allowance: Option<Allowance>,
 }
 
 /// One answer to an event.
@@ -572,6 +717,10 @@ pub struct Note {
     /// badge counts. Absent on a tombstone and from an older server.
     #[serde(default)]
     pub content_seq: Option<i64>,
+    /// Whose board it is on (docs/protocol.md, "Several families"). Absent
+    /// from a server that predates it, where it is the one family's.
+    #[serde(default)]
+    pub family_id: Option<i64>,
 }
 
 impl Note {
@@ -643,21 +792,74 @@ impl Roster {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Chat {
     pub id: i64,
-    /// `family` | `direct` | `ai`.
+    /// `family` | `direct` | `ai` | `group`.
     pub kind: String,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
     pub peer_user_id: Option<i64>,
+    /// A group's members, the caller included, in the order they joined —
+    /// present only for `group` (docs/protocol.md, "Groups").
+    #[serde(default)]
+    pub member_ids: Option<Vec<i64>>,
+    /// The one member who may rename the group, add and remove members, and
+    /// delete it — present only for `group`.
+    #[serde(default)]
+    pub admin_user_id: Option<i64>,
+    /// The families this chat is listed in: exactly one for a family chat,
+    /// a group and an `ai` chat; every family the two people share for a
+    /// direct chat. Absent from a server that predates it, where it means
+    /// the one family the account has (docs/protocol.md, `Chat`).
+    #[serde(default)]
+    pub family_ids: Option<Vec<i64>>,
 }
 
 impl Chat {
-    pub const FAMILY: &'static str = "family";
-    pub const DIRECT: &'static str = "direct";
-    pub const AI: &'static str = "ai";
+    pub const FAMILY: &'static str = fc_text::groups::FAMILY;
+    pub const DIRECT: &'static str = fc_text::groups::DIRECT;
+    pub const AI: &'static str = fc_text::groups::AI;
+    pub const GROUP: &'static str = fc_text::groups::GROUP;
+
+    pub fn is_group(&self) -> bool {
+        self.kind == Self::GROUP
+    }
+
+    /// What this chat offers (fc_text::groups::offers): a group is the
+    /// family chat less calls and "seen".
+    pub fn offers(&self) -> fc_text::groups::Offers {
+        fc_text::groups::offers(&self.kind)
+    }
+
+    /// A group's members — empty for every other kind.
+    pub fn group_member_ids(&self) -> &[i64] {
+        self.member_ids
+            .as_deref()
+            .filter(|_| self.is_group())
+            .unwrap_or_default()
+    }
+
+    /// Whom a mention here may name and a poll here counts: the family's
+    /// members, or in a group the group's, in the order they joined
+    /// (docs/protocol.md, "Groups" — "4 of 5 voted" counts the group's).
+    pub fn members_of(&self, family: &[Member]) -> Vec<Member> {
+        if !self.is_group() {
+            return family.to_vec();
+        }
+        self.group_member_ids()
+            .iter()
+            .filter_map(|id| family.iter().find(|member| member.id == *id))
+            .cloned()
+            .collect()
+    }
+
+    /// May `me` do `power` to this chat? Only ever to a group.
+    pub fn may(&self, power: fc_text::groups::Power, me: i64) -> bool {
+        self.is_group()
+            && fc_text::groups::may(power, me, self.admin_user_id, self.group_member_ids())
+    }
 
     pub fn is_family(&self) -> bool {
         self.kind == Self::FAMILY
@@ -680,6 +882,9 @@ impl Chat {
         if let Some(title) = self.title.as_ref().filter(|title| !title.is_empty()) {
             return title.clone();
         }
+        if self.is_group() {
+            return t("Group").to_string();
+        }
         peer_name.unwrap_or_else(|| t("Chat")).to_string()
     }
 }
@@ -690,7 +895,7 @@ impl Chat {
 /// explicitly, and `0` is a real answer meaning "never reported"), so it is
 /// not an Option. `unread_count` likewise. The three `max_*_seq` are
 /// high-water marks, omitted until the first reaction, edit or poll.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct ChatListItem {
     pub chat: Chat,
     #[serde(default)]
@@ -783,6 +988,14 @@ pub struct Attachment {
     /// square video tile, which is what the attachment otherwise is.
     #[serde(default, skip_serializing_if = "is_false")]
     pub round: bool,
+    /// This video is an ANIMATION — an animated picture its sender made into
+    /// a silent looping video (docs/protocol.md, "Animations"). Present only
+    /// when true, set by the send and never changed, never beside `sticker`
+    /// or `round` and never on anything but a video. A client that has not
+    /// heard of it draws a video with its poster, which is what the
+    /// attachment otherwise is.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub animation: bool,
     /// A voice note's shape: 48 lowercase hex digits, one level 0–15 per
     /// slice of the recording, measured by the sender (docs/protocol.md, "A
     /// voice note's waveform"). Absent where none was sent — a picked sound
@@ -823,6 +1036,10 @@ pub struct PackItem {
     pub label: Option<String>,
     #[serde(default)]
     pub created_at: Option<String>,
+    /// Whose pack it is in (docs/protocol.md, "Several families"). Absent
+    /// from a server that predates it, where it is the one family's.
+    #[serde(default)]
+    pub family_id: Option<i64>,
 }
 
 impl PackItem {
@@ -947,6 +1164,28 @@ impl Message {
         }
     }
 
+    /// The animation this message IS, if it is one — drawn as a picture that
+    /// moves (docs/protocol.md, "Animations"). The one test every client
+    /// shares, `fc_text::animation_source::is_animation`: exactly one
+    /// attachment, a video, carrying `animation: true`. A caption is
+    /// allowed; two attachments, or the flag on anything but a video, are
+    /// the ordinary message it otherwise is.
+    pub fn animation(&self) -> Option<&Attachment> {
+        let flags: Vec<fc_text::animation_source::AttachmentFlags> = self
+            .attachments()
+            .iter()
+            .map(|attachment| fc_text::animation_source::AttachmentFlags {
+                kind: &attachment.kind,
+                animation: attachment.animation,
+            })
+            .collect();
+        if fc_text::animation_source::is_animation(&flags) {
+            self.attachments().first()
+        } else {
+            None
+        }
+    }
+
     /// The video message this message IS, if it is one — drawn as a circle
     /// (docs/protocol.md, "Video messages"; the plan for #79, S5.1). The one
     /// test every client shares, `fc_text::record::is_round`: exactly one
@@ -973,12 +1212,12 @@ impl Message {
 /// Why an assistant answer stopped early — an `ai_error`'s optional
 /// `reason`, already read (docs/protocol.md, "The assistant").
 ///
-/// Two values and not a string, because a client MUST treat a reason it
-/// does not know as absent: the decision is made once, where the frame is
-/// read, and nothing after it can invent a meaning for a word a newer
-/// server sends. It is what the failed row REMEMBERS, beside the fact that
-/// it failed, so the sentence survives every redraw the flag did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// An enum and not a string, because a client MUST treat a reason it does
+/// not know as absent: the decision is made once, where the frame is read,
+/// and nothing after it can invent a meaning for a word a newer server
+/// sends. It is what the failed row REMEMBERS, beside the fact that it
+/// failed, so the sentence survives every redraw the flag did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AiFailure {
     /// Any failure the server did not say more about — the provider out of
     /// reach, a broken stream, a picture that could not be stored — and any
@@ -990,39 +1229,71 @@ pub enum AiFailure {
     /// the same words gets the same refusal, so the sentence says to put it
     /// another way instead.
     Refused,
+    /// `"allowance_used"`: a PAID family has used this month's assistant
+    /// allowance, and the server did not call the provider at all. The frame
+    /// says when it renews (`renews_at`, the 1st of the next UTC month), and
+    /// the sentence names that UTC calendar day — the 1st, for every reader
+    /// (docs/protocol.md, "Paid families").
+    AllowanceUsed { renews_at: Option<String> },
 }
 
 impl AiFailure {
-    /// The wire's `reason`, with everything but a known word read as absent.
-    pub fn from_reason(reason: Option<&str>) -> AiFailure {
+    /// The wire's `reason`, with everything but a known word read as absent
+    /// — and `renews_at`, which only `"allowance_used"` carries.
+    pub fn from_reason(reason: Option<&str>, renews_at: Option<&str>) -> AiFailure {
         match reason {
             Some("refused") => AiFailure::Refused,
+            Some("allowance_used") => AiFailure::AllowanceUsed {
+                renews_at: renews_at.map(str::to_string),
+            },
             _ => AiFailure::Failed,
         }
     }
 
     /// What the failed answer says — in the bubble, in the row still
     /// waiting for words, and so to a screen reader.
-    pub fn sentence(self) -> &'static str {
+    pub fn sentence(&self) -> String {
         match self {
-            AiFailure::Failed => t("Couldn't answer that. Ask again."),
+            AiFailure::Failed => t("Couldn't answer that. Ask again.").to_string(),
             AiFailure::Refused => {
-                t("The assistant's provider refused that. Try putting it another way.")
+                t("The assistant's provider refused that. Try putting it another way.").to_string()
+            }
+            AiFailure::AllowanceUsed { renews_at } => {
+                let now = js_sys::Date::now();
+                // A frame without the day still says the month's rule: the
+                // 1st of the next one, UTC.
+                let renews_at = renews_at
+                    .clone()
+                    .unwrap_or_else(|| fc_text::paid::next_month_utc(now));
+                fc_text::paid::ai_allowance_used(&crate::time::utc_day_in_sentence(&renews_at, now))
             }
         }
     }
 }
 
-/// Deserialises an `ai_error`'s `reason` FORGIVINGLY: a word this client
-/// does not know, or a value that is not a word at all, is the failure it
-/// always was — never a frame dropped for being unreadable, which would
-/// leave the row waiting for an answer that is not coming.
-pub fn ai_failure<'de, D>(deserializer: D) -> Result<AiFailure, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let reason = serde_json::Value::deserialize(deserializer)?;
-    Ok(AiFailure::from_reason(reason.as_str()))
+/// An `ai_error`'s `reason` and `renews_at`, read FORGIVINGLY from the
+/// frame they sit in: a word this client does not know, or a value that is
+/// not a word at all, is the failure it always was — never a frame dropped
+/// for being unreadable, which would leave the row waiting for an answer
+/// that is not coming.
+impl<'de> Deserialize<'de> for AiFailure {
+    fn deserialize<D>(deserializer: D) -> Result<AiFailure, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Said {
+            #[serde(default)]
+            reason: serde_json::Value,
+            #[serde(default)]
+            renews_at: serde_json::Value,
+        }
+        let said = Said::deserialize(deserializer)?;
+        Ok(AiFailure::from_reason(
+            said.reason.as_str(),
+            said.renews_at.as_str(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1367,6 +1638,52 @@ mod tests {
         assert_eq!(kept["round"], true);
     }
 
+    /// AN ANIMATION is a video with one more field (docs/protocol.md,
+    /// "Animations"): read as the server sends it, drawn as an animation
+    /// only by the one test every client shares — exactly one attachment, a
+    /// video, `animation: true` — WITH or without a caption, and written
+    /// back only when true.
+    #[wasm_bindgen_test]
+    fn an_animation_is_a_video_with_one_more_field() {
+        let sent: Message = serde_json::from_str(
+            r#"{"id": 1600, "chat_id": 42, "sender_id": 9, "body": "",
+                "created_at": "2026-10-19T10:00:00Z",
+                "attachments": [{"id": 93, "kind": "video", "mime": "video/mp4",
+                                 "size": 182330, "width": 480, "height": 270,
+                                 "duration_ms": 2100, "has_preview": true, "animation": true}]}"#,
+        )
+        .expect("reads");
+        let drawn = sent.animation().expect("an animation");
+        assert_eq!((drawn.id, drawn.size), (93, Some(182_330)));
+        assert!(sent.round_video().is_none() && sent.sticker().is_none());
+        // A caption is allowed: still an animation.
+        let mut captioned = sent.clone();
+        captioned.body = "look at him go".into();
+        assert!(captioned.animation().is_some());
+
+        let plain: Message = serde_json::from_str(
+            r#"{"id": 1601, "chat_id": 42, "sender_id": 9, "body": "",
+                "created_at": "2026-10-19T10:00:00Z",
+                "attachments": [{"id": 94, "kind": "video", "mime": "video/mp4"}]}"#,
+        )
+        .expect("reads");
+        assert!(plain.animation().is_none(), "absent is an ordinary video");
+        assert!(!plain.attachments()[0].animation);
+        let mut pair = sent.clone();
+        let again = pair.attachments()[0].clone();
+        pair.attachments.as_mut().expect("has some").push(again);
+        assert!(pair.animation().is_none(), "never two");
+        for kind in ["photo", "file", "audio", "location"] {
+            let mut other = sent.clone();
+            other.attachments.as_mut().expect("has some")[0].kind = kind.into();
+            assert!(other.animation().is_none(), "a flagged {kind}");
+        }
+        let kept = serde_json::to_value(&plain.attachments()[0]).expect("encodes");
+        assert!(kept.get("animation").is_none());
+        let kept = serde_json::to_value(&sent.attachments()[0]).expect("encodes");
+        assert_eq!(kept["animation"], true);
+    }
+
     /// A pack item live, labelled, and as a tombstone — which carries
     /// nothing but its id, its seq and that it is gone.
     #[wasm_bindgen_test]
@@ -1439,6 +1756,7 @@ mod tests {
             kind: "family".into(),
             title: Some("The Smiths".into()),
             peer_user_id: None,
+            ..Chat::default()
         };
         assert_eq!(family.display_title(None), "The Smiths");
         let direct = Chat {
@@ -1446,6 +1764,7 @@ mod tests {
             kind: "direct".into(),
             title: None,
             peer_user_id: Some(9),
+            ..Chat::default()
         };
         assert_eq!(direct.display_title(Some("Anna")), "Anna");
         // A direct chat whose peer is not in the roster yet still draws as
@@ -1458,8 +1777,46 @@ mod tests {
             kind: "direct".into(),
             title: Some(String::new()),
             peer_user_id: Some(9),
+            ..Chat::default()
         };
         assert_eq!(empty.display_title(Some("Anna")), "Anna");
+    }
+
+    /// A group carries its name, its members in the order they joined and
+    /// its admin; every other kind carries neither, and a group's fields on
+    /// another kind mean nothing (docs/protocol.md, "Groups").
+    #[wasm_bindgen_test]
+    fn a_group_reads_its_members_and_its_admin() {
+        let json = r#"{"chat": {"id": 77, "kind": "group", "title": "Cousins",
+                                "peer_user_id": null, "member_ids": [7, 9, 11],
+                                "admin_user_id": 7},
+                       "last_message": null, "unread_count": 0, "last_read_message_id": 0}"#;
+        let item: ChatListItem = serde_json::from_str(json).expect("decodes");
+        let chat = item.chat;
+        assert!(chat.is_group() && !chat.is_family() && !chat.is_direct());
+        assert_eq!(chat.group_member_ids(), &[7, 9, 11]);
+        assert_eq!(chat.admin_user_id, Some(7));
+        assert_eq!(chat.display_title(None), "Cousins");
+        assert!(chat.offers().mentions && !chat.offers().calls && !chat.offers().seen);
+        assert!(chat.may(fc_text::groups::Power::Delete, 7));
+        assert!(!chat.may(fc_text::groups::Power::Delete, 9));
+        assert!(chat.may(fc_text::groups::Power::Leave, 9));
+        assert!(!chat.may(fc_text::groups::Power::Leave, 12));
+        let nameless = Chat {
+            title: None,
+            ..chat.clone()
+        };
+        assert_eq!(nameless.display_title(Some("Anna")), "Group");
+
+        let family: Chat = serde_json::from_str(
+            r#"{"id": 42, "kind": "family", "title": "The Smiths", "member_ids": [7]}"#,
+        )
+        .expect("decodes");
+        assert!(family.group_member_ids().is_empty());
+        assert!(
+            !family.may(fc_text::groups::Power::Leave, 7),
+            "never the family chat"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -1589,5 +1946,25 @@ mod tests {
         ] {
             assert!(!roster(off).assistant.unwrap().greeting_weather, "{off:?}");
         }
+    }
+
+    /// `password_reset`: true and absent offer the reset — absent is a
+    /// server from before several families, under the old rule — and only
+    /// an explicit false hides it (docs/protocol.md, "Owners, per family").
+    #[wasm_bindgen_test]
+    fn a_members_password_reset_is_hidden_only_when_false() {
+        let read = |json: &str| serde_json::from_str::<Member>(json).expect("a member");
+        assert_eq!(
+            read(r#"{"id": 9, "display_name": "Anna", "password_reset": true}"#).password_reset,
+            Some(true)
+        );
+        assert_eq!(
+            read(r#"{"id": 9, "display_name": "Anna", "password_reset": false}"#).password_reset,
+            Some(false)
+        );
+        assert_eq!(
+            read(r#"{"id": 9, "display_name": "Anna"}"#).password_reset,
+            None
+        );
     }
 }

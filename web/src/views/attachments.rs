@@ -20,6 +20,7 @@ use yew::prelude::*;
 use crate::awake::ScreenAwake;
 use crate::media::{download, use_media, MediaLoader, Variant};
 use crate::model::Attachment;
+use crate::views::animation::AnimationTile;
 use crate::views::attach::{phone_like, PLAY_AFTER};
 use crate::views::quiet::{use_quiet, use_quiet_explain, LiveRegion};
 
@@ -76,6 +77,14 @@ pub fn attachment_stack(props: &StackProps) -> Html {
         .filter(|attachment| !media::is_media(&attachment.kind))
         .cloned()
         .collect();
+    // AN ANIMATION — the one test every client shares: exactly one
+    // attachment, a video, carrying `animation: true` — is drawn as a
+    // picture that moves (docs/protocol.md, "Animations"), with no text
+    // under it: it is silent by construction.
+    let animation = match props.attachments.as_slice() {
+        [only] if only.kind == "video" && only.animation => Some(only.clone()),
+        _ => None,
+    };
     let open = |index: usize| {
         let on_open = props.on_open.clone();
         let media = media.clone();
@@ -89,7 +98,7 @@ pub fn attachment_stack(props: &StackProps) -> Html {
     let videos: Vec<(usize, i64)> = media
         .iter()
         .enumerate()
-        .filter(|(_, attachment)| attachment.kind == "video")
+        .filter(|(_, attachment)| attachment.kind == "video" && animation.is_none())
         .map(|(index, attachment)| (index + 1, attachment.id))
         .collect();
     let marked = videos.len() >= 2;
@@ -109,7 +118,9 @@ pub fn attachment_stack(props: &StackProps) -> Html {
     });
     html! {
         <div class="attachments">
-            if media.len() >= 2 {
+            if let Some(animation) = animation {
+                <AnimationTile attachment={animation} mine={props.mine} on_open={open(0)} />
+            } else if media.len() >= 2 {
                 <Album items={media.clone()} mine={props.mine} on_open={open(0)} />
             } else if let Some(single) = media.first() {
                 <Tile attachment={single.clone()} mine={props.mine} on_open={open(0)} />
@@ -155,10 +166,18 @@ pub(crate) fn tile_source(attachment: &Attachment) -> Option<Variant> {
 fn tile(props: &TileProps) -> Html {
     let attachment = &props.attachment;
     let source = tile_source(attachment);
+    let frame = use_node_ref();
+    // Fetched as it comes within a screen of being seen, or at once when this
+    // tab holds it (stickers::use_fetch_ahead).
+    let near = crate::views::stickers::use_fetch_ahead(
+        frame.clone(),
+        attachment.id,
+        source.unwrap_or(Variant::Preview),
+    );
     let url = use_media(
         attachment.id,
         source.unwrap_or(Variant::Preview),
-        source.is_some(),
+        source.is_some() && near,
     );
     let (width, height) = media::tile_size(attachment.width, attachment.height);
     let video = attachment.kind == "video";
@@ -170,6 +189,7 @@ fn tile(props: &TileProps) -> Html {
     let loading = url.is_none() && source.is_some() && attachment.id > 0;
     html! {
         <button
+            ref={frame}
             class={classes!("tile", props.mine.then_some("on-tint"), loading.then_some("is-loading"))}
             // Its own shape at up to 320 wide, and narrower where the pane
             // is — a thread panel, a phone — without losing the shape.
@@ -514,7 +534,8 @@ pub fn seek_by_key(key: &str, at: f64, total: f64) -> Option<f64> {
 /// Where a pointer `x` across a waveform from `left` that is `width` wide
 /// puts the position of a message `total` seconds long.
 pub fn seek_by_pointer(x: f64, left: f64, width: f64, total: f64) -> f64 {
-    if !(width > 0.0) || !x.is_finite() {
+    // NaN is not a width either.
+    if width.is_nan() || width <= 0.0 || !x.is_finite() {
         return 0.0;
     }
     (((x - left) / width).clamp(0.0, 1.0) * total).clamp(0.0, total)
@@ -1066,7 +1087,15 @@ pub fn transcript_block(props: &TranscriptProps) -> Html {
             <button type="button" class="link transcript-action" onclick={show.clone()}>{ label }</button>
         }
     };
-    match &props.state {
+    // A used-up month's line lasts until the month renews: drawn after that,
+    // it is "Show text" again, as though nothing had been asked
+    // (docs/protocol.md, "Transcripts on request").
+    let now = js_sys::Date::now();
+    let state = props
+        .state
+        .as_ref()
+        .filter(|state| !matches!(state, TranscriptState::Failed(failure) if failure.lapsed(now)));
+    match state {
         None if props.offered => html! {
             <div class="transcript">{ marker.clone().unwrap_or_default() }{ show_button(t("Show text")) }</div>
         },

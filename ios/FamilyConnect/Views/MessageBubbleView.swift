@@ -234,7 +234,8 @@ struct MessageBubbleView: View {
             // A poll sets the balloon's width, so the question wraps
             // against the bars rather than floating narrow above them.
             || message.poll != nil
-            || bodyBlocks.contains { $0.isTable }
+            // A drawing (#97) is as wide as it is, like a table.
+            || bodyBlocks.contains { $0.isTable || $0.isRich }
     }
 
     /// An own message that IS a reply lays its balloon out with
@@ -321,7 +322,6 @@ struct MessageBubbleView: View {
         // see everything anyway, so a context without the stores loses
         // defence in depth rather than the oracle itself.
         if let attachmentStore {
-            _ = attachmentStore.generation
             for attachment in message.attachments where !attachment.isFile {
                 _ = AttachmentView.image(for: attachment, in: attachmentStore)
             }
@@ -366,6 +366,14 @@ struct MessageBubbleView: View {
     static let captionFloor: CGFloat = 240
 
     var body: some View {
+        // Decided ONCE per pass, outside the geometry hook below. The hook's
+        // transform runs on every scrolled frame for every bubble in the
+        // window, and it used to parse the body for a link
+        // (`previewableLink`) each time — the whole window re-detecting
+        // links sixty times a second while the reader scrolled. Now the
+        // closure tests a captured Bool, and once the bubble has been seen
+        // (or has no link to preview) it is a constant `false`.
+        let watchesVisibility = !hasBeenVisible && previewableLink != nil
         HStack(alignment: .bottom, spacing: 0) {
             if isMine { Spacer(minLength: 48) }
 
@@ -412,7 +420,12 @@ struct MessageBubbleView: View {
                 // the retry button, and it cannot wait for the run to end.
                 if isRunEnd || message.isEdited || message.state != .sent {
                 HStack(spacing: 4) {
-                    Text(message.createdAt, format: .dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits))
+                    // The locale's own short time — "20:58" or "8:58 PM".
+                    // `.hour(.twoDigits(amPM: .omitted))` read the clock
+                    // the locale keeps and then dropped its AM/PM, so on a
+                    // 12-hour locale 20:58 came out "08:58" beside a
+                    // status bar saying 8:58 PM.
+                    Text(message.createdAt, format: .dateTime.hour().minute())
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                     if message.isEdited {
@@ -437,6 +450,18 @@ struct MessageBubbleView: View {
                     threadChip
                 }
             }
+            // A bubble's widest is min(column − 48, 560) (#106, 2.2): the
+            // spacer gives the first, this the second. OUTSIDE the balloon
+            // and everything it draws, so it can only narrow the PROPOSAL
+            // the balloon wraps against — never widen what it fills, which
+            // is the full-width-slab mistake this view has shipped twice.
+            // The frame is empty beside a short bubble (it hit-tests
+            // nothing there) and aligned to the speaker's side, so the
+            // balloon sits where it did. Below 608 points of column — every
+            // iPhone — the spacer binds first and the proposal is exactly
+            // what it was; on an iPad's 1024-pt column a line of text stops
+            // at a readable 560 instead of running 976.
+            .frame(maxWidth: ComposerRow.maxBubble, alignment: isMine ? .trailing : .leading)
 
             if !isMine { Spacer(minLength: 48) }
         }
@@ -447,7 +472,7 @@ struct MessageBubbleView: View {
         // viewport — geometry, not onAppear, because in this non-lazy
         // window every row "appears" at creation.
         .onGeometryChange(for: Bool.self) { geometry in
-            guard previewableLink != nil, let viewport = geometry.bounds(of: .scrollView) else {
+            guard watchesVisibility, let viewport = geometry.bounds(of: .scrollView) else {
                 return false
             }
             let frame = geometry.frame(in: .scrollView)
@@ -877,9 +902,11 @@ struct MessageBubbleView: View {
                 MessageBodyBlocks(
                     blocks: bodyBlocks,
                     isStreaming: isStreaming,
-                    isMine: isMine
+                    isMine: isMine,
+                    onDoubleTap: { toggleQuickHeart() },
+                    onLongPress: { onLongPress() }
                 ) { text, carriesCursor in
-                    Text(text)
+                    text
                         .font(bubbleFont)
                         .foregroundStyle(bubbleContentColor)
                         // WHY A REPLY USED TO LOSE ITS LAST LINES.
@@ -1300,6 +1327,54 @@ private struct DoubleCheckmark: View {
         }
         .font(.caption2)
         .padding(.trailing, 4)
+    }
+}
+
+// MARK: - Skipping an unchanged bubble
+
+/// Lets the thread skip a bubble whose inputs did not change (`.equatable()`
+/// in ConversationView.bubbleRow).
+///
+/// EVERY INPUT THAT IS NOT A CLOSURE IS COMPARED, and adding one without
+/// adding it here is a bubble that stops updating — so this list is the
+/// struct's own list, in its order. The closures are left out because
+/// they cannot be compared and need not be: the thread builds them from
+/// the message (compared) and from its own state, which they read through
+/// SwiftUI's storage at the moment they run. The one closure whose PRESENCE
+/// changes what is drawn — the call record's "call back" — is compared by
+/// whether it is there.
+///
+/// Internal state — the reaction popover, a pending link tap, whether the
+/// bubble has been seen — is not an input and is untouched by this: SwiftUI
+/// skips the body only when the PARENT re-renders with equal inputs, never
+/// when the bubble's own state or the stores it observes change.
+extension MessageBubbleView: Equatable {
+    static func == (lhs: MessageBubbleView, rhs: MessageBubbleView) -> Bool {
+        lhs.message == rhs.message
+            && lhs.isMine == rhs.isMine
+            && lhs.isStreaming == rhs.isStreaming
+            && lhs.assistantFailure == rhs.assistantFailure
+            && lhs.showsSenderName == rhs.showsSenderName
+            && lhs.senderName == rhs.senderName
+            && lhs.senderID == rhs.senderID
+            && lhs.senderAvatarVersion == rhs.senderAvatarVersion
+            && lhs.isRunStart == rhs.isRunStart
+            && lhs.isRunEnd == rhs.isRunEnd
+            && lhs.isRead == rhs.isRead
+            && lhs.reactionChips == rhs.reactionChips
+            && lhs.reactionDetails == rhs.reactionDetails
+            && lhs.avatarVersions == rhs.avatarVersions
+            && lhs.memberNames == rhs.memberNames
+            && lhs.currentUserID == rhs.currentUserID
+            && lhs.replyCount == rhs.replyCount
+            && lhs.memberCount == rhs.memberCount
+            && (lhs.onCallBack == nil) == (rhs.onCallBack == nil)
+            && lhs.publishesAnchor == rhs.publishesAnchor
+            && lhs.blockedUserIDs == rhs.blockedUserIDs
+            && lhs.isHiddenByBlock == rhs.isHiddenByBlock
+            && lhs.isRevealed == rhs.isRevealed
+            && lhs.isReplyQuoteRevealed == rhs.isReplyQuoteRevealed
+            && lhs.isParentQuoteRevealed == rhs.isParentQuoteRevealed
     }
 }
 

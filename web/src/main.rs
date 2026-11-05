@@ -77,10 +77,11 @@ use sync::{network_back, page_visible, report_read, start_session, Channels, Sha
 use views::board::BoardPane;
 use views::call::CallPanel;
 use views::chat_list::ChatList;
+use views::chat_list::{Families, FamilyRow};
 use views::conversation::Conversation;
 use views::dialog::Confirm;
 use views::family::FamilyPane;
-use views::gate::{FamilyGate, PendingApproval};
+use views::gate::{AnotherFamilyPane, FamilyGate, PendingApproval};
 use views::login::Login;
 use views::open_polls::OpenPollsPanel;
 use views::quiet::{LiveRegion, QuietRoot};
@@ -127,11 +128,12 @@ fn app() -> Html {
     };
 
     // Signing out, from anywhere: a 401 and the button do the same thing.
+    // Made once: everything it holds is held for the app's life.
     let sign_out = {
         let live = live.clone();
         let media = media.clone();
         let calls = calls.clone();
-        Callback::from(move |revoke: bool| {
+        use_callback((), move |revoke: bool, _| {
             // A call does not outlive the session it was placed in, and the
             // other side is owed the reason rather than a silence.
             calls.end();
@@ -280,10 +282,18 @@ fn app() -> Html {
         use_effect_with((), move |_| {
             let heard = Closure::<dyn Fn(web_sys::StorageEvent)>::new(
                 move |event: web_sys::StorageEvent| {
-                    let me = live.read(|state| state.store.my_user_id);
-                    if me != 0 && event.key() == Some(session::board_marks_key(me)) {
-                        let kept = session::board_marks(me);
-                        live.now(|state| state.store.board.take_marks(me, kept));
+                    let (me, family) = live
+                        .read(|state| (state.store.my_user_id, state.store.current_family_id()));
+                    let Some(family_id) = family.filter(|_| me != 0) else {
+                        return;
+                    };
+                    if event.key() == Some(session::board_marks_key(me, family_id)) {
+                        let kept = session::board_marks(me, family_id, false);
+                        live.now(|state| {
+                            if let Some(board) = state.store.board_mut(family_id) {
+                                board.take_marks(me, kept);
+                            }
+                        });
                     }
                 },
             );
@@ -331,15 +341,29 @@ fn app() -> Html {
         });
     }
 
-    let on_action = Actions {
-        live: live.clone(),
-        channels: channels.clone(),
-        sign_out: sign_out.clone(),
-        last_typing,
-        media: media.clone(),
-        calls: calls.clone(),
-    }
-    .callback();
+    // ONE callback for the app's life — everything `Actions` holds is held
+    // for it. Made afresh on every draw, it was a new prop for every pane
+    // and every bubble on every draw of the app, which is after every
+    // change to the state: nothing below could ever be left as it was.
+    let on_action = {
+        let live = live.clone();
+        let channels = channels.clone();
+        let sign_out = sign_out.clone();
+        let media = media.clone();
+        let calls = calls.clone();
+        (*use_memo((), move |_| {
+            Actions {
+                live,
+                channels,
+                sign_out,
+                last_typing,
+                media,
+                calls,
+            }
+            .callback()
+        }))
+        .clone()
+    };
 
     // The board, while it is the pane in front: shown whenever what it
     // shows changes — a note arriving, a note rewritten; never a drag, which
@@ -361,7 +385,15 @@ fn app() -> Html {
     }
 
     let now = sync::wall_ms();
-    let state = live.read(|state| state.clone());
+    // To the minute, for what reads the clock by the day (the day pills):
+    // a day starts on a minute, and a prop that changes on every draw is a
+    // pane drawn again on every draw.
+    let now_minute = (now / 60_000.0).floor() as i64;
+    // The state is LOOKED AT for this draw, not copied: everything below
+    // only reads it, and nothing here changes it — a change goes through
+    // `Live`, from a callback or a task, never from a draw. A copy took
+    // every chat's every message, the board, the outbox… on every draw.
+    let state = live.borrow();
     let store = &state.store;
     let sign_out_click = {
         let confirming = confirming_sign_out.clone();
@@ -412,10 +444,10 @@ fn app() -> Html {
                 {root_id}
                 messages={view.thread.messages.clone()}
                 my_user_id={store.my_user_id}
-                is_family_chat={item.is_some_and(|item| item.chat.is_family())}
-                is_ai_chat={item.is_some_and(|item| item.chat.is_ai())}
+                chat_kind={item.map(|item| AttrValue::from(item.chat.kind.clone())).unwrap_or_default()}
                 names={store.names.clone()}
                 members={store.members.clone()}
+                chat_members={item.map(|item| item.chat.members_of(&store.members)).unwrap_or_default()}
                 assistant={store.assistant.clone()}
                 blocked={store.blocked.clone()}
                 revealed={store.revealed.clone()}
@@ -430,6 +462,11 @@ fn app() -> Html {
             />
         }
     } else if let Some(open) = &store.open_polls {
+        // A group's polls count the group (docs/protocol.md, "Groups").
+        let counted = store
+            .item(open.chat_id)
+            .map(|item| item.chat.members_of(&store.members))
+            .unwrap_or_else(|| store.members.clone());
         html! {
             <OpenPollsPanel
                 messages={open.messages.clone()}
@@ -437,8 +474,9 @@ fn app() -> Html {
                 names={store.names.clone()}
                 blocked={store.blocked.clone()}
                 revealed={store.revealed.clone()}
-                member_count={store.members.len()}
-                member_ids={store.members.iter().map(|member| member.id).collect::<std::collections::HashSet<i64>>()}
+                chat_kind={store.item(open.chat_id).map(|item| AttrValue::from(item.chat.kind.clone())).unwrap_or_default()}
+                member_count={counted.len()}
+                member_ids={counted.iter().map(|member| member.id).collect::<std::collections::HashSet<i64>>()}
                 {assistant_user_id}
                 on_action={on_action.clone()}
             />
@@ -511,11 +549,15 @@ fn app() -> Html {
         .is_some()
         .then(|| panel_button(Panel::Settings, t("Settings")));
     let close_panel = on_action.reform(|_: ()| Action::ClosePanel);
+    let families = families_of(store);
     let panel = match (state.panel, store.account.clone(), store.family.clone()) {
         (Some(Panel::Settings), Some(account), family) => Some(html! {
             <SettingsPane
                 {account}
                 {family}
+                several={store.families.len() > 1}
+                new_family={families.new_family}
+                join_another={families.join_another}
                 assistant={store.assistant.clone()}
                 roster_changes={store.roster_changes}
                 on_action={on_action.clone()}
@@ -538,6 +580,18 @@ fn app() -> Html {
                 support_contact={store.support_contact.clone()}
                 pack={store.pack.limits.map(|limits| (store.pack.listed(), limits))}
                 pack_adding={store.pack.adding}
+                invitable={store.invitable()}
+                other_families={store.families.len() > 1}
+                sent_invitations={store.sent_invitations.clone()}
+                on_action={on_action.clone()}
+                on_close={close_panel.clone()}
+            />
+        }),
+        (Some(panel @ (Panel::NewFamily | Panel::JoinFamily)), Some(account), _) => Some(html! {
+            <AnotherFamilyPane
+                join={panel == Panel::JoinFamily}
+                max_families={actions::max_families(store)}
+                may_start={account.may_start_family()}
                 on_action={on_action.clone()}
                 on_close={close_panel.clone()}
             />
@@ -557,6 +611,12 @@ fn app() -> Html {
             />
         }
     });
+
+    // What the pane beside the list is: a pane or the board in front, a
+    // conversation, or nothing yet.
+    let in_front = panel.is_some() || (state.board_open && store.family.is_some());
+    let reading = !in_front && open_item.is_some();
+    let listing = !in_front && open_item.is_none();
 
     html! {
         <ContextProvider<Calls> context={calls.clone()}>
@@ -602,7 +662,17 @@ fn app() -> Html {
                     <button class="link" onclick={dismiss} aria-label={t("Dismiss")}>{ "✕" }</button>
                 </LiveRegion>
             }
-            <div class={classes!("split", (store.thread_view.is_some() || store.open_polls.is_some()).then_some("with-panel"))}>
+            // Below the two panes ONE surface at a time (#106, section 3):
+            // the list, or the conversation it opened — which has the way
+            // back in its header — never the list as a band above the chat.
+            // The board and the panes keep the list above them: the list is
+            // their way out.
+            <div class={classes!(
+                "split",
+                (store.thread_view.is_some() || store.open_polls.is_some()).then_some("with-panel"),
+                reading.then_some("is-reading"),
+                listing.then_some("is-listing"),
+            )}>
                 <ChatList
                     chats={store.sorted_chats()}
                     names={store.names.clone()}
@@ -612,6 +682,10 @@ fn app() -> Html {
                     selected={state.open_chat}
                     on_select={on_action.reform(Action::SelectChat)}
                     now_ms={now}
+                    members={store.family.is_some().then(|| store.members.clone())}
+                    on_action={on_action.clone()}
+                    {families}
+                    unpaid={store.family.as_ref().and_then(|family| views::chat_list::unpaid_banner(family, &store.members, now))}
                 />
                 if let Some(panel) = panel {
                     { panel }
@@ -639,7 +713,7 @@ fn app() -> Html {
                         blocked={store.blocked.clone()}
                         revealed={store.board.revealed.clone()}
                         pinning={store.board.pinning}
-                        now_minute={(now / 60_000.0).floor() as i64}
+                        {now_minute}
                         on_action={on_action.clone()}
                     />
                 } else if let Some(item) = open_item {
@@ -676,7 +750,7 @@ fn app() -> Html {
                         agreed_to_assistant={store.assistant_consent_at().is_some()}
                         transcripts={store.transcripts.clone()}
                         on_action={on_action.clone()}
-                        now_ms={now}
+                        now_ms={now_minute as f64 * 60_000.0}
                         round={store.round}
                         item={item.clone()}
                     />
@@ -712,6 +786,38 @@ fn app() -> Html {
         </QuietRoot>
         </ContextProvider<MediaLoader>>
         </ContextProvider<Calls>>
+    }
+}
+
+/// What the switcher draws (docs/protocol.md, "Several families"): every
+/// family with the unread of the chats listed in it, the join requests and
+/// invitations waiting, and which ways to another family are open.
+fn families_of(store: &store::Store) -> Families {
+    let account = store.account.as_ref();
+    let count = store.families.len();
+    let max = account.and_then(|account| account.max_families_per_account);
+    Families {
+        rows: store
+            .family_list()
+            .into_iter()
+            .map(|family| FamilyRow {
+                id: family.id,
+                unread: store.unread_in(family.id),
+                name: family.name,
+            })
+            .collect(),
+        current: store.current_family_id(),
+        invitations: store.invitations.clone(),
+        pending: account
+            .map(|account| account.pending_join_requests.clone())
+            .unwrap_or_default(),
+        new_family: fc_text::families::offers_new_family(
+            account.is_some_and(|account| account.member_families_enabled),
+            store.owns_a_family(),
+            count,
+            max,
+        ),
+        join_another: fc_text::families::offers_join_another(count, max),
     }
 }
 

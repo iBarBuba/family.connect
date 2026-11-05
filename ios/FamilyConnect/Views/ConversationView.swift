@@ -111,6 +111,8 @@ struct ConversationView: View {
     @Query private var chats: [ChatEntity]
     @Query private var members: [MemberEntity]
     @State private var model = ConversationModel()
+    /// The composer's emoji as you type (#101): its live swap.
+    @State private var emojiTyping = EmojiTypingField()
     /// The open-polls surface, reached from this chat's toolbar.
     @State private var showsOpenPolls = false
     /// The chain open on its own sheet (docs/protocol.md, "Threads").
@@ -187,6 +189,15 @@ struct ConversationView: View {
     /// smallest.
     @ScaledMetric(relativeTo: .body) private var attachGlyph: CGFloat = 20
     @ScaledMetric(relativeTo: .body) private var sendGlyph: CGFloat = 26
+    /// The width of a glyph INSIDE the field — the stickers, the video
+    /// button, the paintbrush (#106). Narrower than a row control because
+    /// the capsule's own padding is its margin; its height is the row
+    /// control's, so it sits centred on the field's line.
+    @ScaledMetric(relativeTo: .body) private var fieldGlyph: CGFloat = 30
+    /// The shortest text run the field keeps beside the paperclip and the
+    /// slot before it takes a line of its own — the same seven-odd
+    /// characters at every text size (`ComposerRow.shortestTextRun`).
+    @ScaledMetric(relativeTo: .body) private var shortestTextRun: CGFloat = ComposerRow.shortestTextRun
 
     /// Live height of the input bar; changes exactly when the draft wraps
     /// to more (or fewer) lines.
@@ -381,11 +392,16 @@ struct ConversationView: View {
     }
 
     private var chat: ChatEntity? { chats.first }
-    private var isFamilyChat: Bool { chat?.kind == "family" }
+    /// The family chat or a group — the one surface they share: sender
+    /// names, member mentions, polls, `@ai`, and no "seen" tick
+    /// (docs/protocol.md, "Groups"; `ChatRules`).
+    private var isFamilyOrGroup: Bool { ChatRules.isFamilyOrGroup(chat?.kind) }
 
-    /// Whether there is somebody to ring from here.
+    /// Whether there is somebody to ring from here. A direct chat only — a
+    /// group has no single person to ring and the protocol has no group
+    /// calls (`ChatRules.offersCalls`).
     private var canCall: Bool {
-        session.callsEnabled && chat?.kind == "direct" && chat?.peerUserID != nil
+        session.callsEnabled && ChatRules.offersCalls(chat?.kind) && chat?.peerUserID != nil
             // The blocker calling somebody they blocked is refused with
             // `blocked`, so the button does not offer it. Defence in depth
             // behind the direct-chat prune: if the prune landed this is
@@ -426,25 +442,31 @@ struct ConversationView: View {
     // MARK: - Member mentions (docs/protocol.md, "Mentioning a member")
 
     /// Everybody a mention may name: the current roster, by the name the
-    /// app calls them.
+    /// app calls them — in a group, only its own members (`ChatRules`).
     private var mentionRoster: [MentionDTO] {
-        members.filter { !$0.hasLeft && !$0.accountDeleted }
-            .map { MentionDTO(userID: $0.userID, name: $0.resolvedDisplayName) }
+        ChatRules.mentionRoster(
+            members.filter { !$0.hasLeft && !$0.accountDeleted }
+                .map { MentionDTO(userID: $0.userID, name: $0.resolvedDisplayName) },
+            kind: chat?.kind,
+            groupMemberIDs: chat?.groupMemberIDs ?? [])
     }
 
-    /// What the strip offers for the prefix being typed: never the reader
-    /// themself, never the blocked, and never the assistant — which is not
-    /// in the roster and has its own button.
-    private func mentionCandidates(matching query: String) -> [MentionDTO] {
-        MemberMentions.candidates(
+    /// What the strip offers for the prefix being typed: the assistant
+    /// FIRST where it is offered (#106 — its button left the row, and this
+    /// is where people look for it), then the roster: never the reader
+    /// themself, never the blocked. Picking the assistant writes `@ai `.
+    private func mentionCandidates(matching query: String) -> [MentionSuggestion] {
+        MemberMentions.suggestions(
             in: mentionRoster, matching: query,
-            excluding: coordinator.blockedUserIDs.union([currentUserID]))
+            excluding: coordinator.blockedUserIDs.union([currentUserID]),
+            assistantName: offersAssistant
+                ? (AppSettings.assistantName ?? String(localized: "Assistant")) : nil)
     }
 
-    /// The members the text names, resolved at send — family chat only,
-    /// nil when it names nobody so the wire stays as it was.
+    /// The members the text names, resolved at send — the family chat or a
+    /// group only, nil when it names nobody so the wire stays as it was.
     private func resolvedMentions(in body: String) -> [MentionDTO]? {
-        guard isFamilyChat else { return nil }
+        guard isFamilyOrGroup else { return nil }
         let found = MemberMentions.resolve(body: body, roster: mentionRoster)
         return found.isEmpty ? nil : found
     }
@@ -469,25 +491,6 @@ struct ConversationView: View {
     private func openThread(serverID: Int64?, threadRootID: Int64?) {
         guard let serverID else { return }
         threadTarget = ThreadTarget(chatID: chatID, rootID: threadRootID ?? serverID)
-    }
-
-    /// How many open polls in this chat this reader still has to answer —
-    /// the badge on the toolbar entry point (OpenPollsBadge, shared with the
-    /// Mac and mirrored on Android).
-    ///
-    /// Computed from what this device already holds rather than from the
-    /// endpoint: the badge must be right the moment the chat opens, and a
-    /// request per open would be a request per open. The polls it has are
-    /// the polls the chat has synced, which is what the reader is looking at.
-    private var openPollsToAnswer: Int {
-        // A poll by somebody this reader has blocked is a hidden row on the
-        // surface and counts toward nothing: a badge is a claim that there
-        // is something for them to answer, and a question they chose not to
-        // see is not one (protocol.md, "Finding the open ones").
-        let me = currentUserID
-        let blocked = coordinator.blockedUserIDs
-        let visible = messages.filter { $0.senderID == me || !blocked.contains($0.senderID) }
-        return OpenPollsBadge.count(polls: visible.compactMap(\.poll), currentUserID: me)
     }
 
     /// How many of the locally cached messages are RENDERED. The thread
@@ -524,11 +527,21 @@ struct ConversationView: View {
     /// window exists to prevent, and starting the window MUCH wider (which
     /// is what an anchored open does) makes it materially worse.
     private static let maxWindow = 300
-    /// The readable column the thread's content is capped to (#21/#44),
-    /// named because the floating jump-to-newest button has to line up
-    /// with the SAME column — see the overlay for why that is not a
-    /// cosmetic choice.
-    static let threadMaxWidth: CGFloat = 560
+    /// The cap on the centred container that holds the thread's column
+    /// (#21/#44, widened by #106), named because the floating
+    /// jump-to-newest button and the composer have to line up with the SAME
+    /// column — see the overlay for why that is not a cosmetic choice.
+    ///
+    /// It is the column, 1024, plus the 12-pt inset each container pads
+    /// inside it, so what is left for content is `min(pane − 24, 1024)`
+    /// (`ComposerRow.column`) with no measured width anywhere: on a 13"
+    /// iPad in landscape with the sidebar shown (a 1056-pt detail) the
+    /// column is 1024, and every iPhone is narrower than the cap, so its
+    /// column is the pane less the inset it always had. #44's 560 used to
+    /// be here, and squeezed the iPad's composer to 360 points; it lives on
+    /// as the BUBBLE's cap (`MessageBubbleView`), which is where its
+    /// concern — a phone-sized card inside a pane-wide balloon — was.
+    static let threadMaxWidth: CGFloat = ComposerRow.containerCap()
 
     private var visibleMessages: ArraySlice<MessageEntity> {
         messages.suffix(visibleCount)
@@ -545,8 +558,13 @@ struct ConversationView: View {
         // the quote's excerpt is a cut of a body the circle does not have.
         let snapshots = visibleMessages.map { MessageSnapshot($0) }
         let roundIDs = MessagePresentation.roundMessageIDs(snapshots)
+        // ...and one quoting an animation with no caption says "GIF" (#96).
+        let animationIDs = MessagePresentation.animationMessageIDs(snapshots)
         return MessagePresentation.daySections(
-            snapshots.map { MessagePresentation.namingRoundQuotes($0, roundIDs: roundIDs) },
+            snapshots.map {
+                MessagePresentation.namingRoundQuotes(
+                    $0, roundIDs: roundIDs, animationIDs: animationIDs)
+            },
             firstUnreadID: unreadDividerServerID)
     }
 
@@ -554,10 +572,13 @@ struct ConversationView: View {
     /// excerpt, or "Video message" for a circle, which has no words.
     private func quoteWord(_ quote: ReplyToDTO) -> String {
         guard quote.excerpt.isEmpty,
-              let quoted = messages.first(where: { $0.serverID == quote.messageID }),
-              MessagePresentation.isRoundVideo(MessageSnapshot(quoted))
+              let quoted = messages.first(where: { $0.serverID == quote.messageID })
         else { return quote.excerpt }
-        return String(localized: "Video message")
+        let snapshot = MessageSnapshot(quoted)
+        if MessagePresentation.isRoundVideo(snapshot) { return String(localized: "Video message") }
+        // An animation with no caption says "GIF" (#96).
+        if MessagePresentation.isAnimation(snapshot) { return String(localized: "GIF") }
+        return quote.excerpt
     }
 
     /// "Open Full Screen" on a video message: the existing viewer, with
@@ -580,6 +601,12 @@ struct ConversationView: View {
     private var unreadDividerCount: Int? {
         if case .unread(_, let count) = openAnchor { return count }
         return nil
+    }
+
+    /// What the link-card and drawing pin hook watches: either counter
+    /// moving means a bubble's art landed and its height changed.
+    private var bubbleArtGenerations: [Int] {
+        [previewLoader.generation, RichRenderer.shared.generation]
     }
 
     /// Is the floating jump-to-newest button up? The rule is shared with
@@ -652,14 +679,16 @@ struct ConversationView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.top, 8)
-                // A readable column on a big screen, the second half of
-                // #21. The CONTAINER is capped, never the bubble: the
-                // greedy-frame ordering question stays out of
-                // MessageBubbleView (which has shipped a full-width-slab
-                // regression twice) and ReplyBalloonLayout — shared with
-                // macOS, carrying no #if os(iOS) — is untouched. 560 sits
-                // above every iPhone PORTRAIT width, so the bubble subtree
-                // there sees exactly the proposal it ships with today.
+                // The conversation column on a big screen (#21, #44, #106):
+                // min(pane − 24, 1024), centred — see `threadMaxWidth`. The
+                // container sets the COLUMN; the bubble's own 560 cap sits
+                // OUTSIDE its balloon in MessageBubbleView, so the
+                // greedy-frame question that shipped a full-width slab
+                // twice stays out of the balloon, and ReplyBalloonLayout —
+                // shared with macOS, carrying no #if os(iOS) — is
+                // untouched. The cap is above every iPhone width, so the
+                // bubble subtree there sees exactly the proposal it always
+                // had.
                 .frame(maxWidth: Self.threadMaxWidth)
                 .frame(maxWidth: .infinity)
             }
@@ -782,11 +811,14 @@ struct ConversationView: View {
                     || (!hasSettled && !opensInHistory) else { return }
                 pinToBottom(proxy, animated: true)
             }
-            .onChange(of: previewLoader.generation) {
-                // A link-preview card just landed: the bubble hosting it
-                // grew, and a bubble above the viewport growing slides
-                // the visible region into older content — same problem
-                // as reaction catch-up below, same repair.
+            .onChange(of: bubbleArtGenerations) {
+                // A link-preview card just landed, or a formula, a diagram
+                // or a graph was drawn in place of its source (#97): the
+                // bubble hosting it changed height, and a bubble above the
+                // viewport growing slides the visible region into older
+                // content — same problem as reaction catch-up below, same
+                // repair. One hook for both, not two: this chain is at the
+                // length where CI's type checker gives up on `body`.
                 guard isPinnedToBottom else { return }
                 pinToBottom(proxy, animated: false)
             }
@@ -998,23 +1030,15 @@ struct ConversationView: View {
         .toolbar {
             // Title + typing subtitle in the fixed-height nav bar: the
             // indicator can come and go without moving any chat content
-            // (see the header comment; Android shows it the same way).
+            // (see the header comment; Android shows it the same way). In a
+            // group the title is the way into Group Info (GroupViews.swift),
+            // which carries its own sheet so nothing is added to this chain.
             ToolbarItem(placement: .principal) {
-                VStack(spacing: 0) {
-                    Text(chat?.title ?? "")
-                        .font(.headline)
-                        .lineLimit(1)
-                    if let typingLine {
-                        // One line: three people typing at once wrapped
-                        // the caption and pushed the title off its bar.
-                        Text(typingLine)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .transition(.opacity)
-                    }
-                }
-                .animation(.easeInOut(duration: 0.15), value: typingLine)
+                ConversationHeaderTitle(
+                    chatID: chatID,
+                    title: chat?.title ?? "",
+                    isGroup: chat?.kind == ChatRules.group,
+                    typingLine: typingLine)
             }
             // A direct chat's peer can be rung (docs/protocol.md, "Voice
             // calls"); the family chat has no single person to ring, and
@@ -1050,10 +1074,10 @@ struct ConversationView: View {
                 }
             }
             // The way back to a decision the family has scrolled past
-            // (docs/protocol.md, "Finding the open ones"). Family chat only,
-            // because polls exist nowhere else — which is also why this slot
-            // was empty here: `canCall` is false in the family chat, so it
-            // had no trailing item at all.
+            // (docs/protocol.md, "Finding the open ones"). The family chat
+            // or a group only, because polls exist nowhere else — which is
+            // also why this slot was empty here: `canCall` is false in both,
+            // so it had no trailing item at all.
             //
             // The badge counts open polls THIS READER has not voted in,
             // derived from the votes already on every poll (OpenPollsBadge).
@@ -1061,32 +1085,11 @@ struct ConversationView: View {
             // everything, until somebody else closes them, and a badge that
             // cannot be cleared by doing the thing it asks for stops meaning
             // anything within a day.
-            if chat?.kind == "family" {
+            if ChatRules.offersPolls(chat?.kind) {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showsOpenPolls = true
-                    } label: {
-                        // The count is drawn BY HAND. `.badge` on a toolbar
-                        // item renders only on iOS 26 / macOS 26, and this
-                        // app deploys to iOS 17 — on every earlier OS it is
-                        // silently nothing, and the whole OpenPollsBadge
-                        // apparatus would have computed a number nobody saw.
-                        // The capsule is the chat list's own unread badge.
-                        Image(systemName: "chart.bar.doc.horizontal")
-                            .overlay(alignment: .topTrailing) {
-                                if openPollsToAnswer > 0 {
-                                    Text("\(openPollsToAnswer)")
-                                        .font(.caption2.bold())
-                                        .foregroundStyle(.white)
-                                        .padding(.horizontal, 5)
-                                        .padding(.vertical, 1)
-                                        .background(.tint, in: Capsule())
-                                        .offset(x: 9, y: -8)
-                                }
-                            }
-                    }
-                    .accessibilityLabel("Open polls")
-                    .accessibilityValue(openPollsToAnswer > 0 ? Text("\(openPollsToAnswer) to answer") : Text(""))
+                    // Counts from its own narrow query, once per pass of its
+                    // own body (OpenPollsToolbarButton says why).
+                    OpenPollsToolbarButton(chatID: chatID) { showsOpenPolls = true }
                 }
             }
         }
@@ -1190,7 +1193,8 @@ struct ConversationView: View {
                     continue
                 }
                 do {
-                    let prepared = try await MediaPrep.prepare(fileAt: url, limit: MediaPrep.sizeLimit)
+                    let prepared = try await MediaPrep.prepare(
+                        fileAt: url, limit: MediaPrep.sizeLimit, animates: !isAssistantChat)
                     // `prepare` may hand back the source itself (a video
                     // that goes as it is — within the profile, or after a
                     // transcode that failed or did not help); only delete
@@ -1214,162 +1218,240 @@ struct ConversationView: View {
         }
     }
 
+    /// What every row of one pass looks up, computed ONCE per pass.
+    ///
+    /// Each of these used to be a computed property read from inside the
+    /// row builder — so for a window of N rows, every pass of the body
+    /// rebuilt the name and picture dictionaries N times over, scanned the
+    /// roster linearly for each sender, and read the current user and the
+    /// assistant's id out of UserDefaults per row. Over a window widened
+    /// across a few hundred unread rows that was the bulk of a pass. The
+    /// answers cannot differ between two rows of the same pass, so they are
+    /// taken once, here, and handed down.
+    private struct RowLookups {
+        let currentUserID: Int64
+        /// The coordinator's idea of the reader, which the assistant-chat
+        /// naming rule has always compared against.
+        let coordinatorUserID: Int64
+        /// userID → display name and → picture version, first row wins —
+        /// the same answer `members.first(where:)` gave.
+        let names: [Int64: String]
+        let avatarVersions: [Int64: Int64]
+        let memberCount: Int
+        let blocked: Set<Int64>
+        let isFamilyOrGroup: Bool
+        let isAssistantChat: Bool
+        let assistantChatTitle: String?
+        let assistantID: Int64?
+        let assistantName: String?
+        let othersReadUpTo: Int64
+        let canCall: Bool
+
+        /// `ConversationView.displayName(for:)`, from the precomputed table.
+        func displayName(for userID: Int64) -> String? {
+            if isAssistantChat, userID != coordinatorUserID {
+                return assistantChatTitle
+            }
+            if let assistantID, userID == assistantID {
+                return assistantName
+            }
+            return names[userID]
+        }
+    }
+
+    private var rowLookups: RowLookups {
+        RowLookups(
+            currentUserID: currentUserID,
+            coordinatorUserID: coordinator.currentUserID,
+            names: memberNames,
+            avatarVersions: avatarVersions,
+            memberCount: familyMemberCount,
+            blocked: coordinator.blockedUserIDs,
+            isFamilyOrGroup: isFamilyOrGroup,
+            isAssistantChat: isAssistantChat,
+            assistantChatTitle: chat?.title,
+            assistantID: AppSettings.assistantUserID,
+            assistantName: AppSettings.assistantName,
+            othersReadUpTo: chat?.othersReadUpTo ?? 0,
+            canCall: canCall)
+    }
+
     /// The message rows — split out so the scroll container above stays
     /// type-checkable at a glance.
     @ViewBuilder
     private func bubbleRows(proxy: ScrollViewProxy) -> some View {
-                    ForEach(sections) { section in
-                        DayPill(day: section.day)
-                            .padding(.vertical, 6)
-                        ForEach(Array(section.messages.enumerated()), id: \.element.id) { index, message in
-                            // "N new messages", above the oldest message
-                            // this reader has not seen. Which row that is
-                            // comes from the section (one shared builder
-                            // for both Apple threads); the count is the
-                            // one captured at open.
-                            if section.unreadDividerAbove == message.localID,
-                                let unreadDividerCount {
-                                UnreadDivider(count: unreadDividerCount)
-                                    .id(UnreadDivider.scrollID)
-                            }
-                            MessageBubbleView(
-                                message: message,
-                                isMine: message.senderID == currentUserID,
-                                isStreaming: coordinator.isAwaitingAssistant(
-                                    message, isAssistantChat: isAssistantChat),
-                                assistantFailure: message.serverID.flatMap {
-                                    coordinator.assistantFailure(messageID: $0)
-                                },
-                                showsSenderName: MessagePresentation.showsSenderName(
-                                    at: index,
-                                    in: section.messages,
-                                    isFamilyChat: isFamilyChat,
-                                    currentUserID: currentUserID,
-                                    blockedUserIDs: coordinator.blockedUserIDs),
-                                senderName: displayName(for: message.senderID),
-                                senderID: message.senderID,
-                                senderAvatarVersion: avatarVersion(for: message.senderID),
-                                // The Mac's run rule (MacConversationView.rows):
-                                // a run is one sender's consecutive messages
-                                // within the day section.
-                                isRunStart: index == 0
-                                    || section.messages[index - 1].senderID != message.senderID,
-                                isRunEnd: index == section.messages.count - 1
-                                    || section.messages[index + 1].senderID != message.senderID,
-                                isRead: MessagePresentation.isRead(
-                                    message,
-                                    othersReadUpTo: chat?.othersReadUpTo ?? 0,
-                                    isFamilyChat: isFamilyChat),
-                                reactionChips: MessagePresentation.reactionChips(
-                                    message.reactions,
-                                    currentUserID: currentUserID),
-                                reactionDetails: MessagePresentation.reactionDetails(
-                                    message.reactions,
-                                    names: memberNames,
-                                    currentUserID: currentUserID,
-                                    // The CHIPS above are deliberately not
-                                    // given this: their count must not move.
-                                    blockedUserIDs: coordinator.blockedUserIDs),
-                                avatarVersions: avatarVersions,
-                                memberNames: memberNames,
-                                currentUserID: currentUserID,
-                                onTapQuote: { jumpToMessage($0, proxy: proxy) },
-                                onTapMention: { openMember($0) },
-                                replyCount: message.replyCount,
-                                onOpenThread: {
-                                    openThread(serverID: message.serverID, threadRootID: message.threadRootID)
-                                },
-                                onOpenAttachment: { attachment in
-                                    if MessagePresentation.isSticker(message) {
-                                        viewingSticker = attachment
-                                    } else if MessagePresentation.isRoundVideo(message) {
-                                        // A tap plays a circle in place;
-                                        // this is its "Open Full Screen"
-                                        // (#79, S5.4).
-                                        openFullScreen(message)
-                                    } else if attachment.isFile {
-                                        openFile(attachment)
-                                    } else {
-                                        // The whole message's media, opened
-                                        // at the one that was tapped — the
-                                        // viewer pages through the rest.
-                                        let media = AttachmentAlbum.media(of: message.attachments)
-                                        let index = media.firstIndex { $0.id == attachment.id } ?? 0
-                                        viewingAlbum = AttachmentAlbum(items: media, index: index)
-                                    }
-                                },
-                                onVote: { optionID in
-                                    Task {
-                                        await coordinator.vote(
-                                            localID: message.localID, optionID: optionID)
-                                    }
-                                },
-                                onClosePoll: {
-                                    Task { await coordinator.closePoll(localID: message.localID) }
-                                },
-                                memberCount: familyMemberCount,
-                                onCallBack: canCall ? { startCall() } : nil,
-                                onRetry: { coordinator.retry(localID: message.localID) },
-                                onDelete: { coordinator.deleteLocalMessage(localID: message.localID) },
-                                onToggleReaction: { emoji in
-                                    toggleReaction(localID: message.localID, emoji: emoji)
-                                },
-                                onLongPress: {
-                                    // Nothing to offer on a pending bubble:
-                                    // no server id to react to, no failure
-                                    // to retry.
-                                    guard message.serverID != nil || message.state == .failed else { return }
-                                    // A hidden row opens nothing. One
-                                    // missing clause here is three leaks
-                                    // at once: the capsule floats over a
-                                    // placeholder, Copy puts the blocked
-                                    // body on the pasteboard, and Share
-                                    // hands the blocked attachment to the
-                                    // share sheet. Reveal is a TAP.
-                                    guard
-                                        !MessagePresentation.isHiddenByBlock(
-                                            message,
-                                            blockedUserIDs: coordinator.blockedUserIDs,
-                                            currentUserID: currentUserID)
-                                            || revealedMessageIDs.contains(message.localID)
-                                    else { return }
-                                    withAnimation(.spring(duration: 0.3, bounce: 0.25)) {
-                                        reactionPickerID = message.localID
-                                    }
-                                },
-                                publishesAnchor: reactionPickerID == message.localID,
-                                blockedUserIDs: coordinator.blockedUserIDs,
-                                isHiddenByBlock: MessagePresentation.isHiddenByBlock(
-                                    message,
-                                    blockedUserIDs: coordinator.blockedUserIDs,
-                                    currentUserID: currentUserID),
-                                isRevealed: revealedMessageIDs.contains(message.localID),
-                                // Never persisted, never sent, never
-                                // written to SwiftData: a peek is not a
-                                // fact anybody else may read.
-                                onReveal: { revealedMessageIDs.insert(message.localID) },
-                                isReplyQuoteRevealed: revealedQuoteIDs.contains(
-                                    "\(message.localID)#reply"),
-                                isParentQuoteRevealed: revealedQuoteIDs.contains(
-                                    "\(message.localID)#parent"),
-                                onRevealQuote: { level in
-                                    revealedQuoteIDs.insert(
-                                        level == .reply
-                                            ? "\(message.localID)#reply"
-                                            : "\(message.localID)#parent")
-                                })
-                                .id(message.localID)
-                                // A jumped-to bubble is briefly tinted, so
-                                // the eye lands on the right one in a wall
-                                // of text.
-                                .background(
-                                    RoundedRectangle(cornerRadius: 12)
-                                        .fill(Color.accentColor.opacity(
-                                            highlightedMessageID == message.localID ? 0.14 : 0))
-                                        .padding(.horizontal, -4))
-                                .animation(.easeOut(duration: 0.25), value: highlightedMessageID)
-                        }
+        let lookups = rowLookups
+        ForEach(sections) { section in
+            DayPill(day: section.day)
+                .padding(.vertical, 6)
+            ForEach(Array(section.messages.enumerated()), id: \.element.id) { index, message in
+                // "N new messages", above the oldest message
+                // this reader has not seen. Which row that is
+                // comes from the section (one shared builder
+                // for both Apple threads); the count is the
+                // one captured at open.
+                if section.unreadDividerAbove == message.localID,
+                    let unreadDividerCount {
+                    UnreadDivider(count: unreadDividerCount)
+                        .id(UnreadDivider.scrollID)
+                }
+                bubbleRow(message, index: index, rows: section.messages, lookups: lookups, proxy: proxy)
+            }
+        }
+    }
+
+    /// One row: the bubble, its scroll id and the jump highlight.
+    ///
+    /// `.equatable()` is what lets SwiftUI SKIP a row whose inputs did not
+    /// change. Without it every bubble's body re-ran on every pass of the
+    /// thread — a message arriving, a reaction landing, the typing line —
+    /// because a bubble takes a dozen closures and SwiftUI cannot compare
+    /// closures, so it never knew a row was unchanged. `MessageBubbleView`'s
+    /// `==` compares every input that is not a closure, and the closures
+    /// built here read only the message (part of that comparison) and this
+    /// view's state through its storage, which is always current — so a
+    /// skipped row's closures do the same thing a rebuilt row's would.
+    private func bubbleRow(
+        _ message: MessageSnapshot, index: Int, rows: [MessageSnapshot],
+        lookups: RowLookups, proxy: ScrollViewProxy
+    ) -> some View {
+            MessageBubbleView(
+                message: message,
+                isMine: message.senderID == lookups.currentUserID,
+                isStreaming: coordinator.isAwaitingAssistant(
+                    message, isAssistantChat: lookups.isAssistantChat),
+                assistantFailure: message.serverID.flatMap {
+                    coordinator.assistantFailure(messageID: $0)
+                },
+                showsSenderName: MessagePresentation.showsSenderName(
+                    at: index,
+                    in: rows,
+                    isFamilyOrGroup: lookups.isFamilyOrGroup,
+                    currentUserID: lookups.currentUserID,
+                    blockedUserIDs: lookups.blocked),
+                senderName: lookups.displayName(for: message.senderID),
+                senderID: message.senderID,
+                senderAvatarVersion: lookups.avatarVersions[message.senderID] ?? 0,
+                // The Mac's run rule (MacConversationView.rows):
+                // a run is one sender's consecutive messages
+                // within the day section.
+                isRunStart: index == 0
+                    || rows[index - 1].senderID != message.senderID,
+                isRunEnd: index == rows.count - 1
+                    || rows[index + 1].senderID != message.senderID,
+                isRead: MessagePresentation.isRead(
+                    message,
+                    othersReadUpTo: lookups.othersReadUpTo,
+                    isFamilyOrGroup: lookups.isFamilyOrGroup),
+                reactionChips: MessagePresentation.reactionChips(
+                    message.reactions,
+                    currentUserID: lookups.currentUserID),
+                reactionDetails: MessagePresentation.reactionDetails(
+                    message.reactions,
+                    names: lookups.names,
+                    currentUserID: lookups.currentUserID,
+                    // The CHIPS above are deliberately not
+                    // given this: their count must not move.
+                    blockedUserIDs: lookups.blocked),
+                avatarVersions: lookups.avatarVersions,
+                memberNames: lookups.names,
+                currentUserID: lookups.currentUserID,
+                onTapQuote: { jumpToMessage($0, proxy: proxy) },
+                onTapMention: { openMember($0) },
+                replyCount: message.replyCount,
+                onOpenThread: {
+                    openThread(serverID: message.serverID, threadRootID: message.threadRootID)
+                },
+                onOpenAttachment: { attachment in
+                    if MessagePresentation.isSticker(message) {
+                        viewingSticker = attachment
+                    } else if MessagePresentation.isRoundVideo(message) {
+                        // A tap plays a circle in place;
+                        // this is its "Open Full Screen"
+                        // (#79, S5.4).
+                        openFullScreen(message)
+                    } else if attachment.isFile {
+                        openFile(attachment)
+                    } else {
+                        // The whole message's media, opened
+                        // at the one that was tapped — the
+                        // viewer pages through the rest.
+                        let media = AttachmentAlbum.media(of: message.attachments)
+                        let index = media.firstIndex { $0.id == attachment.id } ?? 0
+                        viewingAlbum = AttachmentAlbum(items: media, index: index)
                     }
+                },
+                onVote: { optionID in
+                    Task {
+                        await coordinator.vote(
+                            localID: message.localID, optionID: optionID)
+                    }
+                },
+                onClosePoll: {
+                    Task { await coordinator.closePoll(localID: message.localID) }
+                },
+                memberCount: lookups.memberCount,
+                onCallBack: lookups.canCall ? { startCall() } : nil,
+                onRetry: { coordinator.retry(localID: message.localID) },
+                onDelete: { coordinator.deleteLocalMessage(localID: message.localID) },
+                onToggleReaction: { emoji in
+                    toggleReaction(localID: message.localID, emoji: emoji)
+                },
+                onLongPress: {
+                    // Nothing to offer on a pending bubble:
+                    // no server id to react to, no failure
+                    // to retry.
+                    guard message.serverID != nil || message.state == .failed else { return }
+                    // A hidden row opens nothing. One
+                    // missing clause here is three leaks
+                    // at once: the capsule floats over a
+                    // placeholder, Copy puts the blocked
+                    // body on the pasteboard, and Share
+                    // hands the blocked attachment to the
+                    // share sheet. Reveal is a TAP.
+                    guard
+                        !MessagePresentation.isHiddenByBlock(
+                            message,
+                            blockedUserIDs: lookups.blocked,
+                            currentUserID: lookups.currentUserID)
+                            || revealedMessageIDs.contains(message.localID)
+                    else { return }
+                    withAnimation(.spring(duration: 0.3, bounce: 0.25)) {
+                        reactionPickerID = message.localID
+                    }
+                },
+                publishesAnchor: reactionPickerID == message.localID,
+                blockedUserIDs: lookups.blocked,
+                isHiddenByBlock: MessagePresentation.isHiddenByBlock(
+                    message,
+                    blockedUserIDs: lookups.blocked,
+                    currentUserID: lookups.currentUserID),
+                isRevealed: revealedMessageIDs.contains(message.localID),
+                // Never persisted, never sent, never
+                // written to SwiftData: a peek is not a
+                // fact anybody else may read.
+                onReveal: { revealedMessageIDs.insert(message.localID) },
+                isReplyQuoteRevealed: revealedQuoteIDs.contains(
+                    "\(message.localID)#reply"),
+                isParentQuoteRevealed: revealedQuoteIDs.contains(
+                    "\(message.localID)#parent"),
+                onRevealQuote: { level in
+                    revealedQuoteIDs.insert(
+                        level == .reply
+                            ? "\(message.localID)#reply"
+                            : "\(message.localID)#parent")
+                })
+            .equatable()
+            .id(message.localID)
+            // A jumped-to bubble is briefly tinted, so
+            // the eye lands on the right one in a wall
+            // of text.
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.accentColor.opacity(
+                        highlightedMessageID == message.localID ? 0.14 : 0))
+                    .padding(.horizontal, -4))
+            .animation(.easeOut(duration: 0.25), value: highlightedMessageID)
     }
 
     /// Open the chat: fetch a first page if there is nothing cached,
@@ -1589,6 +1671,42 @@ struct ConversationView: View {
 
     private var inputBar: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // One order on every client, top to bottom, the nearest to the
+            // field being what is being written (#106, docs/composer-and-
+            // wide-layout-2026-10-20.md, 2.4): notices, voice messages not
+            // sent, the reply or edit banner, staged attachments, mention
+            // suggestions — then the voice line and the busy/failure strip
+            // directly above the row.
+            //
+            // First of the notices: nothing goes to the model until this
+            // member has said so (protocol.md, "Consenting to the
+            // assistant"). Shown rather than a silent refusal, and shown
+            // as the draft becomes one that would travel — in the
+            // assistant's own chat that is from the first character, and
+            // in the family chat it is the moment `@ai` is typed.
+            if assistantConsentNeeded, let processor = AppSettings.assistantProcessor {
+                AssistantConsentBar(processor: processor) {
+                    afterAssistantConsent = { send() }
+                    showAssistantConsent = true
+                }
+            } else if assistantIsUnnamed {
+                // Nothing to agree TO on such a server, so there is no
+                // screen to raise — only this, and a send that does not
+                // happen (protocol.md, "Consenting to the assistant").
+                assistantPictureNotice(AssistantConsent.unnamedProcessorNotice)
+            }
+            // Two strips, never both: the assistant's own chat says what a
+            // staged photo will meet; the family chat says the same for a
+            // photo an `@ai` draft is about to carry (#56).
+            if let notice = pictureNotice ?? mentionPictureNotice {
+                assistantPictureNotice(notice)
+            }
+            // While the draft is a `/draw` request: the picture provider's
+            // filter refuses most real names and brands, so say so where
+            // the description is being written (`PictureRequestHint`).
+            if showsPictureRequestHint {
+                pictureRequestHint
+            }
             // Voice messages something else stopped, each in its own row,
             // above everything that belongs to the field — they carry their
             // own reply and caption, and no other Send carries them (#79,
@@ -1609,86 +1727,44 @@ struct ConversationView: View {
             if editTarget != nil {
                 editBanner()
             }
-            if mediaState != .idle || composerNotice != nil {
-                mediaStrip
-            }
-            // What the voice flow has to say: the silence warning while a
-            // recording runs, otherwise its latest hint (S2.3, S2.9).
-            if let line = voiceLine {
-                voiceLineView(line)
-            }
             if !staged.isEmpty {
                 stagedRow
             }
-            // Two strips, never both: the assistant's own chat says what a
-            // staged photo will meet; the family chat says the same for a
-            // photo an `@ai` draft is about to carry (#56).
-            if let notice = pictureNotice ?? mentionPictureNotice {
-                assistantPictureNotice(notice)
-            }
-            // While the draft is a `/draw` request: the picture provider's
-            // filter refuses most real names and brands, so say so where
-            // the description is being written (`PictureRequestHint`).
-            if showsPictureRequestHint {
-                pictureRequestHint
-            }
             // The roster, while a member is being named (protocol.md,
-            // "Mentioning a member") — family chat only, and only while
-            // the draft ends in an `@` token.
-            if isFamilyChat, let query = MemberMentions.query(in: model.draft) {
+            // "Mentioning a member") — the family chat or a group only, and
+            // only while the draft ends in an `@` token.
+            if isFamilyOrGroup, let query = MemberMentions.query(in: model.draft) {
                 let candidates = mentionCandidates(matching: query)
                 if !candidates.isEmpty {
-                    MentionSuggestions(candidates: candidates) { name in
+                    MentionSuggestions(suggestions: candidates) { name in
                         model.draft = MemberMentions.accept(draft: model.draft, name: name)
                         // A suggestion taken is a change the person made (S1.1).
                         voice.otherAction()
                     }
                 }
             }
-            // Before any of that: nothing goes to the model until this
-            // member has said so (protocol.md, "Consenting to the
-            // assistant"). Shown rather than a silent refusal, and shown
-            // as the draft becomes one that would travel — in the
-            // assistant's own chat that is from the first character, and
-            // in the family chat it is the moment `@ai` is typed.
-            if assistantConsentNeeded, let processor = AppSettings.assistantProcessor {
-                AssistantConsentBar(processor: processor) {
-                    afterAssistantConsent = { send() }
-                    showAssistantConsent = true
-                }
-            } else if assistantIsUnnamed {
-                // Nothing to agree TO on such a server, so there is no
-                // screen to raise — only this, and a send that does not
-                // happen (protocol.md, "Consenting to the assistant").
-                assistantPictureNotice(AssistantConsent.unnamedProcessorNotice)
+            // What the voice flow has to say: the silence warning while a
+            // recording runs, otherwise its latest hint (S2.3, S2.9).
+            if let line = voiceLine {
+                voiceLineView(line)
             }
-            // The input row: the controls and the field — or, while a voice
-            // message is being made, the row that takes their place at the
-            // same height — and the slot, which never moves (#79, S1.3).
-            HStack(alignment: .bottom, spacing: 8) {
-                ZStack(alignment: .bottom) {
-                    composerControls
-                        .opacity(voiceRowCoversControls ? 0 : 1)
-                        .allowsHitTesting(!voiceRowCoversControls)
-                        .accessibilityHidden(voiceRowCoversControls)
-                    voiceRow
-                }
-                .animation(voiceRowAnimation, value: voiceRowKey)
-                recordSendSlot
+            // Directly above the row on every client (#106, doc 2.4).
+            if mediaState != .idle || composerNotice != nil {
+                mediaStrip
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            inputRow
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
         }
-        // The same readable column the thread is held to (#21/#44),
-        // centred the same way: on an iPad's detail column the bar used to
-        // run the full width while the bubbles sat in a centred 560pt
-        // band, so the attach button was 200pt left of the messages it
-        // attaches to and the send button 100pt right of them. The bar's
-        // material still spans the column — only its controls are held.
-        // Every iPhone is narrower than the cap in PORTRAIT, so nothing
-        // moves there; in landscape a phone is wider than 560, and its
-        // composer now sits over its thread column exactly as the
-        // thread itself already did.
+        // The same column the thread is held to (#21/#44/#106), centred the
+        // same way and padded by the same 12 points, so the composer is
+        // exactly as wide as the messages above it: on an iPad's detail
+        // column the bar used to run the full width while the bubbles sat
+        // in a centred band, so the attach button was 200pt left of the
+        // messages it attaches to and the send button 100pt right of them.
+        // The bar's material still spans the pane — only its controls are
+        // held. Every iPhone is narrower than the cap, so nothing moves
+        // there.
         .frame(maxWidth: Self.threadMaxWidth)
         .frame(maxWidth: .infinity)
         .background(.bar)
@@ -1731,7 +1807,8 @@ struct ConversationView: View {
             hasCamera: CameraPicker.isAvailable,
             offersVoice: offersVoiceMessages,
             roundAvailable: roundAvailable,
-            isFamilyChat: isFamilyChat)
+            isFamilyOrGroup: isFamilyOrGroup,
+            offersAssistant: offersAssistant)
         ForEach(Array(groups.enumerated()), id: \.offset) { index, group in
             if index > 0 { Divider() }
             ForEach(group, id: \.self) { item in
@@ -1821,6 +1898,16 @@ struct ConversationView: View {
             // Busy, editing (the menu's own guard) and a call; NOT a
             // waiting voice message — that rule is about voice.
             .disabled(slotInputs.call)
+        case .askAssistant:
+            // The `@ai` button that stood in the row until #106, worded:
+            // it types `@ai ` and gives the field back, exactly as the
+            // button did. The menu's own guard covers an edit, which the
+            // button was disabled for.
+            Button {
+                insertAssistantMention()
+            } label: {
+                Label("Ask the Assistant", systemImage: "sparkles")
+            }
         case .location:
             Button {
                 shareLocation()
@@ -1841,88 +1928,115 @@ struct ConversationView: View {
         }
     }
 
-    /// The paperclip, the sticker, `@ai` and `/draw` buttons and the field —
-    /// one view, so that a voice row can cover it whole while the field
-    /// underneath keeps its place and its focus (S2.3).
-    private var composerControls: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            // A Menu rather than two buttons: the composer is narrow,
-            // and "attach" is one intent with several sources.
-            Menu {
-                attachMenuContent
-            } label: {
-                Image(systemName: "paperclip")
-                    .font(.system(size: attachGlyph))
-                    .foregroundStyle(.tint)
-                    .frame(width: composerControl, height: composerControl)
-                    .contentShape(Rectangle())
-            }
-            // Editing borrows the composer to rewrite an existing
-            // message, which has no second attachment to add — and
-            // attaching would have posted the edit as a new message
-            // while leaving the banner armed. Android already gated
-            // this; iOS did not.
-            .disabled(composerIsBusy)
-            .accessibilityLabel("Attach a photo, video or file")
-            // Top to bottom, as on every other client (#78): `.automatic`
-            // turned the list round on the iPhone, so the first item sat
-            // at the bottom, next to the paperclip.
-            .menuOrder(.fixed)
-            .photosPicker(
-                isPresented: $showPhotoPicker,
-                selection: $pickedMedia,
-                maxSelectionCount: StagedAttachment.maxPerMessage,
-                // No `photoLibrary:` — see the note in SettingsView. The
-                // out-of-process picker needs no PhotoKit reference and
-                // no usage description, and nothing here reads a PHAsset.
-                matching: isAssistantChat ? .images : .any(of: [.images, .videos]))
-            // The family's stickers, one tap from the composer
-            // (docs/protocol.md, "In the panel, one tap sends"). Absent
-            // rather than disabled where there is nothing behind it —
-            // see `showsStickers`.
-            if showsStickers {
-                StickerComposerButton(
-                    side: composerControl, glyph: attachGlyph, onOpen: { voice.otherAction() }
-                ) { item in
-                    sendSticker(item)
-                }
-                // The same guard the attach menu carries: an edit has
-                // borrowed the composer, or a send is already running.
-                .disabled(composerIsBusy)
-            }
-            if showsAssistantMention {
-                Button {
-                    insertAssistantMention()
-                } label: {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 20))
-                        .foregroundStyle(.tint)
-                        .frame(width: composerControl, height: composerControl)
-                        .contentShape(Rectangle())
-                }
-                .disabled(editTarget != nil)
-                .accessibilityLabel("Ask the assistant")
-            }
-            if showsPictureRequest {
-                Button {
-                    insertDrawToken()
-                } label: {
-                    Image(systemName: "paintbrush")
-                        .font(.system(size: 19))
-                        .foregroundStyle(.tint)
-                        .frame(width: composerControl, height: composerControl)
-                        .contentShape(Rectangle())
-                }
-                .disabled(editTarget != nil)
-                .accessibilityLabel("Ask for a picture")
-            }
+    /// The input row (#106, docs/composer-and-wide-layout-2026-10-20.md,
+    /// 2.1): the paperclip, alone; the field, with the stickers and the
+    /// video button (or, in the assistant's chat, the paintbrush) INSIDE it
+    /// at its trailing edge; and the slot, which never moves (#79, S1.3).
+    /// While a voice message records, its row covers the paperclip and the
+    /// field, which keep their places — and the field its focus — underneath
+    /// (S2.3). `ComposerRowLayout` puts the field on a line of its own when
+    /// the text size leaves it too little room beside the controls.
+    private var inputRow: some View {
+        ComposerRowLayout(spacing: 8, fieldChrome: fieldChromeForLayout, textRun: shortestTextRun) {
+            paperclipMenu
+                .modifier(CoveredWhileRecording(
+                    covered: voiceRowCoversControls, animation: voiceRowAnimation, key: voiceRowKey))
+                .composerRowRole(.paperclip)
             messageField
+                .modifier(CoveredWhileRecording(
+                    covered: voiceRowCoversControls, animation: voiceRowAnimation, key: voiceRowKey))
+                .composerRowRole(.field)
+            recordSendSlot
+                .composerRowRole(.slot)
+            // Always one child, empty or not, so the layout always has its
+            // cover and the row's own transition plays inside it.
+            ZStack(alignment: .bottom) {
+                voiceRow
+            }
+            .animation(voiceRowAnimation, value: voiceRowKey)
+            .composerRowRole(.cover)
         }
     }
 
-    /// The message field.
+    /// The paperclip and the menu it opens. A Menu rather than several
+    /// buttons: the composer is narrow, and "attach" is one intent with
+    /// several sources.
+    private var paperclipMenu: some View {
+        Menu {
+            attachMenuContent
+        } label: {
+            Image(systemName: "paperclip")
+                .font(.system(size: attachGlyph))
+                .foregroundStyle(.tint)
+                .frame(width: composerControl, height: composerControl)
+                // A 44-pt target around the 36-pt box (S1.1 "Targets"): it
+                // reaches into the gaps on either side, and costs the row
+                // no width.
+                .contentShape(Rectangle().inset(by: -ComposerRow.targetOverhang(side: composerControl)))
+        }
+        // Editing borrows the composer to rewrite an existing
+        // message, which has no second attachment to add — and
+        // attaching would have posted the edit as a new message
+        // while leaving the banner armed. Android already gated
+        // this; iOS did not.
+        .disabled(composerIsBusy)
+        .accessibilityLabel("Attach a photo, video or file")
+        // Top to bottom, as on every other client (#78): `.automatic`
+        // turned the list round on the iPhone, so the first item sat
+        // at the bottom, next to the paperclip.
+        .menuOrder(.fixed)
+        .photosPicker(
+            isPresented: $showPhotoPicker,
+            selection: $pickedMedia,
+            maxSelectionCount: StagedAttachment.maxPerMessage,
+            // No `photoLibrary:` — see the note in SettingsView. The
+            // out-of-process picker needs no PhotoKit reference and
+            // no usage description, and nothing here reads a PHAsset.
+            matching: isAssistantChat ? .images : .any(of: [.images, .videos]),
+            // The bytes as they are in the library (#96): a GIF has to
+            // arrive as a GIF to become an animation, and `.automatic`
+            // is allowed to hand over something more compatible.
+            // Everything else is prepared from its original either way.
+            preferredItemEncoding: .current)
+    }
+
+    /// The glyphs inside the field, in order (`ComposerRow.fieldGlyphs`).
+    private var fieldGlyphList: [ComposerRow.FieldGlyph] {
+        ComposerRow.fieldGlyphs(
+            stickers: showsStickers, paintbrush: showsPictureRequest, video: videoDoor != .hidden)
+    }
+
+    /// The text run's trailing inset for the glyphs showing NOW, so a
+    /// placeholder or a line of text never runs under them (S1.4).
+    private var fieldTrailingInset: CGFloat {
+        ComposerRow.trailingInset(
+            glyphs: fieldGlyphList.count, glyphWidth: fieldGlyph, spacing: Self.fieldGlyphSpacing,
+            endInset: Self.fieldGlyphEndInset, bareInset: Self.fieldLeadingInset)
+    }
+
+    /// What the field spends on chrome at its WIDEST in this chat — every
+    /// glyph it can show here, the video button included while typing has
+    /// sent it away — so the row's arrangement is decided once per text
+    /// size and chat, never by a keystroke.
+    private var fieldChromeForLayout: CGFloat {
+        let widest = (stickerDoor != .absent ? 1 : 0)
+            + (showsPictureRequest || roundAvailable ? 1 : 0)
+        return Self.fieldLeadingInset + ComposerRow.trailingInset(
+            glyphs: widest, glyphWidth: fieldGlyph, spacing: Self.fieldGlyphSpacing,
+            endInset: Self.fieldGlyphEndInset, bareInset: Self.fieldLeadingInset)
+    }
+
+    /// The field's text inset on its leading side — and on its trailing
+    /// side when no glyph sits there.
+    private static let fieldLeadingInset: CGFloat = 12
+    /// Between two glyphs, and after the last one.
+    private static let fieldGlyphSpacing: CGFloat = 2
+    private static let fieldGlyphEndInset: CGFloat = 6
+
+    /// The message field: the capsule, the text, and the glyphs inside it.
     private var messageField: some View {
         TextField("Message", text: typedDraft, axis: .vertical)
+            .proseTextEntry()
             .focused($inputFocused)
             // The backstop for the door this side does not own:
             // the field's OWN paste — the edit menu's Paste item,
@@ -1938,21 +2052,130 @@ struct ConversationView: View {
                 composerNotice = String(
                     localized: "A message can be at most \(ComposerText.bodyLimit) characters.")
             }
+            // A hardware keyboard's Return sends, Shift+Return breaks the
+            // line (#106, 2.3). That Return reaches SwiftUI as a SUBMIT on a
+            // multi-line field — measured on iOS 27: `onKeyPress` never sees
+            // it, Shift+Return included, and a keyboard shortcut on plain
+            // Return loses to the field — while the on-screen keyboard's
+            // Return never submits at all: it types the new line it always
+            // has, so a phone or a tablet without a keyboard is unchanged.
+            .onSubmit { hardwareReturn() }
+            // …and Shift+Return, taken before the field can submit it.
+            .background(ReturnKeyCommands(active: inputFocused) { appendLine() })
             .lineLimit(1...5)
-            .padding(.horizontal, 12)
-            // Room for the video button while it shows, so a placeholder
-            // never runs under it (S1.4).
-            .padding(.trailing, videoDoor == .hidden ? 0 : 28)
+            .padding(.leading, Self.fieldLeadingInset)
+            // Room for the glyphs while they show, so a placeholder
+            // never runs under them (S1.4).
+            .padding(.trailing, fieldTrailingInset)
             .padding(.vertical, 7)
             .composerFieldBackground()
-            .overlay(alignment: .topTrailing) {
-                if videoDoor != .hidden {
-                    videoDoorButton
-                }
+            .overlay(alignment: .bottomTrailing) {
+                fieldGlyphs
             }
             .onChange(of: videoDoor == .hidden, initial: true) { _, hidden in
                 if !hidden { videoDoorShownAtMS = VoiceComposer.uptimeMS() }
             }
+    }
+
+    /// The glyphs at the field's trailing edge, each centred on the LAST
+    /// line — level with the paperclip and the slot, which sit on the row's
+    /// bottom edge — in the order `ComposerRow.fieldGlyphs` gives: the
+    /// stickers innermost, so the video button leaving at the first
+    /// character never moves them.
+    @ViewBuilder
+    private var fieldGlyphs: some View {
+        let glyphs = fieldGlyphList
+        if !glyphs.isEmpty {
+            HStack(spacing: Self.fieldGlyphSpacing) {
+                if glyphs.contains(.stickers) {
+                    // The family's stickers, one tap from the composer
+                    // (docs/protocol.md, "In the panel, one tap sends") —
+                    // empty or typing since #106, so nothing moves under
+                    // the thumb. Absent rather than disabled where there is
+                    // nothing behind it — see `showsStickers`.
+                    StickerComposerButton(
+                        side: composerControl, glyph: attachGlyph, width: fieldGlyph,
+                        hitOverhang: fieldGlyphOverhang, onOpen: { voice.otherAction() }
+                    ) { item in
+                        sendSticker(item)
+                    }
+                    // The same guard the attach menu carries: an edit has
+                    // borrowed the composer, or a send is already running.
+                    .disabled(composerIsBusy)
+                }
+                if glyphs.contains(.paintbrush) {
+                    paintbrushButton
+                }
+                if glyphs.contains(.video) {
+                    videoDoorButton
+                }
+            }
+            .padding(.trailing, Self.fieldGlyphEndInset)
+        }
+    }
+
+    /// How far an in-field glyph's hit area reaches past its box: to 44
+    /// points across (S1.1). Neighbours overlap by the difference, and the
+    /// trailing one — drawn last — takes the overlap.
+    private var fieldGlyphOverhang: CGFloat {
+        ComposerRow.targetOverhang(side: fieldGlyph)
+    }
+
+    /// The assistant chat's `/draw` — inside the field, beside the stickers
+    /// (#106). A button and not a menu line, as decided on 2026-10-07.
+    private var paintbrushButton: some View {
+        Button {
+            insertDrawToken()
+        } label: {
+            Image(systemName: "paintbrush")
+                .font(.system(size: 19))
+                .foregroundStyle(.tint)
+                .frame(width: fieldGlyph, height: composerControl)
+                .contentShape(Rectangle().inset(by: -fieldGlyphOverhang))
+        }
+        .buttonStyle(.plain)
+        .disabled(editTarget != nil)
+        .accessibilityLabel("Ask for a picture")
+    }
+
+    /// A HARDWARE Return in the field (2.3), arriving as the field's submit:
+    /// the slot on rows 2 to 5 and nothing else (S1.3), a new line with
+    /// Shift (⌥ and ⌃ too), and ⌘↩ left to the hidden shortcut that has
+    /// always been the iPad's Send. The submit names no modifier, so they
+    /// are read off the keyboard itself (`HardwareReturn.held`).
+    ///
+    /// A submit takes the focus away; every outcome gives it back — the
+    /// person is still typing, and a keyboard-only iPad has no other way
+    /// back into the field.
+    private func hardwareReturn() {
+        // A Shift+Return the key command saw: a line, never a send.
+        if ReturnKeyCommands.takeShiftReturn() {
+            appendLine()
+            inputFocused = true
+            return
+        }
+        let held = HardwareReturn.held()
+        switch ComposerRow.hardwareReturn(
+            shift: held.shift, option: held.option, command: held.command, control: held.control,
+            slotTakesReturn: slot.takesReturn && slot != .save(enabled: false)) {
+        case .activateSlot:
+            activateSlot()
+        case .newLine:
+            appendLine()
+        case .nothing, .shortcut:
+            break
+        }
+        inputFocused = true
+    }
+
+    /// A line break from Shift+Return (⌥↩, ⌃↩). At the END: SwiftUI's field
+    /// publishes no caret before iOS 18 (see `insertAssistantMention`), and
+    /// the end is where a line break is being typed in all but the rarest
+    /// case. The person's own edit, so it lifts the slot's guard (S1.1).
+    private func appendLine() {
+        guard let extended = HardwareReturn.appendingLine(to: model.draft) else { return }
+        model.draft = extended
+        voice.otherAction()
     }
 
     /// The draft as the FIELD writes it: every character typed, deleted,
@@ -1962,14 +2185,17 @@ struct ConversationView: View {
     /// change lifts the slot's activation guard (S1.1: "ok" typed and sent at
     /// once is never slowed, while a double tap on Send still cannot open
     /// the microphone it turned into).
+    ///
+    /// Emoji as you type (#101) wrap it: `:)` typed at the end becomes 😊
+    /// (EmojiTypingField), written through this same setter.
     private var typedDraft: Binding<String> {
-        Binding(
+        emojiTyping.binding(Binding(
             get: { model.draft },
             set: { newValue in
                 guard newValue != model.draft else { return }
                 model.draft = newValue
                 voice.otherAction()
-            })
+            }))
     }
 
     /// ⌘V from a hardware keyboard, for the pastes a text field will not
@@ -2325,7 +2551,8 @@ struct ConversationView: View {
     }
 
     /// A 22-point glyph in a 44-point target at the field's trailing edge,
-    /// centred on the first line (S1.4).
+    /// centred on its line (S1.4) — the first line and the last are one
+    /// line while it shows, since it leaves at the first character.
     private var videoDoorButton: some View {
         Button {
             // It appears beside the slot the moment a text Send empties the
@@ -2338,8 +2565,8 @@ struct ConversationView: View {
             Image(systemName: "video.circle")
                 .font(.system(size: 22))
                 .foregroundStyle(videoDoor == .shown ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
-                .frame(width: 34, height: 36)
-                .contentShape(Rectangle().inset(by: -5))
+                .frame(width: fieldGlyph, height: composerControl)
+                .contentShape(Rectangle().inset(by: -fieldGlyphOverhang))
         }
         .buttonStyle(.plain)
         .accessibilityLabel(Text(verbatim: VideoDoor.label))
@@ -3018,7 +3245,8 @@ struct ConversationView: View {
         composerNotice = nil
         prepare {
             do {
-                stageIfWanted(try await ClipboardAttachment.prepare(limit: MediaPrep.sizeLimit))
+                stageIfWanted(try await ClipboardAttachment.prepare(
+                    limit: MediaPrep.sizeLimit, animates: !isAssistantChat))
             } catch ClipboardAttachment.Failure.nothingToPaste {
                 preparationFailed(String(localized: "There's nothing to paste."))
             } catch MediaPrep.PrepError.tooLargeAfterCompression {
@@ -3040,7 +3268,10 @@ struct ConversationView: View {
                 guard !Task.isCancelled else { break }
                 do {
                     stageIfWanted(
-                        try await MediaPrep.prepareFile(from: url, limit: MediaPrep.sizeLimit),
+                        // An animated picture becomes an animation (#96);
+                        // anything else goes as the file it is.
+                        try await MediaPrep.preparePickedFile(
+                            from: url, limit: MediaPrep.sizeLimit, animates: !isAssistantChat),
                         moreToCome: index < urls.count - 1)
                 } catch MediaPrep.PrepError.tooLargeAfterCompression {
                     // A document cannot be compressed the way a video can,
@@ -3254,8 +3485,11 @@ struct ConversationView: View {
                 let prepared: MediaPrep.Prepared
                 do {
                     // The assistant is shown a photo: there, a GIF is its still.
+                    // Everywhere else an animated picture becomes an
+                    // animation (#96).
                     prepared = try await PickedMediaPrep.prepare(
-                        item, limit: limit, keepsAnimated: !isAssistantChat)
+                        item, limit: limit, keepsAnimated: !isAssistantChat,
+                        animates: !isAssistantChat)
                 } catch PickedMediaPrep.Failure.unreadableVideo {
                     preparationFailed(String(localized: "Couldn't read that video."))
                     continue
@@ -3692,15 +3926,16 @@ struct ConversationView: View {
     /// and a message like any other, so it goes through the consent
     /// question (`sendSticker`), never around it.
     ///
-    /// And on a phone it steps aside while there is something in the
-    /// composer: a sticker is its own message — it takes no caption and no
-    /// attachment — so with words typed or a photo staged the button has
-    /// nothing to offer, and the width it would take is the field's. The
-    /// Mac has the room and keeps it always.
+    /// It used to step aside on a phone while there was something in the
+    /// composer — a sticker is its own message, and the width was the
+    /// field's — and the `@ai` button slid into its place at the first
+    /// character. That was the row moving under the thumb, and #106 stopped
+    /// it: the glyph is INSIDE the field now, costs the text 32 points
+    /// rather than a control and its gap, and stays, typing or not, as it
+    /// always did on the Mac (docs/composer-and-wide-layout-2026-10-20.md,
+    /// decision 3). A sticker still goes on its own; the words stay.
     private var showsStickers: Bool {
         stickerDoor != .absent
-            && staged.isEmpty
-            && model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var stickerDoor: StickerDoor {
@@ -3970,7 +4205,8 @@ struct ConversationView: View {
         }
     }
 
-    /// Offer the mention only where it does something.
+    /// Offer the assistant only where `@ai` does something — the first
+    /// entry of the `@` list and the paperclip's "Ask the Assistant" (#106).
     ///
     /// The family chat is the only place `@ai` is answered (a direct chat
     /// is two people who each already have a private assistant, and the
@@ -3978,11 +4214,14 @@ struct ConversationView: View {
     /// actually has one — which is exactly what an absent `assistant` on
     /// `GET /families/mine` says (docs/protocol.md).
     ///
-    /// A button rather than an autocomplete popup: there is precisely one
-    /// name to complete, and a menu of one is a worse way to type three
-    /// characters than a button that types them.
-    private var showsAssistantMention: Bool {
-        chat?.kind == "family" && AppSettings.assistantUserID != nil
+    /// It used to be a button of its own in the row, on the reasoning that
+    /// one name to complete deserves a button rather than a list. It was
+    /// the control that cost the field most and the one used least, so the
+    /// owner moved it (docs/composer-and-wide-layout-2026-10-20.md, 4.2):
+    /// typing `@` is where people look for a name, and the menu is where
+    /// they look for words.
+    private var offersAssistant: Bool {
+        ChatRules.offersAssistantMention(chat?.kind) && AppSettings.assistantUserID != nil
             // A server that names nobody is one whose assistant this
             // client does not offer: the consent screen would have a hole
             // exactly where the person needs to read (protocol.md,
@@ -4109,7 +4348,7 @@ struct ConversationView: View {
     /// one of the four may be somebody else's picture (protocol.md, "Recent
     /// photos from the family chat").
     private var mentionPictureNotice: String? {
-        guard isFamilyChat else { return nil }
+        guard isFamilyOrGroup else { return nil }
         return MentionPictureNotice.of(
             draft: model.draft,
             staged: staged.map(\.assistantPictureCandidate),
@@ -4244,14 +4483,9 @@ struct ConversationView: View {
         return members.first(where: { $0.userID == userID })?.resolvedDisplayName
     }
 
-    /// 0 when the sender has no picture — or has left the family, so the
-    /// roster no longer holds them.
-    private func avatarVersion(for userID: Int64) -> Int64 {
-        members.first(where: { $0.userID == userID })?.avatarVersion ?? 0
-    }
-
-    /// userID → picture version for every known member, feeding the
-    /// faces in the "who reacted" rows.
+    /// userID → picture version for every known member, feeding the faces
+    /// in the "who reacted" rows and each run's avatar (`RowLookups`) — 0,
+    /// by absence, when the sender has no picture or has left the family.
     private var avatarVersions: [Int64: Int64] {
         Dictionary(members.map { ($0.userID, $0.avatarVersion) }, uniquingKeysWith: { first, _ in first })
     }
@@ -4259,9 +4493,13 @@ struct ConversationView: View {
     /// How many people a poll could hear from: the live roster, which is
     /// neither the people who have left nor the accounts that were
     /// deleted — a tally must not go on counting somebody who no longer
-    /// exists (docs/protocol.md, "Deleting an account").
+    /// exists (docs/protocol.md, "Deleting an account"). In a group, its
+    /// members (`ChatRules.pollAudience`).
     private var familyMemberCount: Int {
-        members.filter { !$0.hasLeft && !$0.accountDeleted }.count
+        ChatRules.pollAudience(
+            kind: chat?.kind,
+            groupMemberIDs: chat?.groupMemberIDs ?? [],
+            liveFamilyMembers: members.filter { !$0.hasLeft && !$0.accountDeleted }.count)
     }
 
     /// userID → display name for every known member, feeding the "who
@@ -4374,8 +4612,9 @@ private struct VoiceSurfaces: ViewModifier {
     }
 }
 
-private extension View {
-    /// The message field's backdrop. On iOS 26 the system's own text
+extension View {
+    /// The message field's backdrop — the chat's composer and the thread's
+    /// (#106: one capsule for both). On iOS 26 the system's own text
     /// fields in bars are glass, and a flat grey capsule beside glass
     /// toolbar buttons read as last year's control; earlier systems keep
     /// the fill they have always had.
@@ -4386,6 +4625,25 @@ private extension View {
         } else {
             self.background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
+    }
+}
+
+/// Hides a composer control under the voice row while a voice message
+/// records — still in its place, its focus kept, untouchable and unread —
+/// and fades it back with the row's own cross-fade (S1.1 "Motion", S2.3).
+/// One modifier for the paperclip and the field alike, which the voice row
+/// covered together when they were one HStack.
+private struct CoveredWhileRecording: ViewModifier {
+    let covered: Bool
+    let animation: Animation?
+    let key: Int
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(covered ? 0 : 1)
+            .allowsHitTesting(!covered)
+            .accessibilityHidden(covered)
+            .animation(animation, value: key)
     }
 }
 

@@ -140,6 +140,30 @@ interface MessageDao {
     @Query("UPDATE messages SET attachmentsKnowRound = 1 WHERE clientMsgId = :clientMsgId")
     suspend fun markRoundFlagKnown(clientMsgId: String)
 
+    /**
+     * Rows a build from before #96 cached that could be ANIMATIONS: the set's
+     * first attachment a video, on the server, and the set not yet known to
+     * carry the flag (docs/protocol.md, "Animations"). Unlike a video
+     * message an animation may carry a caption, so the body is not asked.
+     * Newest first, as [roundFlagUnknown]; "exactly one attachment" is the
+     * caller's to check — see `MessageRepository.repairUnknownAnimationFlags`.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE attachmentsKnowAnimation = 0
+          AND attachmentKind = 'video'
+          AND serverId IS NOT NULL
+        ORDER BY serverId DESC
+        LIMIT :limit
+        """,
+    )
+    suspend fun animationFlagUnknown(limit: Int): List<MessageEntity>
+
+    /** Settle a row [animationFlagUnknown] returned: it is never asked about again. */
+    @Query("UPDATE messages SET attachmentsKnowAnimation = 1 WHERE clientMsgId = :clientMsgId")
+    suspend fun markAnimationFlagKnown(clientMsgId: String)
+
     @Query("SELECT * FROM messages WHERE serverId = :serverId")
     suspend fun findByServerId(serverId: Long): MessageEntity?
 
@@ -213,7 +237,8 @@ interface MessageDao {
             attachmentLongitude = :longitude,
             attachmentAccuracyM = :accuracyM,
             attachmentsJson = :attachmentsJson,
-            attachmentsKnowRound = 1
+            attachmentsKnowRound = 1,
+            attachmentsKnowAnimation = 1
         WHERE clientMsgId = :clientMsgId
         """,
     )
@@ -277,7 +302,8 @@ interface MessageDao {
             attachmentLongitude = :longitude,
             attachmentAccuracyM = :accuracyM,
             attachmentsJson = :attachmentsJson,
-            attachmentsKnowRound = 1
+            attachmentsKnowRound = 1,
+            attachmentsKnowAnimation = 1
         WHERE serverId = :serverId AND :editSeq >= editSeq
         """,
     )
@@ -370,7 +396,8 @@ interface MessageDao {
      */
     @Query(
         "UPDATE messages SET attachmentId = :attachmentId, attachmentsJson = :attachmentsJson, " +
-            "attachmentsKnowRound = 1 WHERE clientMsgId = :clientMsgId AND serverId IS NULL",
+            "attachmentsKnowRound = 1, attachmentsKnowAnimation = 1 " +
+            "WHERE clientMsgId = :clientMsgId AND serverId IS NULL",
     )
     suspend fun applyOwnAttachments(clientMsgId: String, attachmentId: Long, attachmentsJson: String)
 
@@ -388,16 +415,17 @@ interface MessageDao {
      * Every message in one chat, for a chat that is going.
      *
      * The only reason a chat is ever deleted is that the server no longer
-     * has it — a peer deleted their account, which takes the direct chat
-     * with them, both halves (docs/protocol.md, "Deleting an account").
-     * Nothing else in this protocol can make a chat vanish, and leaving a
-     * family explicitly does not: that history is retained and resurfaces
-     * on rejoin.
+     * has it — or no longer shows it to this reader: a peer deleted their
+     * account, which takes the direct chat with them, both halves
+     * (docs/protocol.md, "Deleting an account"), or a GROUP was left,
+     * removed from or deleted (docs/protocol.md, "Groups"). Leaving a
+     * family explicitly does not delete the family chat: that history is
+     * retained and resurfaces on rejoin.
      *
      * Paired with [ChatDao.deleteById] and never called on its own — a
      * chat row whose messages are gone is a chat that opens empty, and
      * messages whose chat row is gone are rows nothing will ever read
-     * again. See ChatRepository.deleteDirectChat, which owns the order.
+     * again. See ChatRepository.deleteChat, which owns the order.
      */
     @Query("DELETE FROM messages WHERE chatId = :chatId")
     suspend fun deleteByChat(chatId: Long)

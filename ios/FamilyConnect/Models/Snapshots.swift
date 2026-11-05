@@ -29,7 +29,9 @@ nonisolated struct ChatSnapshot: Equatable, Sendable, Identifiable {
     /// "Mentioning a member").
     var hasUnreadMention: Bool = false
 
-    var isFamilyChat: Bool { kind == "family" }
+    var isFamilyChat: Bool { kind == ChatRules.family }
+    /// The family chat or a group — the surface they share (`ChatRules`).
+    var isFamilyOrGroup: Bool { ChatRules.isFamilyOrGroup(kind) }
 }
 
 /// One user's reaction to one message. Codable in the wire shape
@@ -430,13 +432,20 @@ nonisolated enum AssistantFailure: Equatable, Sendable {
     /// picture's description. Asking again in the same words will not work,
     /// so the sentence does not tell the member to.
     case refused
+    /// A paid family has used this month's assistant allowance (`reason:
+    /// "allowance_used"`, docs/protocol.md "Paid families"). Asking again
+    /// will not work until `renewsAt`, so the sentence names that day.
+    case allowanceUsed(renewsAt: Date)
 
     /// The frame's reason, read. Nil — absent, or a value this client does
     /// not know — is `.stopped`, the sentence every client showed before
-    /// `reason` existed.
-    init(reason: AIErrorReason?) {
+    /// `reason` existed. An allowance with no `renews_at` renews when the
+    /// server's month does: the 1st of the next one, UTC.
+    init(reason: AIErrorReason?, now: Date = .now) {
         switch reason {
         case .refused: self = .refused
+        case .allowanceUsed(let renewsAt):
+            self = .allowanceUsed(renewsAt: renewsAt ?? PaidFamilies.nextMonthStartUTC(after: now))
         case nil: self = .stopped
         }
     }
@@ -447,6 +456,8 @@ nonisolated enum AssistantFailure: Equatable, Sendable {
         switch self {
         case .stopped: "Couldn't answer that. Ask again."
         case .refused: "The assistant's provider refused that. Try putting it another way."
+        case .allowanceUsed(let renewsAt):
+            "This family has used this month’s assistant allowance. It renews on \(PaidFamilies.renewalDay(renewsAt))."
         }
     }
 }
@@ -564,8 +575,9 @@ nonisolated enum MessagePresentation {
 
     /// Whether the sender's name caption shows above a bubble.
     ///
-    /// Rules: only in the family chat (a direct chat has exactly one other
-    /// person — the name would be noise), never on own bubbles, and only
+    /// Rules: only in the family chat or a group (`ChatRules.showsSenderNames`
+    /// — a direct chat has exactly one other person, and the name would be
+    /// noise), never on own bubbles, and only
     /// when the sender *changes* relative to the previous bubble in the
     /// same day section (the first bubble of a section has no previous).
     /// A hidden row draws no name at all, and the RUN GROUPING is
@@ -576,14 +588,14 @@ nonisolated enum MessagePresentation {
     static func showsSenderName(
         at index: Int,
         in section: [MessageSnapshot],
-        isFamilyChat: Bool,
+        isFamilyOrGroup: Bool,
         currentUserID: Int64,
         // UNDEFAULTED, deliberately. A default here compiles clean at every
         // call site and silently draws a blocked member's name — the class
         // of bug that has no compiler pressure behind it at all.
         blockedUserIDs: Set<Int64>
     ) -> Bool {
-        guard isFamilyChat, section.indices.contains(index) else { return false }
+        guard isFamilyOrGroup, section.indices.contains(index) else { return false }
         let message = section[index]
         guard message.senderID != currentUserID else { return false }
         guard !isHiddenByBlock(message, blockedUserIDs: blockedUserIDs, currentUserID: currentUserID)
@@ -596,7 +608,8 @@ nonisolated enum MessagePresentation {
     /// confirmed (has a server id) and covered by the highest read marker
     /// any other member reported. Pending/failed messages are never read.
     ///
-    /// NEVER TRUE IN THE FAMILY CHAT (docs/protocol.md, "Frames"): a `read`
+    /// NEVER TRUE IN THE FAMILY CHAT OR A GROUP (docs/protocol.md, "Frames";
+    /// "Groups" — "'Seen' is not drawn, as in the family chat"): a `read`
     /// frame folds into a displayed "seen" marker only in a DIRECT chat,
     /// where there is exactly one peer and the marker means one person.
     /// `othersReadUpTo` is a MAX over every other member, so in a family
@@ -606,15 +619,15 @@ nonisolated enum MessagePresentation {
     /// max would stop incorporating them, and a tick that slowed down the
     /// day you blocked somebody draws a per-member ABSENCE on screen.
     ///
-    /// `isFamilyChat` is deliberately UNDEFAULTED. A default would let a
+    /// `isFamilyOrGroup` is deliberately UNDEFAULTED. A default would let a
     /// new surface draw the family tick by saying nothing, which is exactly
     /// how this shipped wrong the first time.
     static func isRead(
         _ message: MessageSnapshot,
         othersReadUpTo: Int64,
-        isFamilyChat: Bool
+        isFamilyOrGroup: Bool
     ) -> Bool {
-        guard !isFamilyChat else { return false }
+        guard !isFamilyOrGroup else { return false }
         guard let serverID = message.serverID else { return false }
         return serverID <= othersReadUpTo
     }
@@ -808,6 +821,19 @@ nonisolated enum MessagePresentation {
         Set(messages.lazy.filter(isRoundVideo).compactMap(\.serverID))
     }
 
+    /// True when a message IS an animation (docs/protocol.md, "Animations",
+    /// #96): exactly ONE attachment, a `video` carrying `animation: true`.
+    /// Unlike a video message it may have words beside it.
+    static func isAnimation(_ message: MessageSnapshot) -> Bool {
+        message.attachments.count == 1 && message.attachments[0].isAnimation
+    }
+
+    /// The server ids of the animations among `messages` — a quote of one
+    /// with no words says "GIF" (`quoteWord`).
+    static func animationMessageIDs(_ messages: [MessageSnapshot]) -> Set<Int64> {
+        Set(messages.lazy.filter(isAnimation).compactMap(\.serverID))
+    }
+
     /// A reply quoting a video message says "Video message" (S5.7;
     /// docs/protocol.md, "How it is drawn").
     ///
@@ -817,28 +843,39 @@ nonisolated enum MessagePresentation {
     /// device holds and knows to be round names itself; an excerpt that has
     /// words keeps them, and a quoted message out of the cache stays as the
     /// server sent it.
-    static func quoteWord(excerpt: String, messageID: Int64, roundIDs: Set<Int64>) -> String {
-        guard excerpt.isEmpty, roundIDs.contains(messageID) else { return excerpt }
-        return String(localized: "Video message")
+    ///
+    /// An ANIMATION with no caption is named the same way, "GIF" (#96): "a
+    /// reply's quote says GIF where a video's says Video".
+    static func quoteWord(
+        excerpt: String, messageID: Int64, roundIDs: Set<Int64>, animationIDs: Set<Int64> = []
+    ) -> String {
+        guard excerpt.isEmpty else { return excerpt }
+        if roundIDs.contains(messageID) { return String(localized: "Video message") }
+        if animationIDs.contains(messageID) { return String(localized: "GIF") }
+        return excerpt
     }
 
     /// The message with both levels of its quote named by `quoteWord`.
     static func namingRoundQuotes(
-        _ message: MessageSnapshot, roundIDs: Set<Int64>
+        _ message: MessageSnapshot, roundIDs: Set<Int64>, animationIDs: Set<Int64> = []
     ) -> MessageSnapshot {
-        guard !roundIDs.isEmpty, let quote = message.replyTo else { return message }
+        guard !roundIDs.isEmpty || !animationIDs.isEmpty, let quote = message.replyTo else {
+            return message
+        }
         var named = message
         named.replyTo = ReplyToSnapshot(
             messageID: quote.messageID,
             senderID: quote.senderID,
             excerpt: quoteWord(
-                excerpt: quote.excerpt, messageID: quote.messageID, roundIDs: roundIDs),
+                excerpt: quote.excerpt, messageID: quote.messageID, roundIDs: roundIDs,
+                animationIDs: animationIDs),
             parent: quote.parent.map {
                 QuotedParentSnapshot(
                     messageID: $0.messageID,
                     senderID: $0.senderID,
                     excerpt: quoteWord(
-                        excerpt: $0.excerpt, messageID: $0.messageID, roundIDs: roundIDs))
+                        excerpt: $0.excerpt, messageID: $0.messageID, roundIDs: roundIDs,
+                        animationIDs: animationIDs))
             })
         return named
     }

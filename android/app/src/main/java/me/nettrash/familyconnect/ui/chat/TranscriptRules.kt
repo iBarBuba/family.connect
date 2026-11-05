@@ -19,6 +19,7 @@ package me.nettrash.familyconnect.ui.chat
 
 import me.nettrash.familyconnect.R
 import me.nettrash.familyconnect.data.net.dto.AttachmentDto
+import me.nettrash.familyconnect.util.GroupRules
 import java.util.Locale
 
 object TranscriptRules {
@@ -34,10 +35,12 @@ object TranscriptRules {
      * May this member ask about a recording on this message at all?
      *
      * Their own message, in any chat they are in (direct chats and their
-     * own assistant chat included). Another member's only in the family
-     * chat — its threads are in the family chat too — and only while the
-     * owner's `ai_transcripts` is on. Never another member's in a direct
-     * chat, and never the assistant's own messages.
+     * own assistant chat included). The other person's in a direct chat —
+     * no owner's switch reaches a direct chat (amended 2026-10-21; until
+     * then never) — and another member's in a GROUP, which follows the
+     * direct chat's rule (D4, amended 2026-10-22). Another member's in the
+     * family chat — its threads are in the family chat too — only while the
+     * owner's `ai_transcripts` is on. Never the assistant's own messages.
      */
     fun mayAsk(
         chatKind: String?,
@@ -49,7 +52,8 @@ object TranscriptRules {
         myUserId == null -> false
         assistantUserId != null && senderId == assistantUserId -> false
         senderId == myUserId -> true
-        chatKind == "family" -> familyAllowsOthers
+        GroupRules.transcriptsFollowDirectRule(chatKind) -> true
+        chatKind == GroupRules.FAMILY -> familyAllowsOthers
         else -> false
     }
 

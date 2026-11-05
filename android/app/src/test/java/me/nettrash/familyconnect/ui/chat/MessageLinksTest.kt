@@ -333,4 +333,111 @@ class MessageLinksTest {
             ),
         ).isNull()
     }
+
+    /**
+     * An inline formula's characters are covered by its drawing (#97), and
+     * its source is KaTeX's input: what the detector finds inside one is
+     * not a tap target.
+     */
+    @Test
+    fun aFormulaIsNotLinkified() {
+        val block = MessageMarkdown.blocks("see \$https://a.example\$ or https://b.example").single()
+        val rendered = (block as MessageMarkdown.Block.Text).rendered
+        val detected = MessageLinks.linkSpans(rendered.text)
+        val kept = MessageLinks.outside(detected, rendered.math)
+        assertThat(kept.map { rendered.text.substring(it.start, it.end) }).containsExactly("https://b.example")
+        // A body with no formula is untouched, span for span.
+        assertThat(MessageLinks.outside(detected, emptyList())).isEqualTo(detected)
+    }
+
+    /** Neither a formula nor a diagram's source offers a page to preview. */
+    @Test
+    fun richSourcesHaveNothingToPreview() {
+        assertThat(
+            MessageLinks.firstDrawnWebLinkUrl(MessageMarkdown.blocks("see \$https://a.example\$")),
+        ).isNull()
+        assertThat(
+            MessageLinks.firstDrawnWebLinkUrl(
+                MessageMarkdown.blocks("```mermaid\ngraph TD\nA-->B\nclick A \"https://a.example\"\n```"),
+            ),
+        ).isNull()
+        // The text around a diagram still previews its own link.
+        assertThat(
+            MessageLinks.firstDrawnWebLinkUrl(
+                MessageMarkdown.blocks("```plot\nsin(x)\n```\nmore at https://b.example"),
+            ),
+        ).isEqualTo("https://b.example")
+    }
+
+    /** An `@ai` written inside a formula is KaTeX's input, not a mention. */
+    @Test
+    fun anAssistantTokenInsideAFormulaIsNotMarked() {
+        val rendered = (MessageMarkdown.blocks("@ai what is \$@ai\$?").single() as MessageMarkdown.Block.Text).rendered
+        val styled = MessageLinks.withMentions(rendered.annotated, mentionStyle, math = rendered.math)
+        val marked = styled.spanStyles.filter { it.item == mentionStyle }.map { it.start }
+        assertThat(marked).containsExactly(0)
+    }
+
+    // -- The phone matcher runs only where a digit is (detectorMask) --------
+
+    /**
+     * The whole point of the gate is that it changes no answer: the phone
+     * matcher cannot find a number in text without a digit, so asking it
+     * there is pure cost. Every text here is detected both ways — the gated
+     * mask and all three detectors — and the spans must be identical.
+     */
+    @Test
+    fun theGatedDetectorFindsExactlyWhatAllThreeDetectorsFind() {
+        val texts = listOf(
+            "no digits at all, just words",
+            "mail me at ann@example.com or see www.example.com",
+            "call 555-123-4567 tonight",
+            "+44 20 7946 0958 is the office",
+            "room 4, floor two",
+            "Привет, как дела?",
+            "١٢٣٤٥٦٧٨٩٠ in Arabic-Indic digits",
+            "１２３-４５６７ in full-width digits",
+            "https://example.com/path?id=42 and 0800 123 456",
+            "emoji only 🎉🎉",
+        )
+        for (text in texts) {
+            val gated = MessageLinks.linkSpans(text)
+            val everything = android.text.SpannableString(text).let { spannable ->
+                android.text.util.Linkify.addLinks(
+                    spannable,
+                    android.text.util.Linkify.WEB_URLS or
+                        android.text.util.Linkify.EMAIL_ADDRESSES or
+                        android.text.util.Linkify.PHONE_NUMBERS,
+                )
+                spannable.getSpans(0, spannable.length, android.text.style.URLSpan::class.java)
+                    .map { LinkSpan(spannable.getSpanStart(it), spannable.getSpanEnd(it), it.url) }
+                    .sortedBy { it.start }
+            }
+            assertThat(gated).isEqualTo(everything)
+        }
+    }
+
+    @Test
+    fun thePhoneMatcherIsSkippedOnlyWhereThereIsNoDigit() {
+        val phone = android.text.util.Linkify.PHONE_NUMBERS
+        assertThat(MessageLinks.detectorMask("see you at the park") and phone).isEqualTo(0)
+        assertThat(MessageLinks.detectorMask("see you at 5") and phone).isEqualTo(phone)
+        // Web addresses and email are asked for always.
+        val always = android.text.util.Linkify.WEB_URLS or android.text.util.Linkify.EMAIL_ADDRESSES
+        assertThat(MessageLinks.detectorMask("plain") and always).isEqualTo(always)
+    }
+
+    @Test
+    fun aDigitOfAnyScriptCountsAsADigit() {
+        assertThat(MessageLinks.hasDigit("")).isFalse()
+        assertThat(MessageLinks.hasDigit("letters only")).isFalse()
+        assertThat(MessageLinks.hasDigit("x9")).isTrue()
+        assertThat(MessageLinks.hasDigit("٣")).isTrue() // Arabic-Indic three
+        assertThat(MessageLinks.hasDigit("５")).isTrue() // full-width five
+        // A digit outside the BMP — MATHEMATICAL DOUBLE-STRUCK DIGIT ZERO,
+        // a surrogate pair — still counts.
+        assertThat(MessageLinks.hasDigit("\uD835\uDFD8")).isTrue()
+        // Letter-like numerals are not decimal digits (Unicode Nl, not Nd).
+        assertThat(MessageLinks.hasDigit("Ⅻ")).isFalse()
+    }
 }

@@ -54,12 +54,28 @@ public sealed partial class FamilyView : UserControl
     /// The family's CHAT stickers (docs/protocol.md, "Sticker pack") — not the board's cards: the pack, what has been
     /// decoded of it, and whether an add or a removal is under way.
     /// </summary>
+    /// <remarks>
+    /// The grid's stickers MOVE where this machine can and Windows' animation effects are on, only while on screen ("Sticker
+    /// pack", amended 2026-10-19, #96) — on a <see cref="StickerShelf{TPicture}"/> of the conversation's own budget, which
+    /// makes the least recently drawn still, moved by one <see cref="StickerAnimator"/>.
+    /// </remarks>
     private readonly PackModel pack;
     private readonly Action<PackItemDto> onPack;
-    private readonly Dictionary<long, StickerPicture?> stickerThumbs = [];
+    private readonly StickerAnimator stickers;
+    private readonly StickerShelf<StickerPicture> stickerThumbs;
     private bool changingPack;
     private IReadOnlyList<JoinRequestDto> requests = [];
     private IReadOnlyList<ReportDto> reports = [];
+
+    /// <summary>This family's pending invitations, read with the owner's other lists (docs/protocol.md, "Several families").</summary>
+    private IReadOnlyList<InvitationDto> invitations = [];
+    private readonly InviteModel invites;
+    private long? withdrawing;
+    private readonly Action<InvitationDto> onInvitation;
+    private readonly Action<long> onInvitationGone;
+
+    /// <summary>The family these lists are of — another family shown takes them away until they are read for it.</summary>
+    private long? listsFamily;
     private bool busy;
     private long? deciding;
     private long? resolving;
@@ -85,8 +101,14 @@ public sealed partial class FamilyView : UserControl
         this.connection = connection;
         this.openChat = openChat;
         family = new FamilyModel(connection.Api, connection.Chats);
+        invites = new InviteModel(connection.Api, connection.Chats);
+        listsFamily = connection.Session.State.CurrentFamilyId;
         pack = connection.Stickers;
         InitializeComponent();
+        stickers = new StickerAnimator(DispatcherQueue);
+        stickerThumbs = new StickerShelf<StickerPicture>(
+            StickerAnimation.MaxHeldBytes, StickerAnimation.MaxKept,
+            stickers.IsShowing, stickers.MakeStill, stickers.Release);
         var say = services.Say;
 
         StickersHeading.Text = say.Get("Family Stickers");
@@ -101,6 +123,9 @@ public sealed partial class FamilyView : UserControl
         RotateButton.Content = say.Get("Rotate");
         InviteFootnote.Text = say.Get("Rotating invalidates the current code immediately.");
         RequestsHeading.Text = say.Get("Join requests");
+        InvitationsHeading.Text = say.Get("Pending Invitations");
+        InviteButton.Content = say.Get("Invite…");
+        InviteButton.Click += (_, _) => _ = InviteAsync();
         ReportsHeading.Text = say.Get("Reports");
         ReportsEmpty.Text = say.Get("Members can report a message or a person to you.");
         MembersHeading.Text = say.Get("Members");
@@ -227,7 +252,7 @@ public sealed partial class FamilyView : UserControl
         {
             if (!drawing)
             {
-                limit.Toggle(LimitSwitch.IsOn, FamilyText.Roster(family.Present()).Count, connection.Session.State.MaxFamilyMembers);
+                limit.Toggle(LimitSwitch.IsOn, FamilyText.Roster(family.Present()).Count, PaidFamilies.MemberCeiling(connection.Session.State));
             }
         };
         LimitBox.ValueChanged += (_, args) =>
@@ -237,7 +262,7 @@ public sealed partial class FamilyView : UserControl
             {
                 return;
             }
-            limit.Typed((int)Math.Round(args.NewValue), connection.Session.State.MaxFamilyMembers);
+            limit.Typed((int)Math.Round(args.NewValue), PaidFamilies.MemberCeiling(connection.Session.State));
         };
         LanguageChoice.SelectionChanged += (_, _) =>
         {
@@ -258,7 +283,36 @@ public sealed partial class FamilyView : UserControl
 
         onRoster = QueueRedraw;
         onBlock = (_, _) => QueueRedraw();
-        onSession = _ => QueueRedraw();
+        // Another family shown: the owner's lists were the last family's, and are read again for this one.
+        onSession = moved => DispatcherQueue.TryEnqueue(() =>
+        {
+            if (listsFamily != connection.Session.State.CurrentFamilyId)
+            {
+                listsFamily = connection.Session.State.CurrentFamilyId;
+                requests = [];
+                reports = [];
+                invitations = [];
+                _ = LoadOwnerListsAsync();
+            }
+            Draw();
+        });
+        // The owner's own connections hear their family's invitations come and go.
+        onInvitation = invitation => DispatcherQueue.TryEnqueue(() =>
+        {
+            if (invitation.FamilyId == connection.Session.State.CurrentFamilyId && invitation.User.Id != connection.Session.State.Me?.Id)
+            {
+                invitations = [.. invitations.Where(held => held.Id != invitation.Id), invitation];
+                Draw();
+            }
+        });
+        onInvitationGone = invitationId => DispatcherQueue.TryEnqueue(() =>
+        {
+            if (invitations.Any(held => held.Id == invitationId))
+            {
+                invitations = [.. invitations.Where(held => held.Id != invitationId)];
+                Draw();
+            }
+        });
         onResync = report => DispatcherQueue.TryEnqueue(() =>
         {
             _ = LoadOwnerListsAsync();
@@ -283,13 +337,20 @@ public sealed partial class FamilyView : UserControl
         connection.Router.BlockChanged += onBlock;
         connection.Session.Changed += onSession;
         connection.Live.Resynced += onResync;
+        connection.Router.InvitationChanged += onInvitation;
+        connection.Router.InvitationRemoved += onInvitationGone;
         Unloaded += (_, _) =>
         {
+            // Nothing moves on a screen that has gone, and every frame is given back rather than left to a finalizer.
+            stickers.Stop();
+            stickerThumbs.Clear();
             connection.Router.PackChanged -= onPack;
             connection.Router.RosterChanged -= onRoster;
             connection.Router.BlockChanged -= onBlock;
             connection.Session.Changed -= onSession;
             connection.Live.Resynced -= onResync;
+            connection.Router.InvitationChanged -= onInvitation;
+            connection.Router.InvitationRemoved -= onInvitationGone;
         };
         SizeChanged += (_, e) => Arrange(e.NewSize.Width);
         Draw();
@@ -331,6 +392,7 @@ public sealed partial class FamilyView : UserControl
             CopyButton.IsEnabled = house.InviteCode is not null;
             RotateButton.IsEnabled = !busy;
             DrawRequests();
+            DrawInvitations(state);
             DrawReports();
             DrawHouseRules(state, house);
         }
@@ -471,12 +533,15 @@ public sealed partial class FamilyView : UserControl
         return cell;
     }
 
-    /// <summary>A pack item's picture: its ORIGINAL bytes, whatever <c>has_preview</c> says, drawn still.</summary>
+    /// <summary>
+    /// A pack item's picture: its ORIGINAL bytes, whatever <c>has_preview</c> says — animated where this machine can, still
+    /// when Windows' animation effects are off.
+    /// </summary>
     private async Task ShowStickerAsync(Image image, TextBlock word, PackItemDto item)
     {
         try
         {
-            if (!stickerThumbs.TryGetValue(item.Id, out var decoded))
+            if (!stickerThumbs.TryGet(item.Id, out var decoded))
             {
                 var (bytes, error) = await pack.BytesAsync(item);
                 if (bytes is null)
@@ -488,17 +553,23 @@ public sealed partial class FamilyView : UserControl
                     return;
                 }
                 var scale = XamlRoot?.RasterizationScale ?? 1;
-                decoded = await StickerImaging.DecodeAsync(bytes, StickerLook.ManageCell, scale, animate: false);
-                // A null is kept: this grid is redrawn on every frame about the family, and a codec that is not there
-                // is still not there.
-                stickerThumbs[item.Id] = decoded;
+                // Asked again: the grid is redrawn on every frame about the family, and another cell of this item may have
+                // decoded it while this one fetched.
+                if (!stickerThumbs.TryGet(item.Id, out decoded))
+                {
+                    decoded = await StickerImaging.DecodeAsync(
+                        bytes, StickerLook.ManageCell, scale, StickerImaging.AnimationsWanted());
+                    // A null is kept: a codec that is not there is still not there.
+                    stickerThumbs.Put(item.Id, decoded, decoded?.Bytes ?? 0);
+                }
             }
             if (decoded is null)
             {
                 // The word stays: it is what says a sticker is here.
                 return;
             }
-            image.Source = decoded.First;
+            // The item's clock carries on across a redraw.
+            stickers.Show(image, decoded, stickerThumbs.Started(item.Id, stickers.Now));
             word.Visibility = Visibility.Collapsed;
         }
         catch (Exception e)
@@ -764,13 +835,18 @@ public sealed partial class FamilyView : UserControl
             var birthdayItem = new MenuFlyoutItem { Text = say.Get("Birthday…") };
             birthdayItem.Click += (_, _) => _ = MemberBirthdayAsync(member, me);
             menu.Items.Add(birthdayItem);
-            if (tools.Removable)
+            if (tools.ResetPassword)
             {
+                // Only where this owner owns every family the member is in (docs/protocol.md, "Several families", D7).
                 var reset = new MenuFlyoutItem { Text = say.Get("Reset Password…") };
                 reset.Click += (_, _) => _ = ResetPasswordAsync(
                     XamlRoot, say, member.DisplayName,
-                    async password => (await connection.Api.ResetMemberPassword(member.Id, password)).Error);
+                    async password => (await connection.Api.ResetMemberPassword(member.Id, password)).Error,
+                    connection.Session.State.MaxFamiliesPerAccount);
                 menu.Items.Add(reset);
+            }
+            if (tools.Removable)
+            {
                 var remove = new MenuFlyoutItem { Text = say.Get("Remove from Family") };
                 remove.Click += (_, _) => _ = RemoveAsync(member);
                 menu.Items.Add(remove);
@@ -829,10 +905,12 @@ public sealed partial class FamilyView : UserControl
                 return;
             }
             // Into the list first, so the conversation opens with its title: a chat made just now is in no list yet.
+            // Taken before the request, so its answer cannot undo a group changed meanwhile (ChatStore.Replace).
+            var mark = connection.Chats.ListMark;
             var list = await connection.Api.Chats();
             if (list is { Ok: true, Value.Chats: { } rows })
             {
-                connection.Chats.Replace(rows);
+                connection.Chats.Replace(rows, mark);
             }
             openChat(opened.Chat.Id);
         }
@@ -1002,7 +1080,8 @@ public sealed partial class FamilyView : UserControl
             PolicyChoice.IsEnabled = policyAsked is null;
             PolicyCaption.Text = HouseRules.PolicyCaption(policy, say);
 
-            var ceiling = state.MaxFamilyMembers;
+            // The family's own ceiling — a paid family's is lower — or the operator's on a server that predates it.
+            var ceiling = PaidFamilies.MemberCeiling(state);
             LimitSection.Visibility = ceiling > 0 ? Visibility.Visible : Visibility.Collapsed;
             if (ceiling > 0)
             {
@@ -1051,12 +1130,12 @@ public sealed partial class FamilyView : UserControl
         LanguageChoice.SelectedIndex = Math.Max(0, language);
         LanguageChoice.IsEnabled = idle;
         LanguageFootnote.Text = say.Format(
-            "The language %@ answers in when it is asked in the family chat. It is not this app's language — that follows the device. With none chosen, it answers in the language of whoever asked.",
+            "The language %@ answers in when it is asked in the family chat or a group. It is not this app's language — that follows the device. With none chosen, it answers in the language of whoever asked.",
             token);
         HistorySwitch.IsOn = shown.AiHistory;
         HistorySwitch.IsEnabled = idle;
         HistoryFootnote.Text = say.Format(
-            "With this on, mentioning %@ in the family chat sends the last month of that chat to the assistant, so it can answer questions about what was said earlier. With it off, only the message that mentions it is sent.",
+            "With this on, mentioning %@ in the family chat or a group sends the last month of that chat to the assistant, so it can answer questions about what was said earlier. With it off, only the message that mentions it is sent.",
             token);
 
         // Offered only where this server's assistant can look at pictures at all.
@@ -1064,7 +1143,7 @@ public sealed partial class FamilyView : UserControl
         VisionSwitch.IsOn = shown.AiVision;
         VisionSwitch.IsEnabled = idle;
         VisionFootnote.Text = say.Format(
-            "With this on, a photo is sent to the model your server is set up to use when a member attaches it to a question in their own chat with the assistant, attaches it to an %@ message in the family chat, or replies to a photo with %@ — never a photo the assistant was not pointed at, never from an earlier message unless Recent photos is on, and never a video, file or place. With it off, no photo is ever sent.",
+            "With this on, a photo is sent to the model your server is set up to use when a member attaches it to a question in their own chat with the assistant, attaches it to an %@ message in the family chat or a group, or replies to a photo with %@ — never a photo the assistant was not pointed at, never from an earlier message unless Recent photos is on, and never a video, file or place. With it off, no photo is ever sent.",
             token, token);
 
         // The two that ride on vision: inert-but-explained until what they draw from is there.
@@ -1073,7 +1152,7 @@ public sealed partial class FamilyView : UserControl
         RecentPhotosSwitch.IsEnabled = idle && picturesOn;
         RecentPhotosFootnote.Text = WithNote(
             say.Format(
-                "With this on, whenever anyone mentions %@ in the family chat, the most recent photos in that chat — up to %lld, from anyone, that nobody pointed the assistant at — also go to the model your server is set up to use, after any photo on the message itself or on the one it replies to. Nearly every mention then sends pictures, which costs more. It is off unless you turn it on.",
+                "With this on, whenever anyone mentions %@ in the family chat or a group, the most recent photos in that chat — up to %lld, from anyone, that nobody pointed the assistant at — also go to the model your server is set up to use, after any photo on the message itself or on the one it replies to. Nearly every mention then sends pictures, which costs more. It is off unless you turn it on.",
                 token, HouseRules.MaxPicturesPerQuestion),
             HouseRules.PicturesNote(assistant.Vision, shown,
                 say.Get("While Sees recent history is off this does nothing: the chat's history isn't sent, so no photo from it is either."), say));
@@ -1081,7 +1160,7 @@ public sealed partial class FamilyView : UserControl
         FacesSwitch.IsEnabled = idle && picturesOn;
         FacesFootnote.Text = WithNote(
             say.Format(
-                "With this on, whenever anyone mentions %@ in the family chat, the profile pictures of the members named in that chat's recent history — up to %lld — also go to the model your server is set up to use, so it can tell who is who. They are the pictures members chose for themselves, not photos anyone attached; never a member who has left, and never anyone outside this family. Most mentions then send pictures, which costs more. It is off unless you turn it on; with it off, no face is ever sent.",
+                "With this on, whenever anyone mentions %@ in the family chat or a group, the profile pictures of the members named in that chat's recent history — up to %lld — also go to the model your server is set up to use, so it can tell who is who. They are the pictures members chose for themselves, not photos anyone attached; never a member who has left, and never anyone outside this family. Most mentions then send pictures, which costs more. It is off unless you turn it on; with it off, no face is ever sent.",
                 token, HouseRules.MaxPicturesPerQuestion),
             HouseRules.PicturesNote(assistant.Vision, shown,
                 say.Get("While Sees recent history is off this does nothing: no names are sent, so no faces are either."), say));
@@ -1300,12 +1379,109 @@ public sealed partial class FamilyView : UserControl
             {
                 reports = open.Reports ?? [];
             }
+            if (FamilyRules.OffersInvite(connection.Session.State) && connection.Session.State.CurrentFamilyId is { } shown)
+            {
+                var (pending, failed) = await invites.PendingAsync(shown);
+                if (failed is null && shown == connection.Session.State.CurrentFamilyId)
+                {
+                    invitations = pending;
+                }
+            }
         }
         catch (Exception e)
         {
             Diagnostics.Write($"reading the owner's lists: {e.GetType().Name}");
         }
         Draw();
+    }
+
+    /// <summary>
+    /// The pending invitations into this family, each with "Withdraw Invitation" — and "Invite…" over them, while the owner has
+    /// another family to invite from.
+    /// </summary>
+    private void DrawInvitations(SessionState state)
+    {
+        var say = services.Say;
+        InvitationsSection.Visibility = FamilyRules.OffersInvite(state) ? Visibility.Visible : Visibility.Collapsed;
+        InvitationsList.Children.Clear();
+        foreach (var invitation in invitations)
+        {
+            if (InvitationsList.Children.Count > 0)
+            {
+                InvitationsList.Children.Add(Hairline());
+            }
+            var row = new Grid { ColumnSpacing = 14, Padding = new Thickness(20, 10, 16, 10) };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var face = new PersonPicture { Width = 40, Height = 40, DisplayName = invitation.User.DisplayName };
+            _ = ShowFaceAsync(face, invitation.User.Id, invitation.User.AvatarVersion);
+            row.Children.Add(face);
+            var words = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            words.Children.Add(new TextBlock { Text = invitation.User.DisplayName, FontWeight = FontWeights.SemiBold, TextTrimming = TextTrimming.CharacterEllipsis });
+            words.Children.Add(Secondary($"@{invitation.User.Username}"));
+            Grid.SetColumn(words, 1);
+            row.Children.Add(words);
+            var withdraw = new HyperlinkButton
+            {
+                Content = say.Get("Withdraw Invitation"),
+                IsEnabled = withdrawing is null,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            var id = invitation.Id;
+            withdraw.Click += (_, _) => _ = WithdrawAsync(id);
+            Grid.SetColumn(withdraw, 2);
+            row.Children.Add(withdraw);
+            InvitationsList.Children.Add(row);
+        }
+    }
+
+    /// <summary>"Invite…": the picker, then this family's pending list read again when anybody was invited.</summary>
+    private async Task InviteAsync()
+    {
+        try
+        {
+            if (await FamilyDialogs.InviteAsync(XamlRoot, services.Say, invites, connection.Session.State, invitations))
+            {
+                await LoadOwnerListsAsync();
+            }
+        }
+        catch (Exception e)
+        {
+            Diagnostics.Write($"inviting: {e.GetType().Name}");
+        }
+    }
+
+    private async Task WithdrawAsync(long invitationId)
+    {
+        if (withdrawing is not null || connection.Session.State.CurrentFamilyId is not { } shown)
+        {
+            return;
+        }
+        withdrawing = invitationId;
+        InvitationsError.Visibility = Visibility.Collapsed;
+        Draw();
+        try
+        {
+            if (await invites.WithdrawAsync(shown, invitationId) is { } error)
+            {
+                InvitationsError.Text = FamilyDialogs.InviteFailure(error, services.Say);
+                InvitationsError.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                invitations = [.. invitations.Where(held => held.Id != invitationId)];
+            }
+        }
+        catch (Exception e)
+        {
+            Diagnostics.Write($"withdrawing an invitation: {e.GetType().Name}");
+        }
+        finally
+        {
+            withdrawing = null;
+            Draw();
+        }
     }
 
     private void DrawRequests()

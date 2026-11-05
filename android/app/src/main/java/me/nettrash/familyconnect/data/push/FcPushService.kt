@@ -117,6 +117,14 @@ class FcPushService : FirebaseMessagingService() {
             // same push. Null on a server that predates the field, and on
             // every push that is not about a chat.
             unreadInChat = message.notification?.notificationCount,
+            // Which family the tap opens in (docs/protocol.md, "Several
+            // families"); absent on a direct chat's push and from an older
+            // server.
+            familyId = PushRouteParser.familyId(data),
+            // A paid family's deadline push (docs/protocol.md, "Paid
+            // families"): which stage, so the tap knows whether the family
+            // is still there to open.
+            stage = data[PushRouteParser.KEY_STAGE],
         )
     }
 

@@ -123,6 +123,7 @@
     <string name="s_your_other_devices_will_be_signed_out_this_one_stays_signe">Deine anderen Geräte werden abgemeldet. Dieses bleibt angemeldet.</string>
     <string name="e_action_failed">Aktion fehlgeschlagen</string>
     <string name="e_already_in_family">Du bist schon in einer Familie – zum Aktualisieren ziehen</string>
+    <string name="e_already_in_that_family">Du bist bereits in dieser Familie.</string>
     <string name="e_change_password_failed">Dein Passwort konnte nicht geändert werden.</string>
     <string name="e_change_policy_failed">Die Regel konnte nicht geändert werden</string>
     <string name="e_create_family_failed">Die Familie konnte nicht erstellt werden</string>
@@ -209,10 +210,10 @@
         <item quantity="other">%1$d Aufnahmen als Text</item>
     </plurals>
     <string name="s_family_language">Sprache der Familie</string>
-    <string name="s_family_language_explanation">Die Sprache, in der euer Assistent antwortet, wenn er im Familienchat gefragt wird. Die Sprache dieser App ändert sich dadurch nicht. Ohne Auswahl antwortet er in der Sprache der Frage.</string>
+    <string name="s_family_language_explanation">Die Sprache, in der euer Assistent antwortet, wenn er im Familienchat oder in einer Gruppe gefragt wird. Die Sprache dieser App ändert sich dadurch nicht. Ohne Auswahl antwortet er in der Sprache der Frage.</string>
     <string name="s_not_set">Nicht festgelegt</string>
     <string name="s_assistant_history">Assistent sieht den letzten Verlauf</string>
-    <string name="s_assistant_history_explanation">Erwähnt jemand den Assistenten im Familienchat, geht der letzte Monat dieses Chats mit der Frage mit, damit er zu früher Gesagtem antworten kann. Ist das aus, geht nur die Nachricht mit der Erwähnung raus.</string>
+    <string name="s_assistant_history_explanation">Erwähnt jemand den Assistenten im Familienchat oder in einer Gruppe, geht der letzte Monat dieses Chats mit der Frage mit, damit er zu früher Gesagtem antworten kann. Ist das aus, geht nur die Nachricht mit der Erwähnung raus.</string>
     <string name="s_birthday">Geburtstag</string>
     <string name="s_birthday_for">Geburtstag von %1$s</string>
     <string name="s_day_and_month_no_year">Ein Tag und ein Monat. Kein Jahr, kein Alter.</string>
@@ -260,7 +261,10 @@
     <string name="s_new_message">Neue Nachricht</string>
     <string name="e_finish_editing_first">Beende zuerst die Bearbeitung dieser Nachricht.</string>
     <string name="e_message_at_limit">Die Nachricht ist schon am Limit von %1$d Zeichen.</string>
-    <string name="e_paste_truncated">Eine Nachricht darf höchstens %1$d Zeichen haben. Der Rest wurde nicht eingefügt.</string>
+    <plurals name="e_paste_truncated">
+        <item quantity="one">Eine Nachricht darf höchstens %1$d Zeichen haben. Der Rest wurde nicht eingefügt.</item>
+        <item quantity="other">Eine Nachricht darf höchstens %1$d Zeichen haben. Der Rest wurde nicht eingefügt.</item>
+    </plurals>
     <plurals name="s_n_new_messages">
         <item quantity="one">%1$d neue Nachricht</item>
         <item quantity="other">%1$d neue Nachrichten</item>
@@ -303,10 +307,16 @@
     <string name="s_flip_camera">Kamera wechseln</string>
     <string name="e_camera_permission">Family braucht die Erlaubnis, die Kamera zu benutzen.</string>
     <string name="s_video_calls_are_off_on_this_server">Videoanrufe sind auf diesem Server aus</string>
-    <string name="e_attachment_limit">Eine Nachricht kann höchstens %1$d Anhänge tragen.</string>
+    <plurals name="e_attachment_limit">
+        <item quantity="one">Eine Nachricht kann höchstens %1$d Anhang tragen.</item>
+        <item quantity="other">Eine Nachricht kann höchstens %1$d Anhänge tragen.</item>
+    </plurals>
     <string name="s_share_choose_chat">Teilen an…</string>
     <string name="s_shared_with_family">Mit Family geteilt</string>
-    <string name="e_share_too_many">Nur die ersten %1$d Elemente wurden übernommen.</string>
+    <plurals name="e_share_too_many">
+        <item quantity="one">Nur das erste %1$d Element wurde übernommen.</item>
+        <item quantity="other">Nur die ersten %1$d Elemente wurden übernommen.</item>
+    </plurals>
     <string name="e_share_unavailable">Tritt zuerst einer Familie bei, dann kannst du hierher teilen.</string>
     <string name="e_share_failed">Das Geteilte konnte nicht gelesen werden.</string>
     <string name="s_no_connection">Keine Verbindung</string>
@@ -394,9 +404,18 @@
     <string name="s_member_limit">Mitgliederlimit</string>
     <string name="s_limit_members">Mitglieder begrenzen</string>
     <string name="s_most_members">Höchstzahl</string>
-    <string name="s_member_limit_none">Kein eigenes Limit. Dieser Server erlaubt bis zu %1$d Mitglieder pro Familie.</string>
-    <string name="s_member_limit_frozen">Aktuell %1$d Mitglieder. Niemand Neues kann beitreten, bis jemand geht; es wird niemand entfernt.</string>
-    <string name="s_member_limit_room">%1$d von %2$d Plätzen belegt.</string>
+    <plurals name="s_member_limit_none">
+        <item quantity="one">Kein eigenes Limit. Dieser Server erlaubt bis zu %1$d Mitglied pro Familie.</item>
+        <item quantity="other">Kein eigenes Limit. Dieser Server erlaubt bis zu %1$d Mitglieder pro Familie.</item>
+    </plurals>
+    <plurals name="s_member_limit_frozen">
+        <item quantity="one">Aktuell %1$d Mitglied. Niemand Neues kann beitreten, bis jemand geht; es wird niemand entfernt.</item>
+        <item quantity="other">Aktuell %1$d Mitglieder. Niemand Neues kann beitreten, bis jemand geht; es wird niemand entfernt.</item>
+    </plurals>
+    <plurals name="s_member_limit_room">
+        <item quantity="one">%1$d von %2$d Platz belegt.</item>
+        <item quantity="other">%1$d von %2$d Plätzen belegt.</item>
+    </plurals>
     <string name="s_decrease">Verringern</string>
     <string name="s_increase">Erhöhen</string>
     <string name="e_member_limit_failed">Das Mitgliederlimit konnte nicht geändert werden. Bitte erneut versuchen.</string>
@@ -436,10 +455,10 @@
     <string name="s_assistant_answer_failed">Der Assistent konnte diese Antwort nicht abschließen. Frag noch einmal.</string>
     <string name="s_assistant_provider_refused">Der Anbieter des Assistenten hat das abgelehnt. Versuch es anders zu formulieren.</string>
     <string name="s_assistant_vision">Assistent darf Fotos ansehen</string>
-    <string name="s_assistant_vision_explanation">Wenn jemand in seinem eigenen Chat mit dem Assistenten ein Foto an eine Frage anhängt, im Familienchat ein Foto an eine Nachricht hängt, die den Assistenten erwähnt, oder mit einer Erwähnung des Assistenten auf ein Foto antwortet, wird dieses Foto mit der Frage an das Modell gesendet — höchstens 4 pro Frage. Ein Foto, das niemand dem Assistenten gezeigt hat, wird nie gesendet, auch nicht aus einer früheren Nachricht — außer „Assistent sieht aktuelle Fotos“ ist an —, und Videos, Dateien, Audio und Standorte ebenso wenig. Standardmäßig aus; ist es aus, wird nie ein Foto gesendet.</string>
+    <string name="s_assistant_vision_explanation">Wenn jemand in seinem eigenen Chat mit dem Assistenten ein Foto an eine Frage anhängt, im Familienchat oder in einer Gruppe ein Foto an eine Nachricht hängt, die den Assistenten erwähnt, oder mit einer Erwähnung des Assistenten auf ein Foto antwortet, wird dieses Foto mit der Frage an das Modell gesendet — höchstens 4 pro Frage. Ein Foto, das niemand dem Assistenten gezeigt hat, wird nie gesendet, auch nicht aus einer früheren Nachricht — außer „Assistent sieht aktuelle Fotos“ ist an —, und Videos, Dateien, Audio und Standorte ebenso wenig. Standardmäßig aus; ist es aus, wird nie ein Foto gesendet.</string>
     <string name="e_change_assistant_vision_failed">Einstellung konnte nicht geändert werden</string>
     <string name="s_assistant_history_photos">Assistent sieht aktuelle Fotos</string>
-    <string name="s_assistant_history_photos_explanation">Erwähnt jemand den Assistenten im Familienchat, gehen auch die neuesten Fotos aus diesem Chat — bis zu 4, von wem auch immer, die niemand dem Assistenten gezeigt hat — mit der Frage an das Modell, nach den Fotos an der Nachricht selbst oder an der, auf die sie antwortet. Fast jede Erwähnung sendet dann Bilder, und das kostet mehr. Braucht „Assistent darf Fotos ansehen“ und „Assistent sieht den letzten Verlauf“; aus, bis du es einschaltest.</string>
+    <string name="s_assistant_history_photos_explanation">Erwähnt jemand den Assistenten im Familienchat oder in einer Gruppe, gehen auch die neuesten Fotos aus diesem Chat — bis zu 4, von wem auch immer, die niemand dem Assistenten gezeigt hat — mit der Frage an das Modell, nach den Fotos an der Nachricht selbst oder an der, auf die sie antwortet. Fast jede Erwähnung sendet dann Bilder, und das kostet mehr. Braucht „Assistent darf Fotos ansehen“ und „Assistent sieht den letzten Verlauf“; aus, bis du es einschaltest.</string>
     <string name="s_assistant_history_photos_no_deployment">Hier nicht verfügbar: Der Assistent auf diesem Server kann keine Bilder ansehen.</string>
     <string name="s_assistant_history_photos_needs_vision">Schalte zuerst „Assistent darf Fotos ansehen“ ein — solange das aus ist, lehnt der Server dies ab.</string>
     <string name="s_assistant_history_photos_needs_history">Solange „Assistent sieht den letzten Verlauf“ aus ist, bewirkt das nichts: Der Verlauf des Chats wird nicht gesendet, also auch kein Foto daraus.</string>
@@ -449,7 +468,7 @@
     <string name="s_assistant_greeting_no_server">Hier nicht verfügbar: Dieser Server verschickt keine täglichen Grüße.</string>
     <string name="e_change_assistant_greeting_failed">Einstellung konnte nicht geändert werden</string>
     <string name="s_assistant_faces">Assistent sieht Gesichter der Mitglieder</string>
-    <string name="s_assistant_faces_explanation">Wenn jemand den Assistenten im Familienchat erwähnt, werden auch die Profilbilder der Mitglieder, die im jüngsten Verlauf dieses Chats genannt werden — bis zu 4 — mit der Frage an das Modell gesendet, damit es erkennt, wer wer ist. Es sind die Bilder, die die Mitglieder für sich selbst gewählt haben, keine angehängten Fotos; nie ein Mitglied, das gegangen ist, und nie jemand außerhalb dieser Familie. Die meisten Erwähnungen senden dann Bilder, was mehr kostet. Braucht „Assistent darf Fotos ansehen“ und „Assistent sieht den letzten Verlauf“; aus, bis du es einschaltest — und solange es aus ist, wird nie ein Gesicht gesendet.</string>
+    <string name="s_assistant_faces_explanation">Wenn jemand den Assistenten im Familienchat oder in einer Gruppe erwähnt, werden auch die Profilbilder der Mitglieder, die im jüngsten Verlauf dieses Chats genannt werden — bis zu 4 — mit der Frage an das Modell gesendet, damit es die Mitglieder auseinanderhalten kann. Es sind die Bilder, die die Mitglieder für sich selbst gewählt haben, keine angehängten Fotos; nie ein Mitglied, das gegangen ist, und nie jemand außerhalb dieser Familie. Die meisten Erwähnungen senden dann Bilder, was mehr kostet. Braucht „Assistent darf Fotos ansehen“ und „Assistent sieht den letzten Verlauf“; aus, bis du es einschaltest — und solange es aus ist, wird nie ein Gesicht gesendet.</string>
     <string name="s_assistant_faces_needs_history">Solange „Assistent sieht den letzten Verlauf“ aus ist, bewirkt das nichts: Es werden keine Namen gesendet, also auch keine Gesichter.</string>
     <string name="e_change_assistant_faces_failed">Einstellung konnte nicht geändert werden</string>
     <string name="s_open_polls">Offene Umfragen</string>
@@ -516,7 +535,10 @@
     </plurals>
     <string name="s_mentions_you">Erwähnt dich</string>
     <string name="s_mention_member">%1$s erwähnen</string>
-    <string name="s_note_characters_left">Noch %1$d Zeichen</string>
+    <plurals name="s_note_characters_left">
+        <item quantity="one">Noch %1$d Zeichen</item>
+        <item quantity="other">Noch %1$d Zeichen</item>
+    </plurals>
     <string name="s_your_note">Deine Notiz</string>
     <string name="s_note_preview">Vorschau</string>
     <string name="s_font">Schrift</string>
@@ -529,12 +551,20 @@
     <string name="s_rsvp_going">Komme</string>
     <string name="s_rsvp_maybe">Vielleicht</string>
     <string name="s_rsvp_no">Kann nicht</string>
-    <string name="s_rsvp_going_count">%1$d kommen</string>
-    <string name="s_rsvp_maybe_count">%1$d vielleicht</string>
-    <string name="s_rsvp_going_maybe_count">%1$d kommen, %2$d vielleicht</string>
+    <plurals name="s_rsvp_going_count">
+        <item quantity="one">%1$d kommt</item>
+        <item quantity="other">%1$d kommen</item>
+    </plurals>
+    <plurals name="s_rsvp_maybe_count">
+        <item quantity="one">%1$d vielleicht</item>
+        <item quantity="other">%1$d vielleicht</item>
+    </plurals>
+    <plurals name="s_rsvp_going_maybe_count">
+        <item quantity="one">%1$d kommt, %2$d vielleicht</item>
+        <item quantity="other">%1$d kommen, %2$d vielleicht</item>
+    </plurals>
     <string name="s_add_event">Termin hinzufügen</string>
     <string name="s_event_when">Wann</string>
-    <string name="s_event_where">Wo</string>
     <string name="s_event_place">Ort</string>
     <string name="s_event_has_end">Hat ein Ende</string>
     <string name="s_event_starts">Beginnt</string>
@@ -544,14 +574,15 @@
     <string name="s_event">Termin</string>
     <string name="s_list">Liste</string>
     <string name="s_new_list">Neue Liste</string>
-    <string name="s_add_list">Liste</string>
     <string name="s_add_task_list">Eine Aufgabenliste hinzufügen</string>
     <string name="s_things_to_do">Zu erledigen</string>
     <string name="s_thing_to_do">Aufgabe</string>
     <string name="s_add_a_thing">Aufgabe hinzufügen</string>
     <string name="s_nothing_on_this_list">Auf dieser Liste steht noch nichts.</string>
-    <string name="s_your_list">Deine Liste</string>
-    <string name="s_tasks_done_of">%1$d von %2$d erledigt</string>
+    <plurals name="s_tasks_done_of">
+        <item quantity="one">%1$d von %2$d erledigt</item>
+        <item quantity="other">%1$d von %2$d erledigt</item>
+    </plurals>
     <string name="s_done">Fertig</string>
     <plurals name="s_more_things">
         <item quantity="one">+%1$d weitere</item>
@@ -569,8 +600,8 @@
     <string name="s_the_assistant">Der Assistent</string>
     <string name="s_before_the_assistant_answers">Bevor der Assistent antwortet</string>
     <string name="s_consent_words_leave_for_processor">Was du dem Assistenten schreibst, verlässt den Server dieser Familie und geht an %1$s.</string>
-    <string name="s_consent_family_history_travels">Im Familienchat geht nur eine Nachricht raus, in der @ai steht – und mit ihr die letzten 30 Tage dieses Chats, bis zu 200 Nachrichten, samt dem, was andere geschrieben haben, ihren Namen und den Uhrzeiten.</string>
-    <string name="s_consent_family_mention_alone">Im Familienchat geht nur eine Nachricht raus, in der @ai steht – sonst nichts aus diesem Chat.</string>
+    <string name="s_consent_family_history_travels">Im Familienchat oder in einer Gruppe geht nur eine Nachricht raus, in der @ai steht – und mit ihr die letzten 30 Tage dieses Chats, bis zu 200 Nachrichten, samt dem, was andere geschrieben haben, ihren Namen und den Uhrzeiten.</string>
+    <string name="s_consent_family_mention_alone">Im Familienchat oder in einer Gruppe geht nur eine Nachricht raus, in der @ai steht – sonst nichts aus diesem Chat.</string>
     <string name="s_consent_photo_only_when_attached">Ein Foto geht nur mit, wenn du es an eine Nachricht für den Assistenten anhängst – und nur, solange deine Familie das erlaubt.</string>
     <string name="s_consent_answer_lands_in_the_chat">Die Antwort kommt als Nachricht in diesem Chat zurück, wo alle im Chat sie lesen können.</string>
     <string name="s_consent_can_stop_in_settings">Du kannst das jederzeit in den Einstellungen stoppen. Was schon gesendet wurde, lässt sich nicht zurückholen.</string>
@@ -608,7 +639,10 @@
     <string name="s_sticker_add_failed">Der Sticker konnte nicht hinzugefügt werden. Versuch es noch einmal.</string>
     <string name="s_sticker_unreadable">Dieses Bild konnte nicht gelesen werden.</string>
     <string name="s_sticker_animated_must_be_webp">Animierte Sticker müssen WebP sein. Dieser kann nicht hinzugefügt werden.</string>
-    <string name="s_sticker_label_too_long">Eine Beschreibung darf höchstens %1$d Zeichen lang sein.</string>
+    <plurals name="s_sticker_label_too_long">
+        <item quantity="one">Eine Beschreibung darf höchstens %1$d Zeichen lang sein.</item>
+        <item quantity="other">Eine Beschreibung darf höchstens %1$d Zeichen lang sein.</item>
+    </plurals>
     <string name="s_sticker_remove_not_allowed">Nur wer einen Sticker hinzugefügt hat oder wem die Familie gehört, kann ihn entfernen.</string>
     <string name="s_sticker_remove_failed">Der Sticker konnte nicht entfernt werden. Versuch es noch einmal.</string>
     <string name="s_sticker_not_available_offline">Dieser Sticker ist noch nicht auf diesem Handy. Versuch es noch einmal, wenn du online bist.</string>
@@ -628,12 +662,13 @@
     <string name="s_assistant_transcripts_explanation">Wenn das an ist, können Mitglieder im Familienchat den Text der Sprachnachrichten, Audios und Videos anderer Mitglieder abrufen, und der Ton dieser Aufnahme wird dann an %1$s gesendet. Er wird nur gesendet, wenn jemand danach fragt, und nur, wenn das Mitglied, das sie geschickt hat, dem Assistenten zugestimmt hat. Den Text der eigenen Aufnahmen kann jeder auch ohne diese Einstellung abrufen. Es ist aus, solange du es nicht einschaltest.</string>
     <string name="s_assistant_transcripts_no_server">Hier nicht verfügbar: Dieser Server kann Aufnahmen nicht in Text umwandeln.</string>
     <string name="s_consent_transcript_sound_sent">Wenn du den Text einer Sprachnachricht, einer Audiodatei oder eines Videos abrufst, wird der Ton an %1$s gesendet.</string>
+    <string name="s_consent_transcript_direct_chat">In einem Direktchat oder einer Gruppe können die anderen darin den Text deiner Sprachnachrichten, Audiodateien und Videos abrufen; ihr Ton wird dann an %1$s gesendet.</string>
     <string name="e_change_assistant_transcripts_failed">Einstellung konnte nicht geändert werden</string>
     <!-- Looking things up (#72): docs/protocol.md, "Looking things up" -->
     <string name="s_looking_things_up">Nachschlagen</string>
     <string name="s_assistant_lookups">Kann nachschlagen</string>
     <string name="s_assistant_lookups_explanation">Wenn das an ist, kann der Assistent nachschlagen, wenn eine Frage es braucht – das Wetter, die Nachrichten, eine Tatsache, bei der er unsicher ist –, und zwar bei %1$s. An sie geht nur eine kurze Suchanfrage oder ein Ortsname, den der Assistent aus der Frage formuliert, nie das Gespräch selbst, und nur, wenn das fragende Mitglied dem zugestimmt hat. Antworten nennen dann ihre Quellen. Es ist aus, solange du es nicht einschaltest.</string>
-    <string name="s_consent_lookups_with_history">Wenn der Eigentümer deiner Familie das Nachschlagen einschaltet, kann der Assistent eine kurze Suchanfrage oder einen Ortsnamen, den er aus deiner Frage formuliert – im Familienchat womöglich auch aus den letzten Nachrichten –, an %1$s senden; seine Antwort nennt dann ihre Quellen.</string>
+    <string name="s_consent_lookups_with_history">Wenn der Eigentümer deiner Familie das Nachschlagen einschaltet, kann der Assistent eine kurze Suchanfrage oder einen Ortsnamen, den er aus deiner Frage formuliert – im Familienchat oder in einer Gruppe womöglich auch aus den letzten Nachrichten –, an %1$s senden; seine Antwort nennt dann ihre Quellen.</string>
     <string name="s_consent_lookups_alone">Wenn der Eigentümer deiner Familie das Nachschlagen einschaltet, kann der Assistent eine kurze Suchanfrage oder einen Ortsnamen, den er aus deiner Frage formuliert, an %1$s senden; seine Antwort nennt dann ihre Quellen.</string>
     <string name="s_agree_with_lookups">Mit Nachschlagen zustimmen</string>
     <string name="s_agree_without_lookups">Ohne Nachschlagen zustimmen</string>
@@ -723,4 +758,64 @@
     <string name="s_not_sent">Nicht gesendet</string>
     <string name="s_switch">Wechseln</string>
     <string name="s_stop">Stopp</string>
+    <!-- Groups (#107; docs/protocol.md, "Groups") -->
+    <string name="s_new_group">Neue Gruppe</string>
+    <string name="s_group_name">Gruppenname</string>
+    <string name="s_create_group">Gruppe erstellen</string>
+    <string name="s_group_info">Gruppeninfo</string>
+    <string name="s_add_members">Mitglieder hinzufügen</string>
+    <string name="s_rename_group">Gruppe umbenennen</string>
+    <string name="s_remove_from_group">Aus der Gruppe entfernen</string>
+    <string name="s_leave_group">Gruppe verlassen</string>
+    <string name="s_delete_group">Gruppe löschen</string>
+    <string name="s_group_admin">Admin</string>
+    <string name="s_group">Gruppe</string>
+    <string name="s_group_members_count">Mitglieder: %1$d</string>
+    <string name="s_delete_group_confirm">„%1$s“ löschen? Die Nachrichten werden für alle gelöscht.</string>
+    <string name="s_leave_group_confirm">„%1$s“ verlassen? Du kommst nur zurück, wenn dich der Admin wieder hinzufügt.</string>
+    <string name="e_group_choose_member">Wähle mindestens ein Mitglied.</string>
+    <string name="e_group_name_length">Ein Gruppenname hat 1 bis 64 Zeichen.</string>
+    <string name="e_too_many_groups">Deine Familie hat schon 50 Gruppen.</string>
+    <string name="e_not_group_admin">Das kann nur der Admin der Gruppe.</string>
+    <string name="e_create_group_failed">Die Gruppe konnte nicht erstellt werden.</string>
+    <string name="e_change_group_failed">Die Gruppe konnte nicht geändert werden.</string>
+    <string name="s_everyone_already_in_group">Alle aus der Familie sind schon in dieser Gruppe.</string>
+    <!-- Several families (#88; docs/protocol.md, "Several families"). -->
+    <string name="s_families">Familien</string>
+    <string name="s_new_family">Neue Familie…</string>
+    <string name="s_join_another_family">Weiterer Familie beitreten…</string>
+    <string name="s_switch_family">Familie wechseln</string>
+    <string name="s_family_unread">%1$s, %2$d ungelesen</string>
+    <string name="s_invited_you_to">%1$s lädt dich zu „%2$s“ ein</string>
+    <string name="s_invitations">Einladungen</string>
+    <string name="s_invite">Einladen…</string>
+    <string name="s_invite_to">Zu „%s“ einladen</string>
+    <string name="s_invite_empty">Mitglieder deiner anderen Familien, die noch nicht in dieser sind, erscheinen hier.</string>
+    <string name="s_invited">Eingeladen</string>
+    <string name="s_pending_invitations">Offene Einladungen</string>
+    <string name="s_withdraw_invitation">Einladung zurückziehen</string>
+    <string name="e_invitation_gone">Diese Einladung ist nicht mehr verfügbar.</string>
+    <string name="e_too_many_families">Du bist bereits in so vielen Familien, wie ein Konto sein kann (%d).</string>
+    <string name="e_already_own_a_family">Du besitzt bereits eine Familie und kannst keine weitere gründen.</string>
+    <string name="e_member_families_disabled">Dieser Server erlaubt Mitgliedern nicht, neue Familien zu gründen.</string>
+    <string name="e_member_in_other_families">Dieses Mitglied ist auch in einer Familie, die dir nicht gehört – nur diese Person kann ihr Passwort ändern.</string>
+    <string name="s_leave_named_family">„%s“ verlassen?</string>
+    <string name="s_leave_one_of_families_explanation">Du verlierst den Zugang zu den Chats dieser Familie. Direktchats mit Personen, mit denen du eine andere Familie teilst, bleiben.</string>
+    <string name="s_new_family_explanation">Gründe deine eigene Familie. Sie gehört dir, und du kannst Mitglieder deiner anderen Familien einladen.</string>
+    <!-- Paid families (#89; docs/protocol.md, "Paid families"). -->
+    <string name="s_gate_cannot_start_here">Auf diesem Server kann in dieser App keine neue Familie gegründet werden.</string>
+    <string name="e_subscription_required">Für eine neue Familie auf diesem Server ist ein Abo nötig.</string>
+    <string name="s_banner_member">„%1$s“ wird am %2$s gelöscht, weil das Abo abgelaufen ist. Nur %3$s (Besitzer:in) kann es verlängern.</string>
+    <string name="s_banner_owner_not_here">„%1$s“ wird am %2$s gelöscht, weil dein Abo abgelaufen ist. In dieser App kann es nicht verlängert werden.</string>
+    <string name="s_allowance_title">Kontingent in diesem Monat</string>
+    <string name="s_allowance_storage">Speicher</string>
+    <string name="s_allowance_assistant">Assistent</string>
+    <string name="s_allowance_pictures">Bilder</string>
+    <string name="s_allowance_transcripts">Transkripte</string>
+    <string name="s_allowance_of">%1$s von %2$s</string>
+    <string name="s_allowance_percent">%1$d %% verbraucht</string>
+    <string name="s_allowance_minutes">%1$d von %2$d Min.</string>
+    <string name="s_allowance_renews_on">Erneuert sich am %1$s</string>
+    <string name="e_storage_allowance_used">Diese Familie hat ihr Speicherkontingent aufgebraucht.</string>
+    <string name="e_ai_allowance_used">Diese Familie hat ihr Assistenten-Kontingent für diesen Monat aufgebraucht. Es erneuert sich am %1$s.</string>
 </resources>

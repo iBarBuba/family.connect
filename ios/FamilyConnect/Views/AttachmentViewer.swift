@@ -154,7 +154,11 @@ struct AttachmentViewer: View {
 
     @ViewBuilder
     private func page(_ item: AttachmentDTO) -> some View {
-        if item.isVideo {
+        if item.isAnimation {
+            // An animation (#96): larger, playing, muted and looping, with
+            // no player controls — and only on the page that is up.
+            AnimationViewerPlayer(attachment: item, isCurrent: position == item.id)
+        } else if item.isVideo {
             // Plays only while it is the page that is up: a lazy stack
             // materialises the neighbours early, and a clip that started
             // playing off-screen would be heard before it was seen.
@@ -189,10 +193,9 @@ private struct ZoomablePhoto: View {
 
     var body: some View {
         GeometryReader { geometry in
-            // Reading `store.generation` inside the body is what makes the
-            // view re-render when the fetch lands (the store is the only
-            // thing that knows), the same trick AttachmentView uses.
-            let _ = store.generation
+            // Each lookup registers this view on its own key, which is what
+            // re-renders it when the fetch lands (AttachmentView has the
+            // rule).
             if let image = store.image(id: attachment.id, preview: false) {
                 image
                     .resizable()
@@ -350,6 +353,14 @@ private struct VideoAttachmentPlayer: View {
     /// handle rather than a flag.
     @State private var stream = AttachmentStreamPlayer()
 
+    /// Whether this page took the audio session for playback and still owes
+    /// it back (issue #98). Without it a video plays in the app's default
+    /// session, `.soloAmbient`, which the Ring/Silent switch MUTES — so a
+    /// clip played on a phone set to silent had no sound, unless a voice
+    /// note or a circle had played earlier in the run and left `.playback`
+    /// behind. That "sometimes" is what read as an upload without audio.
+    @State private var holdsSession = false
+
     var body: some View {
         Group {
             // Nil for one runloop turn longer than before — the actor hop
@@ -366,15 +377,38 @@ private struct VideoAttachmentPlayer: View {
         }
         .onAppear { if isCurrent { start() } }
         .onChange(of: isCurrent) { _, current in
-            if current { start() } else { stream.stop() }
+            if current { start() } else { stop() }
         }
         // Paging away or dismissing the viewer mid-load cancels it, so a
         // player is never handed to a page that has gone.
-        .onDisappear { stream.stop() }
+        .onDisappear { stop() }
     }
 
     private func start() {
-        stream.start(attachment: attachment.id, from: coordinator.api)
+        // `onReady` runs before `play()`, so the first frame already has
+        // the session; it never runs for a load that was cancelled.
+        stream.start(attachment: attachment.id, from: coordinator.api) { _ in
+            takeSession()
+        }
+    }
+
+    private func stop() {
+        stream.stop()
+        giveSession()
+    }
+
+    /// The same session a voice note and a circle take (`PlaybackSessionControl`),
+    /// which stands aside while a call holds it.
+    private func takeSession() {
+        guard !holdsSession else { return }
+        holdsSession = true
+        PlaybackSessionControl.system.begin()
+    }
+
+    private func giveSession() {
+        guard holdsSession else { return }
+        holdsSession = false
+        PlaybackSessionControl.system.end()
     }
 }
 

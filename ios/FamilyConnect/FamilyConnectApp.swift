@@ -68,6 +68,10 @@ struct FamilyConnectApp: App {
     /// the cache away every time anything above it changed.
     private let avatars: AvatarStore?
     private let attachments: AttachmentStore?
+    /// Paid families' App Store side (docs/protocol.md, "Paid families"):
+    /// the update listener and the subscription screen's purchases, one per
+    /// process beside the session.
+    private let subscriptions: SubscriptionManager?
 
     init() {
         // UI-test hook: launch with a clean slate so the smoke test can
@@ -245,6 +249,52 @@ struct FamilyConnectApp: App {
             session.applyBlockedIDs = { [weak coordinator] ids in
                 coordinator?.replaceBlocks(with: ids)
             }
+            // Several families (docs/protocol.md, "Several families"): the
+            // session decides which family is shown and which are held; the
+            // store follows through these.
+            session.onCurrentFamilyChanged = { [weak coordinator] familyID in
+                coordinator?.projectRoster(onto: familyID ?? 0)
+            }
+            session.dropFamilyData = { [weak coordinator] familyID in
+                coordinator?.dropFamily(familyID)
+            }
+            session.adoptUnattributedFamilyData = { [weak coordinator] homeID in
+                coordinator?.adoptUnattributed(into: homeID)
+            }
+            session.chatFamilyIDs = { [weak coordinator] chatID in
+                coordinator?.chatFamilyIDs(of: chatID)
+            }
+            // What a `/me` listing no family asks on a cold launch, before
+            // the session holds any list of its own (`AppSession.apply(me:)`).
+            session.holdsFamilyData = { [weak coordinator] in
+                coordinator?.holdsFamilyData() ?? false
+            }
+            session.requestResync = { [weak coordinator] in
+                Task { await coordinator?.resync() }
+            }
+            // Paid families. The manager meets the session and the server
+            // only through these, so its decisions are tested with a fake
+            // store and no network (SubscriptionManager).
+            let subscriptions = SubscriptionManager(store: StoreKitSubscriptionStore())
+            subscriptions.send = { transaction, renewal in
+                try await coordinator.api.putSubscription(transaction: transaction, renewal: renewal)
+            }
+            subscriptions.apply = { [weak session] in session?.applySubscription($0) }
+            subscriptions.refresh = { [weak session] in
+                guard let me = try? await coordinator.api.me() else { return }
+                session?.apply(me: me)
+            }
+            subscriptions.onUnauthorized = { [weak session] in session?.handleUnauthorized() }
+            subscriptions.remember = { AppSettings.subscriptionProducts = $0 }
+            subscriptions.remembered = { AppSettings.subscriptionProducts }
+            session.applySubscriptionConfig = { [weak subscriptions] me in
+                subscriptions?.configure(
+                    enabled: me.subscriptionsEnabled, productIDs: me.subscriptionProducts,
+                    appAccountToken: me.appAccountToken)
+            }
+            session.resumeSubscriptions = { [weak subscriptions] in subscriptions?.startRemembered() }
+            session.resetSubscriptions = { [weak subscriptions] in subscriptions?.reset() }
+            self.subscriptions = subscriptions
             session.clearChatStore = { [weak coordinator] in
                 let context = container.mainContext
                 try? context.delete(model: MessageEntity.self)
@@ -256,6 +306,10 @@ struct FamilyConnectApp: App {
                 try? context.delete(model: ChatEntity.self)
                 try? context.delete(model: MemberEntity.self)
                 try? context.delete(model: NoteEntity.self)
+                // The board's gone set with its notes. It used to survive a
+                // kick or a leave — ids that can never come back, kept for a
+                // family the account is no longer in.
+                try? context.delete(model: GoneNoteEntity.self)
                 // The pack is the family's, like the board: the next account
                 // on this device may be in another family, or in none.
                 // Through the coordinator and not row by row here, because
@@ -419,6 +473,13 @@ struct FamilyConnectApp: App {
                 RoundVideoPlays.voiceNotes.removeAll()
             }
             coordinator.bind(attachmentStore: attachments)
+            // A chat this device drops (a group left, removed from or
+            // deleted — docs/protocol.md, "Groups") takes its not-sent voice
+            // notes with it: they could never be sent anywhere now.
+            coordinator.onChatDropped = { chatID in
+                let parked = ParkedRecordings.shared
+                for entry in parked.entries(for: chatID) { parked.remove(entry) }
+            }
             // Logout wipes the store; faces must go with it, or the next
             // account inherits this one's.
             session.clearAvatarCache = {
@@ -441,6 +502,7 @@ struct FamilyConnectApp: App {
             #endif
             self.avatars = nil
             self.attachments = nil
+            self.subscriptions = nil
         }
     }
 
@@ -465,6 +527,7 @@ struct FamilyConnectApp: App {
                     .environment(previewLoader)
                     .environment(avatars ?? AvatarStore(api: coordinator.api))
                     .environment(attachments ?? AttachmentStore(api: coordinator.api))
+                    .environment(subscriptions)
             }
         case .failure(let error):
             StoreErrorView(error: error)

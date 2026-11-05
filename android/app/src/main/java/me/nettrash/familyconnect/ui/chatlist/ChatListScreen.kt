@@ -2,10 +2,16 @@
  * ChatListScreen.kt
  * Family Connect (Android)
  *
- * The home screen: family chat pinned on top, direct chats by recency.
- * Row = avatar + title + last-message preview + relative time + unread
- * badge. FAB opens a bottom-sheet member picker (idempotent get-or-
- * create direct chat). OfflineBanner under the app bar.
+ * The home screen: family chat pinned on top, direct chats and groups by
+ * recency. Row = avatar + title + last-message preview + relative time +
+ * unread badge. FAB opens a bottom-sheet member picker (idempotent get-or-
+ * create direct chat), which also starts a group (#107; docs/protocol.md,
+ * "Groups"). OfflineBanner under the app bar.
+ *
+ * Several families (#88): with a switcher to show, the title is the current
+ * family's name and opens it; an invitation waiting is a banner over the
+ * list (docs/protocol.md, "Several families"), and so is an unpaid family's
+ * deadline (#89; docs/protocol.md, "Paid families").
  *
  * iOS counterpart: ios/FamilyConnect/UI/ChatList/ChatListView.swift
  */
@@ -45,6 +51,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -52,6 +60,7 @@ import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.automirrored.outlined.StickyNote2
+import androidx.compose.material.icons.outlined.Groups
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material3.Badge
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -90,10 +99,18 @@ import androidx.compose.material3.BadgedBox
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import me.nettrash.familyconnect.R
 import me.nettrash.familyconnect.data.db.ChatEntity
+import me.nettrash.familyconnect.data.db.MemberEntity
 import me.nettrash.familyconnect.ui.components.Avatar
 import me.nettrash.familyconnect.ui.components.EmptyState
 import me.nettrash.familyconnect.ui.components.ErrorCard
 import me.nettrash.familyconnect.ui.components.OfflineBanner
+import me.nettrash.familyconnect.ui.families.FamilySwitcherSheet
+import me.nettrash.familyconnect.ui.families.FamilySwitcherTitle
+import me.nettrash.familyconnect.ui.families.InvitationBanner
+import me.nettrash.familyconnect.ui.families.UnpaidFamilyBanner
+import me.nettrash.familyconnect.ui.group.GroupAvatarMark
+import me.nettrash.familyconnect.ui.group.NewGroupForm
+import me.nettrash.familyconnect.util.GroupRules
 import me.nettrash.familyconnect.util.TimeFormat
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -104,6 +121,10 @@ fun ChatListScreen(
     onOpenBoard: () -> Unit,
     /** The chat open beside this list in the two-pane shape, drawn as selected; null on the phone. */
     selectedChatId: Long? = null,
+    /** The switcher's "New Family…". */
+    onNewFamily: () -> Unit = {},
+    /** The switcher's "Join Another Family…". */
+    onJoinFamily: () -> Unit = {},
     viewModel: ChatListViewModel = hiltViewModel(),
 ) {
     // The chats StateFlow seeds with null in the ViewModel until Room's
@@ -119,13 +140,32 @@ fun ChatListScreen(
     val myUserId by viewModel.myUserId.collectAsStateWithLifecycle()
     val socketState by viewModel.socketState.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
+    val groupCandidates by viewModel.groupCandidates.collectAsStateWithLifecycle()
+    val groupError by viewModel.groupError.collectAsStateWithLifecycle()
+    val creatingGroup by viewModel.creatingGroup.collectAsStateWithLifecycle()
+    val families by viewModel.families.collectAsStateWithLifecycle()
+    val answeringInvitation by viewModel.answeringInvitation.collectAsStateWithLifecycle()
+    val unpaidBanner by viewModel.unpaidBanner.collectAsStateWithLifecycle()
+    var showSwitcher by rememberSaveable { mutableStateOf(false) }
     var showPicker by remember { mutableStateOf(false) }
+    // The sheet's second face, New Group, and what is typed and ticked in
+    // it — saveable, so a rotation mid-form keeps the name and the ticks.
+    var newGroupOpen by rememberSaveable { mutableStateOf(false) }
+    var groupName by rememberSaveable { mutableStateOf("") }
+    var groupSelected by rememberSaveable { mutableStateOf(emptyList<Long>()) }
+    val closePicker = {
+        showPicker = false
+        newGroupOpen = false
+        groupName = ""
+        groupSelected = emptyList()
+        viewModel.clearGroupError()
+    }
     val listState = rememberLazyListState()
     val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
 
     LaunchedEffect(Unit) {
         viewModel.navigateToChat.collect { chatId ->
-            showPicker = false
+            closePicker()
             onOpenChat(chatId)
         }
     }
@@ -164,7 +204,17 @@ fun ChatListScreen(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
         topBar = {
             TopAppBar(
-                title = { Text(stringResource(R.string.s_chats)) },
+                title = {
+                    // The family's name, opening the switcher — only when
+                    // there is one to open; an account in one family with
+                    // nothing pending keeps "Chats".
+                    val currentName = families.currentName
+                    if (families.showsSwitcher && currentName != null) {
+                        FamilySwitcherTitle(name = currentName, onClick = { showSwitcher = true })
+                    } else {
+                        Text(stringResource(R.string.s_chats))
+                    }
+                },
                 actions = {
                     IconButton(onClick = {
                         viewModel.markBoardSeen()
@@ -220,6 +270,26 @@ fun ChatListScreen(
                     onRetry = viewModel::dismissError,
                 )
             }
+            // An invitation waiting to be answered (docs/protocol.md,
+            // "Several families"): Join adds the family and shows it.
+            families.invitations.forEach { invitation ->
+                InvitationBanner(
+                    invitation = invitation,
+                    busy = answeringInvitation != null,
+                    onJoin = { viewModel.acceptInvitation(invitation.id) },
+                    onDecline = { viewModel.declineInvitation(invitation.id) },
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
+            // The family shown is unpaid and will be deleted on a day it
+            // names (docs/protocol.md, "Paid families"). Gone with the
+            // deadline: a renewal clears `delete_at` and this with it.
+            unpaidBanner?.let { banner ->
+                UnpaidFamilyBanner(
+                    banner = banner,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
             val chatList = chats
             when {
                 chatList == null -> ChatListSkeleton()
@@ -264,41 +334,124 @@ fun ChatListScreen(
         }
     }
 
+    if (showSwitcher) {
+        FamilySwitcherSheet(
+            state = families,
+            answeringInvitation = answeringInvitation,
+            onPick = { familyId ->
+                showSwitcher = false
+                viewModel.switchFamily(familyId)
+            },
+            onAccept = { invitationId ->
+                showSwitcher = false
+                viewModel.acceptInvitation(invitationId)
+            },
+            onDecline = viewModel::declineInvitation,
+            onNewFamily = {
+                showSwitcher = false
+                onNewFamily()
+            },
+            onJoinFamily = {
+                showSwitcher = false
+                onJoinFamily()
+            },
+            onDismiss = { showSwitcher = false },
+        )
+    }
+
     if (showPicker) {
         ModalBottomSheet(
-            onDismissRequest = { showPicker = false },
+            onDismissRequest = { if (!creatingGroup) closePicker() },
             containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
         ) {
-            Text(
-                text = stringResource(R.string.s_new_chat),
-                style = MaterialTheme.typography.titleLarge,
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
-            )
-            if (members.isEmpty()) {
-                Text(
-                    text = stringResource(R.string.s_no_other_family_members_yet_share_the_invite_code_first),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
-                )
-            } else {
-                members.forEach { member ->
-                    ListItem(
-                        headlineContent = { Text(member.displayName) },
-                        supportingContent = { Text("@${member.username}") },
-                        leadingContent = {
-                            Avatar(
-                                name = member.displayName,
-                                userId = member.userId,
-                                size = 48,
-                                avatarVersion = member.avatarVersion,
-                            )
+            // Scrolls as one: a family's whole roster and the form's buttons
+            // do not always fit under the keyboard.
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                if (newGroupOpen) {
+                    NewGroupForm(
+                        name = groupName,
+                        onNameChange = {
+                            groupName = it
+                            viewModel.clearGroupError()
                         },
-                        modifier = Modifier.clickable { viewModel.openDirectChat(member.userId) },
+                        candidates = groupCandidates,
+                        selected = groupSelected.toSet(),
+                        onToggle = { id ->
+                            groupSelected = if (id in groupSelected) groupSelected - id else groupSelected + id
+                            viewModel.clearGroupError()
+                        },
+                        error = groupError,
+                        busy = creatingGroup,
+                        onCancel = closePicker,
+                        onCreate = { viewModel.createGroup(groupName, groupSelected.toSet()) },
+                    )
+                } else {
+                    NewChatPicker(
+                        members = members,
+                        onNewGroup = { newGroupOpen = true },
+                        onPick = viewModel::openDirectChat,
                     )
                 }
+                Spacer(Modifier.height(24.dp))
             }
-            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+/** The "New chat" sheet's first face: start a group, or pick somebody to talk to. */
+@Composable
+private fun NewChatPicker(
+    members: List<MemberEntity>,
+    onNewGroup: () -> Unit,
+    onPick: (Long) -> Unit,
+) {
+    Text(
+        text = stringResource(R.string.s_new_chat),
+        style = MaterialTheme.typography.titleLarge,
+        modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
+    )
+    // A group is started from the same sheet a direct chat is
+    // (docs/groups-2026-10-21.md, §6: "in the New Chat sheet").
+    ListItem(
+        headlineContent = { Text(stringResource(R.string.s_new_group)) },
+        leadingContent = {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .background(MaterialTheme.colorScheme.secondaryContainer, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Outlined.Groups,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+            }
+        },
+        modifier = Modifier.clickable(onClick = onNewGroup),
+    )
+    if (members.isEmpty()) {
+        Text(
+            text = stringResource(R.string.s_no_other_family_members_yet_share_the_invite_code_first),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
+        )
+    } else {
+        members.forEach { member ->
+            ListItem(
+                headlineContent = { Text(member.displayName) },
+                supportingContent = { Text("@${member.username}") },
+                leadingContent = {
+                    Avatar(
+                        name = member.displayName,
+                        userId = member.userId,
+                        size = 48,
+                        avatarVersion = member.avatarVersion,
+                    )
+                },
+                modifier = Modifier.clickable { onPick(member.userId) },
+            )
         }
     }
 }
@@ -341,10 +494,13 @@ private fun ChatRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         // The family chat gets a role mark, not initials: it's everyone's
-        // chat, so no one person's color. Direct chats key their avatar
-        // color off the peer, so the color matches the person everywhere.
-        if (chat.kind == "family") {
+        // chat, so no one person's color — and a group its own, for the same
+        // reason. Direct chats key their avatar color off the peer, so the
+        // color matches the person everywhere.
+        if (chat.kind == GroupRules.FAMILY) {
             FamilyAvatarMark()
+        } else if (GroupRules.isGroup(chat.kind)) {
+            GroupAvatarMark()
         } else {
             Avatar(
                 name = chat.title,
@@ -360,10 +516,10 @@ private fun ChatRow(
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = if (hasUnread) FontWeight.SemiBold else null,
                 // The family chat's title is the family's NAME — "The
-                // Harper-Whittington Family" — the one title here that is
-                // not a person's, and the one the top bar no longer
-                // carries. It gets a second line; a person's name keeps one.
-                maxLines = if (chat.kind == "family") 2 else 1,
+                // Harper-Whittington Family" — and a group's is its own; the
+                // two titles here that are not a person's. They get a second
+                // line; a person's name keeps one.
+                maxLines = if (GroupRules.isShared(chat.kind)) 2 else 1,
                 overflow = TextOverflow.Ellipsis,
             )
             Text(

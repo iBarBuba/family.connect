@@ -93,6 +93,12 @@ struct ChatListView: View {
     @State private var linkingCall: LinkingCall?
     /// Why a system call request could not be placed.
     @State private var callRequestError: String?
+    /// Several families (docs/protocol.md, "Several families"): the two
+    /// ways in, opened from the switcher, and what an invitation answered
+    /// from it had to say.
+    @State private var showsNewFamily = false
+    @State private var showsJoinAnother = false
+    @State private var switcherFailure: String?
 
     private struct LinkingCall: Identifiable {
         let id = UUID()
@@ -104,9 +110,27 @@ struct ChatListView: View {
         let video: Bool
     }
 
-    /// pinRank asc (family first), then recency desc, then stable id.
+    /// The chats the CURRENT family lists (docs/protocol.md, "Several
+    /// families"): its family chat, its groups, its assistant chat, and every
+    /// direct chat whose `family_ids` name it. With one family that is every
+    /// chat, exactly as before.
+    private var listedChats: [ChatEntity] {
+        chats.filter {
+            FamilyRules.isListed(
+                chatFamilyIDs: $0.familyIDs, in: session.currentFamilyID, home: session.homeFamilyID)
+        }
+    }
+
+    /// The board on screen is the current family's, and so is its badge.
+    private var familyNotes: [NoteEntity] {
+        let familyKey = coordinator.currentFamilyKey
+        return notes.filter { $0.familyID == familyKey }
+    }
+
+    /// pinRank asc (family first), then recency desc, then stable id. The
+    /// family chat pinned is the CURRENT family's — the only one listed.
     private var sortedChats: [ChatEntity] {
-        chats.sorted { a, b in
+        listedChats.sorted { a, b in
             if a.pinRank != b.pinRank { return a.pinRank < b.pinRank }
             let dateA = a.lastMessageDate ?? .distantPast
             let dateB = b.lastMessageDate ?? .distantPast
@@ -149,6 +173,31 @@ struct ChatListView: View {
     /// What the family is called, for the places that draw it whole.
     private var familyName: String {
         session.family?.name ?? String(localized: "Family")
+    }
+
+    /// The family name at the top of the list, which opens the switcher —
+    /// the phone's way between families (docs/protocol.md, "Several
+    /// families"). Only while there is something to switch to or pending.
+    private var familyTitleMenu: some View {
+        Menu {
+            FamilySwitcherMenuContent(
+                onNewFamily: { showsNewFamily = true },
+                onJoinAnother: { showsJoinAnother = true },
+                onFailure: { switcherFailure = $0 })
+        } label: {
+            HStack(spacing: 4) {
+                Text(familyName)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                Image(systemName: "chevron.down.circle.fill")
+                    .font(.subheadline)
+                    .symbolRenderingMode(.hierarchical)
+            }
+            .foregroundStyle(.primary)
+        }
+        .accessibilityLabel(Text("Switch Family"))
+        .accessibilityValue(Text(familyName))
     }
 
     /// Members still in the family, for the detail column's placeholder.
@@ -229,10 +278,35 @@ struct ChatListView: View {
         // Only what DISAPPEARED. A pushed id that was never in the list is
         // a push-routed chat this device has not cached yet, and popping
         // that is the bug consumePendingRoute deliberately avoids.
-        .onChange(of: chats.map(\.chatID)) { old, new in
+        //
+        // A switch to another family is the same thing from here: a chat the
+        // new family does not list is not on this screen any more, and the
+        // thread pushed over it goes with it.
+        .onChange(of: listedChats.map(\.chatID)) { old, new in
             let vanished = Set(old).subtracting(new)
             guard !vanished.isEmpty else { return }
             path.removeAll { vanished.contains($0) }
+        }
+        .familyDoorSheets(showsNewFamily: $showsNewFamily, showsJoinAnother: $showsJoinAnother)
+        .alert(
+            "Invitations",
+            isPresented: Binding(get: { switcherFailure != nil }, set: { if !$0 { switcherFailure = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(switcherFailure ?? "")
+        }
+        // A send the server refused for the family's used storage
+        // (`storage_allowance_used`, docs/protocol.md "Paid families"): the
+        // bubble goes red like any terminal refusal, and this says why —
+        // over whatever is on screen, the conversation included.
+        .alert(
+            coordinator.sendRefusalNotice ?? "",
+            isPresented: Binding(
+                get: { coordinator.sendRefusalNotice != nil },
+                set: { if !$0 { coordinator.sendRefusalNotice = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
         }
     }
 
@@ -266,9 +340,18 @@ struct ChatListView: View {
                             // too.
                             .id(chatID)
                     }
+                    // With a switcher, the bar's middle is the family's
+                    // name, which a large title would push off it.
+                    .navigationBarTitleDisplayMode(session.showsFamilySwitcher ? .inline : .automatic)
                     .toolbar { chatListToolbar }
                     .safeAreaInset(edge: .top) {
-                        ConnectionBanner()
+                        VStack(spacing: 0) {
+                            ConnectionBanner()
+                            InvitationBanner()
+                            // A paid family's deadline (docs/protocol.md,
+                            // "Paid families"); nothing for any other family.
+                            FamilyPlanBanner()
+                        }
                     }
                     .refreshable {
                         await coordinator.resync()
@@ -290,8 +373,14 @@ struct ChatListView: View {
                     // the banner it carries — is off screen while the list
                     // shows. The phone's placement, for the phone's shape.
                     .safeAreaInset(edge: .top) {
-                        if horizontalSizeClass == .compact {
-                            ConnectionBanner()
+                        VStack(spacing: 0) {
+                            if horizontalSizeClass == .compact {
+                                ConnectionBanner()
+                            }
+                            // Invitations are the list's, on both widths —
+                            // and so is a paid family's deadline.
+                            InvitationBanner()
+                            FamilyPlanBanner()
                         }
                     }
                     .refreshable {
@@ -381,7 +470,7 @@ struct ChatListView: View {
     /// thread ON TOP of the sidebar instead of filling the detail column).
     @ViewBuilder
     private func chatList(selectable: Bool) -> some View {
-        if chats.isEmpty {
+        if listedChats.isEmpty {
             // A ScrollView, not a bare view: the copy promises
             // pull-to-refresh, and .refreshable only works on
             // scrollable content. containerRelativeFrame keeps the
@@ -424,6 +513,11 @@ struct ChatListView: View {
 
     @ToolbarContentBuilder
     private var chatListToolbar: some ToolbarContent {
+        if session.showsFamilySwitcher {
+            ToolbarItem(placement: .principal) {
+                familyTitleMenu
+            }
+        }
         ToolbarItem(placement: .topBarTrailing) {
             Button {
                 showsNewChat = true
@@ -551,13 +645,17 @@ struct ChatListView: View {
     }
 
     private var newNoteCount: Int {
-        BoardBadge.unreadCount(notes: notes, marks: AppSettings.boardMarks)
+        BoardBadge.unreadCount(
+            notes: familyNotes, marks: AppSettings.boardMarks(family: coordinator.currentFamilyKey))
     }
 
-    /// The board is on screen, so everything on it has been shown.
+    /// The board is on screen, so everything on it has been shown — this
+    /// family's board, under this family's marks.
     private func markBoardSeen() {
-        AppSettings.boardMarks = BoardBadge.marksAfterShowing(
-            notes: notes, marks: AppSettings.boardMarks)
+        let familyKey = coordinator.currentFamilyKey
+        AppSettings.setBoardMarks(
+            BoardBadge.marksAfterShowing(notes: familyNotes, marks: AppSettings.boardMarks(family: familyKey)),
+            family: familyKey)
     }
 
     /// Act on a call the system asked for (CallIntents), then clear it so
@@ -735,6 +833,18 @@ struct ChatListView: View {
             showsJoinRequests = false
             popToListForSheet()
             showsReports = true
+        case .invitations, .familyPlan:
+            // An invitation is answered from the banner over the list (and
+            // the switcher's rows): the list, with nothing over it, is where
+            // it is (docs/protocol.md, "Several families"). A paid family's
+            // deadline is a banner over the same list, in the family the
+            // push opened (docs/protocol.md, "Paid families").
+            showsNewChat = false
+            showsSettings = false
+            showsJoinRequests = false
+            showsReports = false
+            showsBoard = false
+            popToListForSheet()
         case .chatList:
             // "joined" and unknown kinds: this list is the destination.
             break
@@ -831,11 +941,15 @@ struct ChatRowView: View {
     /// It gets a second line on the phone's wide row and a third in the
     /// narrow sidebar row, whose title shares its measure with the time
     /// and, on an iPad mini in portrait, has ~150pt to wrap in ("The
-    /// Harper-" / "Whittington" / "Family"). A person's name keeps one.
+    /// Harper-" / "Whittington" / "Family"). A group's name is the same
+    /// kind of title, up to 64 characters of it (docs/protocol.md,
+    /// "Groups"). A person's name keeps one.
     private var titleLines: Int {
-        guard chat.kind == "family" else { return 1 }
+        guard ChatRules.isFamilyOrGroup(chat.kind) else { return 1 }
         return isNarrow ? 3 : 2
     }
+
+    private var isGroup: Bool { chat.kind == ChatRules.group }
 
     var body: some View {
         if isNarrow {
@@ -850,11 +964,13 @@ struct ChatRowView: View {
             InitialsAvatar(
                 title: chat.title,
                 isFamily: chat.kind == "family",
+                isGroup: isGroup,
                 userID: chat.peerUserID,
                 avatarVersion: peerAvatarVersion)
                 // The initials repeat the title; VoiceOver would read
-                // the name twice.
-                .accessibilityHidden(true)
+                // the name twice. A group's says "Group" instead, which
+                // the title does not.
+                .accessibilityHidden(!isGroup)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(chat.title)
@@ -916,10 +1032,11 @@ struct ChatRowView: View {
             InitialsAvatar(
                 title: chat.title,
                 isFamily: chat.kind == "family",
+                isGroup: isGroup,
                 userID: chat.peerUserID,
                 avatarVersion: peerAvatarVersion,
                 size: 34)
-                .accessibilityHidden(true)
+                .accessibilityHidden(!isGroup)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(chat.title)

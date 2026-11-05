@@ -14,6 +14,7 @@
 import SwiftUI
 
 struct StatisticsView: View {
+    @Environment(AppSession.self) private var session
     @Environment(ChatSyncCoordinator.self) private var coordinator
     @Environment(\.dismiss) private var dismiss
 
@@ -137,6 +138,22 @@ struct StatisticsView: View {
                 }
             }
 
+            // A PAID family's allowance (docs/protocol.md, "Family
+            // statistics", amended 2026-10-30): one row per limit the server
+            // reported, and when the monthly ones start again. No section at
+            // all for a free family or a server that does not charge.
+            if let allowance = stats.allowance {
+                Section {
+                    ForEach(PaidFamilies.allowanceRows(allowance)) { row in
+                        LabeledContent(row.label, value: row.value)
+                    }
+                } header: {
+                    Text("This Month’s Allowance")
+                } footer: {
+                    Text(PaidFamilies.allowanceRenews(allowance))
+                }
+            }
+
             Section("Who sends what") {
                 ForEach(stats.members) { member in
                     VStack(alignment: .leading, spacing: 3) {
@@ -202,7 +219,7 @@ struct StatisticsView: View {
     private func load() async {
         failed = false
         do {
-            stats = try await coordinator.api.familyStats()
+            stats = try await coordinator.api.familyStats(family: session.apiFamilyID)
         } catch {
             failed = true
         }

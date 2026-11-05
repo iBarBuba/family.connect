@@ -9,8 +9,10 @@
 //! The authoritative wire contract is `docs/protocol.md` at the repo root;
 //! when this code and that document disagree, the document wins.
 
+pub mod admin;
 pub mod ai;
 pub mod app;
+pub mod appstore;
 pub mod auth;
 pub mod blocks;
 pub mod calls;
@@ -18,6 +20,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod events;
+pub mod families;
 pub mod greetings;
 pub mod handlers_ai;
 pub mod handlers_attachment;
@@ -28,11 +31,15 @@ pub mod handlers_call;
 pub mod handlers_chat;
 pub mod handlers_device;
 pub mod handlers_family;
+pub mod handlers_group;
+pub mod handlers_invitation;
 pub mod handlers_pack;
 pub mod handlers_poll;
 pub mod handlers_report;
 pub mod handlers_stats;
+pub mod handlers_subscription;
 pub mod handlers_transcript;
+pub mod keyring;
 pub mod lookups;
 pub mod mentions;
 pub mod migrate;
@@ -42,9 +49,13 @@ pub mod push_payload;
 pub mod push_text;
 pub mod push_words;
 pub mod registry;
+pub mod seal_existing;
+pub mod seal_files;
 pub mod state;
 pub mod storage;
+pub mod subscriptions;
 #[cfg(test)]
 pub(crate) mod test_keys;
 pub mod tokens;
+pub mod vault;
 pub mod ws;

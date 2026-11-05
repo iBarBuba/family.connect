@@ -21,6 +21,7 @@ package me.nettrash.familyconnect.ui.components
 import android.content.Context
 import androidx.compose.foundation.layout.height
 import com.google.android.gms.maps.GoogleMapOptions
+import com.google.android.gms.maps.model.MapColorScheme
 import com.google.android.gms.maps.model.CameraPosition
 import com.google.android.gms.maps.model.LatLng
 import com.google.maps.android.compose.GoogleMap
@@ -93,6 +94,7 @@ import me.nettrash.familyconnect.data.net.dto.AttachmentDto
 import me.nettrash.familyconnect.data.repo.AttachmentRepository
 import me.nettrash.familyconnect.ui.chat.drawsHairline
 import kotlin.math.sin
+import androidx.core.net.toUri
 
 val LocalAttachments = staticCompositionLocalOf<AttachmentRepository?> { null }
 
@@ -214,6 +216,10 @@ fun AttachmentGroup(
 ) {
     val media = AttachmentAlbum.media(attachments)
     val rows = AttachmentAlbum.rows(attachments)
+    // An ANIMATION is one test on the whole message (#96): exactly one
+    // attachment, a video, carrying the flag. Anything else is the ordinary
+    // message it otherwise is.
+    val animation = attachments.singleOrNull()?.takeIf { it.isAnimation }
     Column(
         modifier = modifier.widthIn(max = attachmentMaxWidth()),
         verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -238,8 +244,10 @@ fun AttachmentGroup(
                     onDoubleTap = onDoubleTap,
                     showMapPreviews = showMapPreviews,
                     onBalloon = onBalloon,
+                    asAnimation = animation != null,
                 )
-                if (media[0].isVideo) recordingFooter(media[0], null)
+                // No "Show text" under an animation: it has no sound to read.
+                if (media[0].isVideo && animation == null) recordingFooter(media[0], null)
             }
         }
         rows.forEach { item ->
@@ -489,6 +497,8 @@ fun AttachmentBlock(
     isMine: Boolean = false,
     /** The server has the message; before that a voice message is the sender's own on its way up. */
     acked: Boolean = true,
+    /** The message is an ANIMATION (#96) — the caller's test, made on the whole message. */
+    asAnimation: Boolean = false,
 ) {
     if (attachment.isLocation) {
         // A location has no bytes at all, so none of the download machinery
@@ -519,6 +529,15 @@ fun AttachmentBlock(
             onLongPress = onLongPress,
             onDoubleTap = onDoubleTap,
             modifier = modifier,
+        )
+    } else if (asAnimation) {
+        AnimationTile(
+            attachment = attachment,
+            onOpen = onOpen,
+            onLongPress = onLongPress,
+            onDoubleTap = onDoubleTap,
+            modifier = modifier,
+            onBalloon = onBalloon,
         )
     } else {
         MediaThumbnail(
@@ -657,6 +676,31 @@ private fun LocationRow(
  *
  * Interaction is deliberately none: the whole row is clickable and hands
  * off to a real map app, which is where panning belongs.
+ *
+ * **The colour scheme is pinned to LIGHT, and that is a crash fix, not a
+ * style choice.** Lite mode has no colour scheme at all (the bitmap is
+ * always the light one), and the renderer that Play services ships
+ * refuses to be handed one: `java.lang.UnsupportedOperationException:
+ * setMapColorScheme not supported in Lite mode`, thrown from
+ * `MapView.onCreate` — that is, from maps-compose's lifecycle observer,
+ * before a single frame — took the whole process down the moment a thread
+ * with a shared location opened with Map previews on (API 36 Play image,
+ * Maps module 24.51). Nothing in this file had changed. play-services-maps
+ * 20.1.0 initialises `GoogleMapOptions`' colour scheme to -1 ("unset")
+ * where 19.2.0 and 20.0.0 left it at 0 (LIGHT), and a renderer older than
+ * 26.x applies whatever is in the options inside `onCreate` and throws on
+ * a lite map; 26.x renderers ignore it silently
+ * (googlemaps/android-maps-compose#1028). maps-compose 9.0.1 carries the
+ * fix for #1028 — it never applies ITS OWN `mapColorScheme` to a lite map —
+ * and that is not enough, because the value that crashes is the SDK's own
+ * default, which maps-compose never touches. Writing LIGHT puts the
+ * pre-20.1.0 value back on the wire, the one every renderer accepts, and
+ * `mapColorScheme = null` keeps maps-compose from ever re-applying its
+ * FOLLOW_SYSTEM default here, which is exactly how #601 (6.0.0) and #1028
+ * (8.6.0) crashed lite maps before. Before removing either: open a thread
+ * with a shared location, Map previews ON, on a Play-image emulator whose
+ * Maps module predates 26 — a current phone proves nothing, its renderer
+ * swallows the call.
  */
 @Composable
 private fun LocationMap(latitude: Double, longitude: Double) {
@@ -671,7 +715,12 @@ private fun LocationMap(latitude: Double, longitude: Double) {
             .fillMaxWidth()
             .height(140.dp),
         cameraPositionState = cameraPositionState,
-        googleMapOptionsFactory = { GoogleMapOptions().liteMode(true) },
+        googleMapOptionsFactory = {
+            GoogleMapOptions()
+                .liteMode(true)
+                .mapColorScheme(MapColorScheme.LIGHT)
+        },
+        mapColorScheme = null,
         uiSettings = MapUiSettings(
             compassEnabled = false,
             mapToolbarEnabled = false,
@@ -697,7 +746,7 @@ private fun LocationMap(latitude: Double, longitude: Double) {
 private fun openInMaps(context: Context, latitude: Double, longitude: Double, label: String) {
     val point = "${String.format(Locale.ROOT, "%.6f", latitude)}," +
         String.format(Locale.ROOT, "%.6f", longitude)
-    val uri = Uri.parse("geo:$point?q=$point(${Uri.encode(label)})")
+    val uri = "geo:$point?q=$point(${Uri.encode(label)})".toUri()
     val intent = Intent(Intent.ACTION_VIEW, uri)
     // No map app installed is a real state on a stripped device; failing
     // silently beats an ActivityNotFoundException taking the app down.
@@ -945,6 +994,6 @@ private val BADGE_SCRIM = Color.Black.copy(alpha = 0.45f)
  * Shape limits for the reserved box. A panorama or a very tall crop would
  * otherwise be a sliver or a column taller than the screen.
  */
-private const val MIN_RATIO = 0.6f
-private const val MAX_RATIO = 1.9f
+internal const val MIN_RATIO = 0.6f
+internal const val MAX_RATIO = 1.9f
 

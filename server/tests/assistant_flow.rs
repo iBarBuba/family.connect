@@ -17,6 +17,7 @@ use axum::routing::post;
 use common::{TestServer, assert_error, spawn_server, spawn_server_with_config};
 use family_connect::config::Config;
 use family_connect::handlers_auth::{Scrubbed, scrub_account};
+use family_connect::keyring::Owner;
 use family_connect::push_payload::PushEvent;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -328,6 +329,86 @@ async fn mentioning_the_assistant_in_the_family_chat_answers_the_whole_family() 
         Some(asked_id),
         "the answer quotes the question, or it belongs to nobody: {reply}"
     );
+}
+
+/// `@ai` in a GROUP is answered in the group, from THAT group's history
+/// alone, and the model is told which chat it is in (protocol.md, "Groups").
+/// The family chat's words are not in the request — and the family's
+/// `ai_history` switch, on by default, is what lets the group's be.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_mention_in_a_group_reads_that_group_and_nothing_else() {
+    let (mock, addr) = spawn_mock_provider().await;
+    let ts = server_with_pictures(addr).await;
+    let (owner, _) = ts.register("owner", "Olive").await;
+    let (_, code) = ts.create_family(&owner, "The Smiths").await;
+    ts.set_open_policy(&owner).await;
+    let (junior, _) = ts.register("junior", "Junior").await;
+    let (gran, gran_id) = ts.register("gran", "Gran").await;
+    ts.join(&junior, &code, "joined").await;
+    ts.join(&gran, &code, "joined").await;
+
+    let family_chat = ts.family_chat_id(&owner).await;
+    say(
+        &ts,
+        &owner,
+        family_chat,
+        "FAMILY-ONLY: the surprise party is Saturday",
+    )
+    .await;
+    let group: Value = ts
+        .post(
+            &junior,
+            "/chats/groups",
+            json!({"title": "Cousins", "member_ids": [gran_id]}),
+        )
+        .await
+        .json()
+        .await
+        .expect("JSON");
+    let group = group["chat"]["id"].as_i64().expect("group id");
+    say(&ts, &gran, group, "GROUP-ONLY: bring the cake at five").await;
+
+    let asked = say(&ts, &junior, group, "@ai when do we bring the cake?").await;
+    let asked_id = asked["id"].as_i64().expect("the question has an id");
+    let reply = wait_for_assistant_message(&ts, &gran, group, asked_id).await;
+    assert_eq!(reply["reply_to"]["message_id"].as_i64(), Some(asked_id));
+    assert!(
+        wait_for_assistant_message_in(&ts, &owner, family_chat)
+            .await
+            .is_none(),
+        "nothing is answered in the family chat"
+    );
+
+    let call = mock.wait_for(TEXT_DEPLOYMENT).await;
+    let system = system_prompt_of(&call);
+    assert!(
+        system.contains(&family_connect::handlers_ai::group_note("Cousins")),
+        "the model is told it is in the group: {system}"
+    );
+    assert!(call.raw.contains("GROUP-ONLY"), "the group's history goes");
+    assert!(
+        !call.raw.contains("FAMILY-ONLY"),
+        "the family chat's never does"
+    );
+}
+
+/// The newest message the assistant sent in a chat, if any — read once, for
+/// a test asserting that nothing was answered there.
+async fn wait_for_assistant_message_in(ts: &TestServer, token: &str, chat: i64) -> Option<Value> {
+    let assistant = assistant_id(ts).await;
+    let body: Value = ts
+        .get(token, &format!("/chats/{chat}/messages"))
+        .await
+        .json()
+        .await
+        .expect("JSON");
+    body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["sender_id"].as_i64() == Some(assistant))
+        .cloned()
 }
 
 /// The assistant's answer does NOT wake a member who blocked the asker.
@@ -1286,10 +1367,11 @@ async fn the_transcript_calls_the_assistant_by_the_name_the_family_sees() {
     say(&ts, &owner, chat, "@ai capital of Serbia?").await;
     sqlx::query(
         "INSERT INTO messages (chat_id, sender_id, client_msg_id, body)
-         VALUES ($1, $2, gen_random_uuid(), 'Belgrade.')",
+         VALUES ($1, $2, gen_random_uuid(), $3)",
     )
     .bind(chat)
     .bind(assistant_id)
+    .bind(ts.seal(Owner::Chat(chat), "Belgrade.").await)
     .execute(&ts.state.pool)
     .await
     .expect("writing the assistant's past reply");
@@ -1888,6 +1970,14 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant in a family's p
      You can only see this one conversation.";
 const MIRROR_LANGUAGE: &str = "Answer in the language the message you were sent is written in, whatever language these \
      instructions are in.";
+/// The note on what the bubbles draw (#97), which every assistant request now carries just before the
+/// language line — spelled out here rather than imported, like the line above, so a change to it is a
+/// change these pins notice.
+const FORMATTING: &str = "Your answer is shown with Markdown. When it genuinely helps, you may also write formulas in \
+     LaTeX — inline between single dollar signs, or on lines of their own between double dollar signs — draw \
+     diagrams in fenced ```mermaid or ```dot blocks, and draw a graph of a function in a fenced ```plot block: one \
+     line per setting or curve, such as `x: -5..5`, `title: Growth`, then expressions in x like `sin(x)` or \
+     `x^2/2`. Plain words are better when they do the job.";
 
 /// Upload a photo and hand back its attachment id.
 async fn upload_photo(ts: &TestServer, token: &str, with_preview: bool) -> i64 {
@@ -2538,7 +2628,7 @@ async fn with_either_lock_shut_a_mention_with_a_photo_is_the_text_request_it_alw
 
     let expected_messages = json!([
         {"role": "system", "content": format!(
-            "{DEFAULT_SYSTEM_PROMPT}\n\n{}\n\n{MIRROR_LANGUAGE}",
+            "{DEFAULT_SYSTEM_PROMPT}\n\n{}\n\n{FORMATTING}\n\n{MIRROR_LANGUAGE}",
             family_connect::handlers_ai::MENTION_INSTRUCTION
         )},
         {"role": "user", "content": "[photo] @ai what is this?"},
@@ -2590,7 +2680,7 @@ async fn a_text_only_mention_serialises_exactly_as_before() {
 
     let call = mock.wait_for(TEXT_DEPLOYMENT).await;
     let expected: Value = serde_json::from_str(concat!(
-        r#"{"max_tokens":1024,"messages":[{"content":"You are a helpful assistant in a family's private chat app. Answer briefly and plainly. You can only see this one conversation.\n\nYou have been mentioned with @ai in a family group chat. You can see ONLY the message that mentioned you, and the message it quotes when there is one; you cannot see the rest of the conversation, who else is in it, or anything said earlier. If answering needs context you were not given, say so in one line and ask for it. Keep the answer short — this is a group chat, not a document.\n\nAnswer in the language the message you were sent is written in, whatever language these instructions are in.","role":"system"},"#,
+        r#"{"max_tokens":1024,"messages":[{"content":"You are a helpful assistant in a family's private chat app. Answer briefly and plainly. You can only see this one conversation.\n\nYou have been mentioned with @ai in a family group chat. You can see ONLY the message that mentioned you, and the message it quotes when there is one; you cannot see the rest of the conversation, who else is in it, or anything said earlier. If answering needs context you were not given, say so in one line and ask for it. Keep the answer short — this is a group chat, not a document.\n\nYour answer is shown with Markdown. When it genuinely helps, you may also write formulas in LaTeX — inline between single dollar signs, or on lines of their own between double dollar signs — draw diagrams in fenced ```mermaid or ```dot blocks, and draw a graph of a function in a fenced ```plot block: one line per setting or curve, such as `x: -5..5`, `title: Growth`, then expressions in x like `sin(x)` or `x^2/2`. Plain words are better when they do the job.\n\nAnswer in the language the message you were sent is written in, whatever language these instructions are in.","role":"system"},"#,
         r#"{"content":"@ai what is the weather","role":"user"}],"model":"test-gpt-oss","stream":true,"stream_options":{"include_usage":true}}"#,
     ))
     .expect("the pinned request is JSON");
@@ -2927,7 +3017,7 @@ async fn expected_history_mention(
         "max_tokens": 1024,
         "messages": [
             {"role": "system", "content": format!(
-                "{DEFAULT_SYSTEM_PROMPT}\n\n{}\n\n{transcript}\n\n{MIRROR_LANGUAGE}",
+                "{DEFAULT_SYSTEM_PROMPT}\n\n{}\n\n{transcript}\n\n{FORMATTING}\n\n{MIRROR_LANGUAGE}",
                 family_connect::handlers_ai::MENTION_WITH_HISTORY_INSTRUCTION
             )},
             {"role": "user", "content": body},
@@ -3494,7 +3584,7 @@ async fn with_history_off_the_switch_sends_no_history_photo() {
         "max_tokens": 1024,
         "messages": [
             {"role": "system", "content": format!(
-                "{DEFAULT_SYSTEM_PROMPT}\n\n{}\n\n{MIRROR_LANGUAGE}",
+                "{DEFAULT_SYSTEM_PROMPT}\n\n{}\n\n{FORMATTING}\n\n{MIRROR_LANGUAGE}",
                 family_connect::handlers_ai::MENTION_INSTRUCTION
             )},
             {"role": "user", "content": "@ai what did Olive send?"},
@@ -3615,7 +3705,7 @@ async fn a_direct_chat_and_the_private_thread_are_unaffected_by_the_switch() {
             follow_up.body["messages"],
             json!([
                 {"role": "system", "content": format!(
-                    "{DEFAULT_SYSTEM_PROMPT}\n\n{MIRROR_LANGUAGE}"
+                    "{DEFAULT_SYSTEM_PROMPT}\n\n{FORMATTING}\n\n{MIRROR_LANGUAGE}"
                 )},
                 {"role": "user", "content": "[photo] what is this?"},
                 {"role": "assistant", "content": "a picture of something"},
@@ -3687,7 +3777,7 @@ async fn a_lone_unreadable_photo_in_the_transcript_is_named_even_though_nothing_
              say so if it is what you are being asked about. You still cannot see any member's \
              private chat with you, or any one-to-one chat between two members. 1 picture(s) in \
              the transcript could not be included, because they were too large or in a format \
-             you cannot read. Say so rather than guessing what they showed.\n\n{MIRROR_LANGUAGE}"
+             you cannot read. Say so rather than guessing what they showed.\n\n{FORMATTING}\n\n{MIRROR_LANGUAGE}"
         )),
         "the omission is NAMED, after the transcript and before the language line: {system}"
     );
@@ -3902,7 +3992,7 @@ async fn a_draw_capable_server_declares_one_tool_and_a_text_only_server_declares
     say(&ts, &owner, chat, "what is the weather").await;
     let text_only = mock.wait_for(TEXT_DEPLOYMENT).await;
     let expected: Value = serde_json::from_str(
-        r#"{"max_tokens":1024,"messages":[{"content":"You are a helpful assistant in a family's private chat app. Answer briefly and plainly. You can only see this one conversation.\n\nAnswer in the language the message you were sent is written in, whatever language these instructions are in.","role":"system"},{"content":"what is the weather","role":"user"}],"model":"test-gpt-oss","stream":true,"stream_options":{"include_usage":true}}"#,
+        r#"{"max_tokens":1024,"messages":[{"content":"You are a helpful assistant in a family's private chat app. Answer briefly and plainly. You can only see this one conversation.\n\nYour answer is shown with Markdown. When it genuinely helps, you may also write formulas in LaTeX — inline between single dollar signs, or on lines of their own between double dollar signs — draw diagrams in fenced ```mermaid or ```dot blocks, and draw a graph of a function in a fenced ```plot block: one line per setting or curve, such as `x: -5..5`, `title: Growth`, then expressions in x like `sin(x)` or `x^2/2`. Plain words are better when they do the job.\n\nAnswer in the language the message you were sent is written in, whatever language these instructions are in.","role":"system"},{"content":"what is the weather","role":"user"}],"model":"test-gpt-oss","stream":true,"stream_options":{"include_usage":true}}"#,
     )
     .expect("the pinned request is JSON");
     assert_eq!(text_only.body, expected, "{}", text_only.raw);
@@ -4764,21 +4854,22 @@ async fn the_shared_scrub_refuses_the_assistant_however_it_is_called() {
 /// the statement — a future sweep, or a hand-run ops line at 2am.
 #[tokio::test]
 #[ignore = "needs a reachable PostgreSQL server; run with --ignored"]
-async fn the_database_refuses_to_remove_or_rename_the_assistant() {
+async fn the_database_refuses_to_remove_or_unmark_the_assistant() {
     let ts = spawn_server().await;
     let assistant = assistant_id(&ts).await;
 
-    // The three ways the row stops being a live account named `assistant`.
-    // The middle one is what `scrub_account` writes, and the quietest: no
-    // lookup of the assistant would ever find it again.
+    // The three ways the row stops being the live, marked assistant account.
+    // The first is what `scrub_account` writes; the middle is the quietest:
+    // no lookup of the assistant would ever find it again, since its name is
+    // sealed and it is found by its mark (0059).
     for (what, sql) in [
         (
             "tombstoning it",
             "UPDATE users SET deleted_at = now() WHERE id = $1",
         ),
         (
-            "renaming it",
-            "UPDATE users SET username = 'deleted-' || id WHERE id = $1",
+            "unmarking it",
+            "UPDATE users SET is_assistant = false WHERE id = $1",
         ),
         ("deleting the row", "DELETE FROM users WHERE id = $1"),
     ] {
@@ -4800,8 +4891,9 @@ async fn the_database_refuses_to_remove_or_rename_the_assistant() {
 
     // What the assistant LOOKS like is still ordinary data: the trigger
     // guards whether the account exists, not how it is presented.
-    sqlx::query("UPDATE users SET display_name = 'Helper', avatar_version = 3 WHERE id = $1")
+    sqlx::query("UPDATE users SET display_name = $2, avatar_version = 3 WHERE id = $1")
         .bind(assistant)
+        .bind(ts.seal(Owner::Account(assistant), "Helper").await)
         .execute(&ts.state.pool)
         .await
         .expect("a display name and an avatar are not the account's existence");
@@ -5434,7 +5526,7 @@ async fn with_history_off_there_are_no_names_and_so_no_faces() {
         "max_tokens": 1024,
         "messages": [
             {"role": "system", "content": format!(
-                "{DEFAULT_SYSTEM_PROMPT}\n\n{}\n\n{MIRROR_LANGUAGE}",
+                "{DEFAULT_SYSTEM_PROMPT}\n\n{}\n\n{FORMATTING}\n\n{MIRROR_LANGUAGE}",
                 family_connect::handlers_ai::MENTION_INSTRUCTION
             )},
             {"role": "user", "content": "@ai hello"},

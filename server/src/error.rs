@@ -76,6 +76,41 @@ pub mod codes {
     /// The disk is nearly full. Says nothing about the request — the same
     /// upload succeeds unchanged once the operator frees something.
     pub const STORAGE_FULL: &str = "storage_full";
+    /// A group member who is not its admin, renaming, adding, removing or
+    /// deleting (protocol.md, "Groups").
+    pub const NOT_GROUP_ADMIN: &str = "not_group_admin";
+    /// A family that already has the most groups it may have.
+    pub const TOO_MANY_GROUPS: &str = "too_many_groups";
+    // Several families (protocol.md, "Several families"; issue #88).
+    /// A `{family}` in the path that the caller is not in — answered exactly
+    /// as an id that never existed, so the families on a server cannot be
+    /// counted by trying ids.
+    pub const FAMILY_NOT_FOUND: &str = "family_not_found";
+    /// The account is already in `[families] max_families_per_account`.
+    pub const TOO_MANY_FAMILIES: &str = "too_many_families";
+    /// A member may CREATE a family only while they own none.
+    pub const ALREADY_OWN_A_FAMILY: &str = "already_own_a_family";
+    /// `[families] member_families = false`: no in-app creation.
+    pub const MEMBER_FAMILIES_DISABLED: &str = "member_families_disabled";
+    /// A password reset needs the owner to own EVERY family the member is in.
+    pub const MEMBER_IN_OTHER_FAMILIES: &str = "member_in_other_families";
+    /// Accepted, declined, withdrawn, somebody else's, or never existed.
+    pub const INVITATION_NOT_PENDING: &str = "invitation_not_pending";
+    /// Paid families (protocol.md, "Paid families"): a new family on a
+    /// server that charges, from an account with no active subscription.
+    pub const SUBSCRIPTION_REQUIRED: &str = "subscription_required";
+    /// A signed App Store value that failed verification, or is for another
+    /// app, product or environment.
+    pub const SUBSCRIPTION_INVALID: &str = "subscription_invalid";
+    /// An App Store subscription another account presented first.
+    pub const SUBSCRIPTION_TAKEN: &str = "subscription_taken";
+    /// `PUT /me/subscription` on a server that does not charge.
+    pub const SUBSCRIPTIONS_DISABLED: &str = "subscriptions_disabled";
+    /// A paid family's storage allowance is used — NOT `storage_full`, which
+    /// is the server's own disk.
+    pub const STORAGE_ALLOWANCE_USED: &str = "storage_allowance_used";
+    /// A paid family's monthly assistant allowance is used.
+    pub const AI_ALLOWANCE_USED: &str = "ai_allowance_used";
     pub const NOTE_NOT_FOUND: &str = "note_not_found";
     pub const NOT_NOTE_AUTHOR: &str = "not_note_author";
     pub const INVALID_NOTE_COLOR: &str = "invalid_note_color";
@@ -307,6 +342,15 @@ impl IntoResponse for ApiError {
 impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
         Self::Internal(anyhow::Error::new(err).context("database error"))
+    }
+}
+
+/// A value that would not seal or open (#59). Internal, like a database
+/// error: the log names the column and the key, and never the content
+/// (docs/protocol.md, "Stored encrypted").
+impl From<crate::keyring::KeyError> for ApiError {
+    fn from(err: crate::keyring::KeyError) -> Self {
+        Self::Internal(anyhow::Error::new(err).context("stored value"))
     }
 }
 

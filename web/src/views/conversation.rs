@@ -18,9 +18,9 @@ use crate::model::{AiFailure, Assistant, ChatListItem, Family, Member, Message, 
 use crate::pack::Gate;
 use crate::prep;
 use crate::staged::Prepared;
-use crate::store::{Draft, NotSent};
+use crate::store::{Draft, Messages, NotSent};
 use crate::time;
-use crate::timeline::{self, Context};
+use crate::timeline::{self, Context, Window};
 use crate::views::attach::{
     drag_carries_something, dropped_files, dropped_links, read_clipboard, AttachMenu, Clip,
     NotSentRow, RecordingRow, StagingStrip, PLAY_AFTER,
@@ -32,6 +32,7 @@ use crate::views::composer::{
 };
 use crate::views::consent::AssistantConsentDialog;
 use crate::views::dialog::Confirm;
+use crate::views::group::GroupInfoDialog;
 use crate::views::poll::PollComposer;
 use crate::views::quiet::{use_quiet_reason, use_quiet_while};
 use crate::views::report::{AssistantReportDialog, ReportDialog, ReportTarget};
@@ -43,7 +44,10 @@ use fc_text::assistant_pictures::{self, Candidate};
 #[derive(Properties, PartialEq)]
 pub struct ConversationProps {
     pub item: ChatListItem,
-    pub messages: Vec<Message>,
+    /// The chat's messages, oldest first — the store's own list, shared
+    /// (`store::Messages`): handing it over copies nothing, and a draw of
+    /// the app that changed nothing here is told so by the pointer.
+    pub messages: Messages,
     pub my_user_id: i64,
     /// userId → the name to draw. A sender who is not in the roster reads
     /// as "Someone" rather than as a number.
@@ -116,7 +120,11 @@ pub struct ConversationProps {
     #[prop_or_default]
     pub transcripts: fc_text::transcript::Transcripts,
     pub on_action: Callback<Action>,
-    /// Wall-clock now, for the day pills.
+    /// Wall-clock now, for the day pills — to the MINUTE (main.rs floors
+    /// it). A day starts on a minute, so the pills read exactly what they
+    /// would at the millisecond; and a prop that changed on every draw of
+    /// the app was a pane, and every bubble in it, drawn again on every
+    /// draw of the app.
     pub now_ms: f64,
     /// How long and how big a video message may be on this server — None on
     /// a server without video messages, which is offered no video entry at
@@ -128,7 +136,7 @@ pub struct ConversationProps {
 /// How close to the bottom still counts as "reading the newest", in
 /// pixels. A reader a line or two up is still following along; one who has
 /// scrolled a screen away is reading history and must not be yanked down.
-const PINNED_SLACK_PX: i32 = 48;
+pub(crate) const PINNED_SLACK_PX: i32 = 48;
 
 /// How long a jumped-to message stays tinted, in milliseconds — the apps'
 /// 1.6 s.
@@ -157,12 +165,114 @@ pub fn row_key(message: &Message, my_user_id: i64) -> String {
 /// says "Video message", having no words of its own to show (the plan for
 /// #79, S5.7). A quoted message this client does not hold says what the
 /// server's excerpt says.
+///
+/// The rule as written, one reply at a time: what `QuotedKinds` — which a
+/// draw asks instead, once for every row — is held to.
+#[cfg(test)]
 pub fn quotes_round(message: &Message, held: &[Message]) -> bool {
     message.reply_to.as_ref().is_some_and(|quote| {
         held.iter().any(|other| {
             other.id == quote.message_id && other.id != 0 && other.round_video().is_some()
         })
     })
+}
+
+/// Whether `message` answers an ANIMATION among `held` — its quote then
+/// says "GIF" where it has no words of its own (docs/protocol.md,
+/// "Animations"). A quoted message this client does not hold says what the
+/// server's excerpt says.
+///
+/// Held to like `quotes_round`.
+#[cfg(test)]
+pub fn quotes_animation(message: &Message, held: &[Message]) -> bool {
+    message.reply_to.as_ref().is_some_and(|quote| {
+        held.iter().any(|other| {
+            other.id == quote.message_id && other.id != 0 && other.animation().is_some()
+        })
+    })
+}
+
+/// Which of the messages held are video messages and which are animations,
+/// by id — `quotes_round` and `quotes_animation` for every row of a draw,
+/// from ONE pass over the messages instead of one per reply.
+#[derive(Debug, Default, PartialEq)]
+pub struct QuotedKinds {
+    rounds: HashSet<i64>,
+    animations: HashSet<i64>,
+}
+
+impl QuotedKinds {
+    pub fn of(held: &[Message]) -> Self {
+        let mut kinds = QuotedKinds::default();
+        for message in held.iter().filter(|message| message.id != 0) {
+            if message.round_video().is_some() {
+                kinds.rounds.insert(message.id);
+            }
+            if message.animation().is_some() {
+                kinds.animations.insert(message.id);
+            }
+        }
+        kinds
+    }
+
+    /// `quotes_round(message, held)`.
+    pub fn round(&self, message: &Message) -> bool {
+        message
+            .reply_to
+            .as_ref()
+            .is_some_and(|quote| self.rounds.contains(&quote.message_id))
+    }
+
+    /// `quotes_animation(message, held)`.
+    pub fn animation(&self, message: &Message) -> bool {
+        message
+            .reply_to
+            .as_ref()
+            .is_some_and(|quote| self.animations.contains(&quote.message_id))
+    }
+}
+
+/// The names a chat's bubbles are drawn with: the roster's — and in the
+/// assistant's own chat, anything not mine is the assistant's, drawn with
+/// the chat's own name rather than looked up in a roster it is not in.
+/// `senders` are the chat's senders other than me, which is all the
+/// messages have to say about it.
+pub fn drawn_names(
+    names: &HashMap<i64, String>,
+    ai_title: Option<&str>,
+    senders: &[i64],
+) -> HashMap<i64, String> {
+    let mut names = names.clone();
+    if let Some(title) = ai_title {
+        for sender in senders {
+            names.insert(*sender, title.to_string());
+        }
+    }
+    names
+}
+
+/// The oldest numbered row drawn from `start` on.
+fn drawn_oldest(messages: &[Message], start: usize) -> Option<i64> {
+    messages
+        .get(start..)?
+        .iter()
+        .map(|message| message.id)
+        .find(|id| *id != 0)
+}
+
+/// The bubble of message `id`, if it is drawn.
+fn drawn_row(id: i64) -> Option<Element> {
+    web_sys::window()?
+        .document()?
+        .get_element_by_id(&format!("m-{id}"))
+}
+
+/// Scroll a drawn bubble into view and tint it for a moment.
+fn show_highlighted(target: &Element, id: i64, highlight: &UseStateHandle<Option<i64>>) {
+    target.scroll_into_view();
+    highlight.set(Some(id));
+    let highlight = highlight.clone();
+    gloo_timers::callback::Timeout::new(HIGHLIGHT_MS, move || highlight.set(None)).forget();
 }
 
 #[function_component(Conversation)]
@@ -227,6 +337,9 @@ pub fn conversation(props: &ConversationProps) -> Html {
     // it there to send, and "Not Now" is "not this one", never "lose what
     // I typed".
     let consent_open = use_state(|| false);
+    // "Group Info", opened from a group's title (docs/protocol.md,
+    // "Groups").
+    let group_info = use_state(|| false);
     let poll_open = use_state(|| false);
     let highlight = use_state(|| Option::<i64>::None);
     let at_newest = use_state(|| true);
@@ -313,19 +426,52 @@ pub fn conversation(props: &ConversationProps) -> Html {
         });
     }
 
+    // THE WINDOW: which rows are drawn (timeline::Window) — the newest
+    // `WINDOW` while the reader follows along, more as they scroll up, and
+    // from the divider down when the chat opens at one. Taken here, in the
+    // draw, because what it says is what this draw puts in the DOM.
+    let window = use_mut_ref(Window::default);
+    // The messages as of the latest draw, for the callbacks below — made
+    // once and handed to every bubble, so they cannot hold the draw's own.
+    let held_now = use_mut_ref(Messages::default);
+    *held_now.borrow_mut() = props.messages.clone();
+    // Whether the opening's anchor has been taken into the window: once,
+    // in the draw that first knows it, so the divider the opening scrolls
+    // to is there to scroll to.
+    let anchored = use_mut_ref(|| false);
+    let redraw = use_force_update();
+    // What the list was before rows were added above — the oldest row
+    // drawn and the list's height — for the effect below.
+    let before = use_mut_ref(|| (None::<i64>, 0));
+    let start = {
+        let mut window = window.borrow_mut();
+        let mut start = window.start(&props.messages, *pinned.borrow());
+        if let Some((id, _)) = anchor.filter(|_| !*anchored.borrow()) {
+            *anchored.borrow_mut() = true;
+            if let Some(index) = props.messages.iter().position(|message| message.id == id) {
+                window.include(&props.messages, index);
+                start = window.held_start(&props.messages);
+                // The opening puts the reader at the divider itself: the
+                // rows drawn above it are not rows to hold the reader
+                // still against.
+                *before.borrow_mut() = (None, 0);
+            }
+        }
+        start
+    };
+
     // EARLIER MESSAGES land above the reader, and what they were reading
     // stays where it was on the screen: the scroll moves down by exactly
     // what was added above. Done here rather than left to the browser's
-    // scroll anchoring, which Safari does not do (styles.css).
+    // scroll anchoring, which Safari does not do (styles.css). The same for
+    // rows the window draws above as the reader scrolls up to them — which
+    // is why this follows the oldest row DRAWN, the oldest held whenever the
+    // window reaches the top.
     {
         let list = list.clone();
         let pinned = pinned.clone();
-        let before = use_mut_ref(|| (None::<i64>, 0));
-        let oldest = props
-            .messages
-            .iter()
-            .map(|message| message.id)
-            .find(|id| *id != 0);
+        let before = before.clone();
+        let oldest = drawn_oldest(&props.messages, start);
         use_effect_with((props.messages.len(), oldest), move |(_, oldest)| {
             let Some(element) = list.cast::<Element>() else {
                 return;
@@ -346,6 +492,10 @@ pub fn conversation(props: &ConversationProps) -> Html {
         let pinned = pinned.clone();
         let at_newest = at_newest.clone();
         let on_action = props.on_action.clone();
+        let window = window.clone();
+        let held_now = held_now.clone();
+        let before = before.clone();
+        let redraw = redraw.clone();
         // Until the opening is decided the scroll is the loading rows being
         // followed, not a reader arriving anywhere.
         let decided = opened.is_some();
@@ -357,6 +507,16 @@ pub fn conversation(props: &ConversationProps) -> Html {
                     at_newest.set(bottom);
                     if decided {
                         on_action.emit(Action::AtNewest(bottom));
+                    }
+                }
+                // Within a screen of the top of the window, with rows held
+                // above it: draw some of them, before the reader gets there.
+                if !bottom && element.scroll_top() < element.client_height() {
+                    let held = held_now.borrow();
+                    let oldest = drawn_oldest(&held, window.borrow().held_start(&held));
+                    if window.borrow_mut().grow(&held) {
+                        *before.borrow_mut() = (oldest, element.scroll_height());
+                        redraw.force_update();
                     }
                 }
             }
@@ -375,27 +535,66 @@ pub fn conversation(props: &ConversationProps) -> Html {
     };
 
     // A quote's click: show the quoted message, tinted for a moment — if it
-    // is here at all.
+    // is here at all. Held but above the window, it is drawn first (the
+    // window taken up to it) and shown once it is: `jump` carries it to the
+    // effect after that draw. One callback for the pane's life, handed to
+    // every bubble: a new one each draw was every bubble drawn again.
+    let jump = use_state(|| Option::<i64>::None);
     let on_jump = {
         let highlight = highlight.clone();
         let pinned = pinned.clone();
-        Callback::from(move |id: i64| {
-            let Some(target) = web_sys::window()
-                .and_then(|window| window.document())
-                .and_then(|document| document.get_element_by_id(&format!("m-{id}")))
+        let window = window.clone();
+        let held_now = held_now.clone();
+        let before = before.clone();
+        let list = list.clone();
+        let jump = jump.clone();
+        use_callback((), move |id: i64, _| {
+            if let Some(target) = drawn_row(id) {
+                *pinned.borrow_mut() = false;
+                show_highlighted(&target, id, &highlight);
+                return;
+            }
+            let held = held_now.borrow();
+            let Some(index) = held
+                .iter()
+                .position(|message| message.id == id && message.id != 0)
             else {
                 return;
             };
             *pinned.borrow_mut() = false;
-            target.scroll_into_view();
-            highlight.set(Some(id));
-            let highlight = highlight.clone();
-            gloo_timers::callback::Timeout::new(HIGHLIGHT_MS, move || highlight.set(None)).forget();
+            let oldest = drawn_oldest(&held, window.borrow().held_start(&held));
+            window.borrow_mut().include(&held, index);
+            if let Some(element) = list.cast::<Element>() {
+                *before.borrow_mut() = (oldest, element.scroll_height());
+            }
+            jump.set(Some(id));
         })
     };
+    {
+        let highlight = highlight.clone();
+        let jump = jump.clone();
+        use_effect_with(*jump, move |target| {
+            if let Some(id) = *target {
+                if let Some(target) = drawn_row(id) {
+                    show_highlighted(&target, id, &highlight);
+                }
+                jump.set(None);
+            }
+        });
+    }
 
-    let is_family = props.item.chat.is_family();
+    // What this chat offers, by its kind as sent (fc_text::groups::offers):
+    // a group is the family chat less calls and "seen" (docs/protocol.md,
+    // "Groups"). `chat_kind` is the kind the shared rules are asked about —
+    // a group as a group, and nothing guessed for a kind this client does
+    // not know.
+    let chat_kind = fc_text::groups::known(&props.item.chat.kind);
+    let offers = props.item.chat.offers();
+    let takes_mentions = offers.mentions;
     let is_ai = props.item.chat.is_ai();
+    // Whom a mention here may name and a poll here counts: the family, or
+    // in a group the group's members.
+    let chat_members = props.item.chat.members_of(&props.members);
     let blocked_peer = props
         .item
         .chat
@@ -408,31 +607,53 @@ pub fn conversation(props: &ConversationProps) -> Html {
     let assistant_user_id = props.assistant.as_ref().map(|assistant| assistant.user_id);
     let context = Context {
         my_user_id: props.my_user_id,
-        is_family_chat: is_family,
-        is_ai_chat: is_ai,
+        chat_kind,
         assistant_user_id,
         blocked: &props.blocked,
         first_unread_id: anchor.map(|(id, _)| id),
         peer_read_up_to: props.peer_read,
     };
-    let rows = timeline::rows(&props.messages, &context);
-    // In the assistant's own chat, anything not mine is the assistant's —
-    // drawn with the chat's own name, not looked up in a roster it is not in.
-    let mut names = props.names.clone();
-    if is_ai {
-        if let Some(title) = props.item.chat.title.clone() {
-            for message in &props.messages {
-                if message.sender_id != props.my_user_id {
-                    names.insert(message.sender_id, title.clone());
-                }
-            }
+    let rows = timeline::rows_from(&props.messages, start, &context);
+
+    // WHAT EVERY BUBBLE IS HANDED, made once and kept while it holds: a
+    // bubble is drawn again only when something of ITS changed. Handed a
+    // fresh copy of the roster's names, a fresh set and fresh callbacks on
+    // every draw — every typing frame, every catch-up page — every bubble in
+    // the chat was drawn again, its markdown parsed and its links found
+    // anew, to say exactly what it said before.
+    let ai_title = props.item.chat.title.clone().filter(|_| is_ai);
+    let ai_senders: Vec<i64> = match ai_title {
+        Some(_) => {
+            let mut senders: Vec<i64> = props
+                .messages
+                .iter()
+                .map(|message| message.sender_id)
+                .filter(|sender| *sender != props.my_user_id)
+                .collect();
+            senders.sort_unstable();
+            senders.dedup();
+            senders
         }
-    }
+        None => Vec::new(),
+    };
+    let names = use_memo(
+        (props.names.clone(), ai_title, ai_senders),
+        |(names, ai_title, senders)| drawn_names(names, ai_title.as_deref(), senders),
+    );
+    let blocked = use_memo(props.blocked.clone(), |blocked| blocked.clone());
+    let member_ids = use_memo(
+        chat_members
+            .iter()
+            .map(|member| member.id)
+            .collect::<Vec<i64>>(),
+        |ids| ids.iter().copied().collect::<HashSet<i64>>(),
+    );
+    let quoted = use_memo(props.messages.clone(), |messages| QuotedKinds::of(messages));
 
     let on_reply = {
         let replying = replying.clone();
         let editing = editing.clone();
-        Callback::from(move |id: i64| {
+        use_callback((), move |id: i64, _| {
             editing.set(None);
             replying.set(Some(id));
         })
@@ -440,29 +661,33 @@ pub fn conversation(props: &ConversationProps) -> Html {
     let on_edit = {
         let replying = replying.clone();
         let editing = editing.clone();
-        Callback::from(move |id: i64| {
+        use_callback((), move |id: i64, _| {
             replying.set(None);
             editing.set(Some(id));
         })
     };
     let on_report = {
         let report = report.clone();
-        let names = names.clone();
-        Callback::from(move |(user_id, message_id): (i64, Option<i64>)| {
-            report.set(Some(ReportTarget {
-                user_id,
-                name: names
-                    .get(&user_id)
-                    .cloned()
-                    .unwrap_or_else(|| t("Someone").to_string()),
-                message_id,
-            }));
-        })
+        use_callback(
+            names.clone(),
+            move |(user_id, message_id): (i64, Option<i64>), names| {
+                report.set(Some(ReportTarget {
+                    user_id,
+                    name: names
+                        .get(&user_id)
+                        .cloned()
+                        .unwrap_or_else(|| t("Someone").to_string()),
+                    message_id,
+                }));
+            },
+        )
     };
 
     let on_report_assistant = {
         let assistant_report = assistant_report.clone();
-        Callback::from(move |message_id: i64| assistant_report.set(Some(message_id)))
+        use_callback((), move |message_id: i64, _| {
+            assistant_report.set(Some(message_id))
+        })
     };
 
     let replying_to = replying.and_then(|id| {
@@ -480,6 +705,9 @@ pub fn conversation(props: &ConversationProps) -> Html {
             } else if message.round_video().is_some() {
                 // No words to quote: what it is (S5.7).
                 t("Video message").to_string()
+            } else if message.body.is_empty() && message.animation().is_some() {
+                // An animation with no caption: what it is (#96).
+                t("GIF").to_string()
             } else {
                 crate::store::excerpt(&message.body)
             },
@@ -547,6 +775,9 @@ pub fn conversation(props: &ConversationProps) -> Html {
     let media_notice = use_state(|| Option::<String>::None);
     let append = use_state(|| (0u32, String::new()));
     let take = use_state(|| 0u32);
+    // Moves each time "Ask the Assistant" is chosen from the paperclip's
+    // menu: the composer puts `@ai ` into its draft (#106).
+    let ask = use_state(|| 0u32);
     // The location waiting for the draft to be its caption.
     let pending = use_mut_ref(|| Option::<Prepared>::None);
     // A hunt for a fix — the permission prompt included — so a second click
@@ -623,6 +854,9 @@ pub fn conversation(props: &ConversationProps) -> Html {
             if files.is_empty() {
                 return;
             }
+            // An animated picture becomes a looping video in every chat but
+            // the assistant's, whose model is shown a photograph (#96).
+            let assistant = is_ai;
             if let Some(reason) = busy.clone() {
                 media_notice.set(Some(reason));
                 return;
@@ -658,7 +892,11 @@ pub fn conversation(props: &ConversationProps) -> Html {
                         ));
                         break;
                     }
-                    let prepared = prep::prepare(&file, &batch).await;
+                    let prepared = if assistant {
+                        prep::prepare_for_assistant(&file, &batch).await
+                    } else {
+                        prep::prepare(&file, &batch).await
+                    };
                     // Cancelled, like gone: whoever cancelled has already
                     // put the composer back, and may have started another
                     // batch since — this one touches nothing more.
@@ -1083,8 +1321,8 @@ pub fn conversation(props: &ConversationProps) -> Html {
         let staged = props.staged.len();
         Callback::from(move |_: ()| record.emit(!*draft_blank.borrow() || staged > 0))
     };
-    // THE WAYS INTO THE VIDEO RECORDER (S1.4–S1.6): offered in a family or
-    // a direct chat, on a server with video messages, on a page that can
+    // THE WAYS INTO THE VIDEO RECORDER (S1.4–S1.6): offered in the family
+    // chat, a direct chat or a group, on a server with video messages, on a page that can
     // capture at all — in a browser that cannot record one ALWAYS, the menus
     // saying so instead of opening (S1.5, S8.7), whatever cameras it lists;
     // where it can, on a device with a camera
@@ -1092,8 +1330,11 @@ pub fn conversation(props: &ConversationProps) -> Html {
     // them opens it during a call or while the composer is busy; a voice
     // message that was not sent does not stop it — that rule is about voice.
     let probed = *probe;
-    let offers_video =
-        crate::round_video::offers_video_entry(props.round.is_some(), !is_ai, probed);
+    let offers_video = crate::round_video::offers_video_entry(
+        props.round.is_some(),
+        offers.video_messages,
+        probed,
+    );
     let records_video = probed.is_some_and(|probe| probe.records);
     let open_recorder = {
         let recorder_open = recorder_open.clone();
@@ -1119,15 +1360,30 @@ pub fn conversation(props: &ConversationProps) -> Html {
     } else {
         None
     };
+    // "Ask the Assistant" — the row's old `@ai` button, now a line of the
+    // paperclip's menu — where `@ai` may be written at all: the family
+    // chat or a group, on a server with an assistant that names who answers
+    // (docs/protocol.md, "Mentioning a member", amended 2026-10-20).
+    let offers_assistant = offers.assistant_mention
+        && props
+            .assistant
+            .as_ref()
+            .and_then(|assistant| assistant.processor.as_deref())
+            .is_some_and(|processor| !processor.trim().is_empty());
     let attach_menu = html! {
         <AttachMenu
+            {offers_assistant}
+            on_assistant={{
+                let ask = ask.clone();
+                Callback::from(move |_: ()| ask.set(*ask + 1))
+            }}
             offers_video={offers_video}
             video_dimmed={video_dimmed}
             on_video={open_recorder.clone()}
             assistant_chat={is_ai}
             offers_pictures={assistant_pictures::offers_picture_attach(is_ai, server_can_see, family_allows)}
             on_pictures={ingest.clone()}
-            offers_poll={is_family}
+            offers_poll={offers.polls}
             busy={busy_reason.clone()}
             on_files={ingest.clone()}
             on_paste={on_paste_menu}
@@ -1142,10 +1398,11 @@ pub fn conversation(props: &ConversationProps) -> Html {
             on_busy={notice.clone()}
         />
     };
-    // THE STICKER BUTTON, beside the paperclip, in EVERY chat a message can
-    // be sent in, wherever this server has packs: the family chat, a
-    // one-to-one chat, and the assistant's own. One click sends: its own
-    // message, no caption, answering whatever the box was answering.
+    // THE STICKER BUTTON, inside the field at its trailing edge (#106), in
+    // EVERY chat a message can be sent in, wherever this server has packs:
+    // the family chat, a one-to-one chat, and the assistant's own. One
+    // click sends: its own message, no caption, answering whatever the box
+    // was answering.
     //
     // In the assistant's chat a sticker is a photograph shown to the model
     // (docs/protocol.md, "Sending one"), so the click goes through the
@@ -1154,8 +1411,11 @@ pub fn conversation(props: &ConversationProps) -> Html {
     // consent screen INSTEAD of sending — picking again once the answer is
     // recorded sends it, as pressing Send again does for words — and on a
     // server that names nobody it says so and sends nothing.
-    let sticker_gate =
-        crate::pack::send_gate(is_ai, props.assistant.as_ref(), props.agreed_to_assistant);
+    let sticker_gate = crate::pack::send_gate(
+        chat_kind,
+        props.assistant.as_ref(),
+        props.agreed_to_assistant,
+    );
     let sticker_menu = props.stickers.clone().map(|items| {
         let on_pick = {
             let on_action = props.on_action.clone();
@@ -1199,7 +1459,6 @@ pub fn conversation(props: &ConversationProps) -> Html {
             />
         }
     });
-    let attach_menu = html! { <>{ attach_menu }{ sticker_menu.unwrap_or_default() }</> };
     // The composer's attachment guard — S1.2's **busy**, which dims the
     // microphone (row 8) and holds a Send back. A recording is not it: the
     // recording row has the field's place while one runs. A note being
@@ -1213,14 +1472,14 @@ pub fn conversation(props: &ConversationProps) -> Html {
             let poll_open = poll_open.clone();
             let replying = replying.clone();
             let pinned = pinned.clone();
-            let members = props.members.clone();
+            let members = chat_members.clone();
             Callback::from(move |(question, options): (String, Vec<String>)| {
                 poll_open.set(false);
                 *pinned.borrow_mut() = true;
                 // A question names members the way a message does, and the
                 // list is fixed at send (ios MacConversationView resolves
                 // them from the question).
-                let mentions = resolve_mentions(&question, &members, is_family);
+                let mentions = resolve_mentions(&question, &members, takes_mentions);
                 on_action.emit(Action::Send {
                     chat_id,
                     draft: Draft {
@@ -1270,11 +1529,24 @@ pub fn conversation(props: &ConversationProps) -> Html {
 
     // "Show text" under a recording, which raises this chat's consent
     // screen when this member has not agreed yet.
-    let transcription =
-        crate::views::bubble::Transcription::of(props.assistant.as_ref(), props.family.as_ref(), {
-            let consent_open = consent_open.clone();
-            Callback::from(move |()| consent_open.set(true))
-        });
+    let transcription = {
+        let consent_open = consent_open.clone();
+        let on_review_consent = use_callback((), move |(), _| consent_open.set(true));
+        use_memo(
+            (
+                props.assistant.clone(),
+                props.family.clone(),
+                on_review_consent,
+            ),
+            |(assistant, family, on_review_consent)| {
+                crate::views::bubble::Transcription::of(
+                    assistant.as_ref(),
+                    family.as_ref(),
+                    on_review_consent.clone(),
+                )
+            },
+        )
+    };
     let consent_dialog = consent_open
         .then(|| {
             props
@@ -1370,20 +1642,13 @@ pub fn conversation(props: &ConversationProps) -> Html {
         let consent_open = consent_open.clone();
         let notice = notice.clone();
         let pinned = pinned.clone();
-        let members = props.members.clone();
+        let members = chat_members.clone();
         let processor = props
             .assistant
             .as_ref()
             .and_then(|assistant| assistant.processor.clone());
         let has_assistant = props.assistant.is_some();
         let agreed = props.agreed_to_assistant;
-        let chat_kind = if is_ai {
-            "ai"
-        } else if is_family {
-            "family"
-        } else {
-            "direct"
-        };
         Callback::from(move |row: NotSent| {
             use fc_text::assistant_consent;
             if assistant_consent::is_required(chat_kind, &row.caption, processor.as_deref(), agreed)
@@ -1405,7 +1670,7 @@ pub fn conversation(props: &ConversationProps) -> Html {
             on_action.emit(Action::SendNotSent {
                 chat_id,
                 id: row.id,
-                mentions: resolve_mentions(&row.caption, &members, is_family),
+                mentions: resolve_mentions(&row.caption, &members, takes_mentions),
             });
         })
     };
@@ -1527,8 +1792,72 @@ pub fn conversation(props: &ConversationProps) -> Html {
         .as_ref()
         .is_some_and(|text| voice.announcement.0 > 0 && voice.announcement.1 == *text);
 
+    // What stacks above the row, handed to the composer to place (#106, doc
+    // 2.4): one order on every client, the nearest to the field being what
+    // is being written — notices · voice messages not sent · reply or edit
+    // banner · staged · mention suggestions · the busy line · THE ROW. They
+    // were drawn here, above the whole composer, which put the staged strip
+    // and the voice messages not sent above the notices and the reply.
+    let not_sent_rows = html! {
+        <>
+        { for props.not_sent.iter().map(|row| html! {
+            <NotSentRow
+                key={row.id}
+                row={row.clone()}
+                quote={quote_of(row.reply_to_message_id)}
+                on_send={send_not_sent.clone()}
+                on_delete={delete_not_sent.clone()}
+                recording={recording_on}
+                on_explain={notice.clone()}
+            />
+        }) }
+        </>
+    };
+    let staging_strip = html! {
+        <StagingStrip
+            items={props.staged.clone()}
+            on_remove={{
+                let on_action = props.on_action.clone();
+                let changed = voice.changed.clone();
+                Callback::from(move |index| {
+                    on_action.emit(Action::Unstage { chat_id, index });
+                    // Taken off by the person: never guarded (S1.1).
+                    changed.emit(());
+                })
+            }}
+            recording={recording_on}
+            on_explain={notice.clone()}
+        />
+    };
+    let busy_line = match (*media_notice).clone() {
+        // Quiet while a recording runs, as every live region here is
+        // but the one that says what the recording does (S6).
+        Some(text) => html! {
+            <p class="composer-notice media-notice"
+               role={(!recording_on).then_some("status")}
+               aria-live={recording_on.then_some("off")}>
+                if notice_said {
+                    <span aria-hidden="true">{ text }</span>
+                } else {
+                    { text }
+                }
+                if *preparing {
+                    // Not a notice to dismiss but work to call off.
+                    <button class="link" onclick={cancel_preparing}>{ t("Cancel") }</button>
+                } else {
+                    <button class="link" aria-label={t("Dismiss")}
+                            onclick={let media_notice = media_notice.clone(); Callback::from(move |_: MouseEvent| media_notice.set(None))}>
+                        { "✕" }
+                    </button>
+                }
+            </p>
+        },
+        None => Html::default(),
+    };
+
     let divider_count = anchor.map(|(_, count)| count).unwrap_or(0);
-    let member_count = props.members.len();
+    let chat_kind_value = AttrValue::from(props.item.chat.kind.clone());
+    let member_count = chat_members.len();
     let avatar_versions: HashMap<i64, i64> = props
         .members
         .iter()
@@ -1553,7 +1882,30 @@ pub fn conversation(props: &ConversationProps) -> Html {
             ondrop={on_drop}
         >
             <header class="conversation-bar">
-                <h2 class="conversation-title">{ title }</h2>
+                // Below the two panes the conversation is the whole window,
+                // and this is the way back to the list of chats (#106,
+                // section 3). The stylesheet hides it where the list is
+                // beside the chat.
+                <button type="button" class="back-to-chats"
+                        onclick={props.on_action.reform(|_: MouseEvent| Action::CloseChat)}>
+                    <span aria-hidden="true">{ "‹ " }</span>{ t("Chats") }
+                </button>
+                // A group's title opens Group Info — its members, and the
+                // admin's tools and everybody's Leave (docs/protocol.md,
+                // "Groups").
+                if props.item.chat.is_group() {
+                    <h2 class="conversation-title">
+                        <button type="button" class="title-button" aria-haspopup="dialog" onclick={{
+                            let group_info = group_info.clone();
+                            Callback::from(move |_: MouseEvent| group_info.set(true))
+                        }}>
+                            <span class="title-name">{ title.clone() }</span>
+                            <span class="title-sub">{ tn("Members: %lld", props.item.chat.group_member_ids().len() as i64) }</span>
+                        </button>
+                    </h2>
+                } else {
+                    <h2 class="conversation-title">{ title }</h2>
+                }
                 // A call lives in a direct chat: the family chat has nobody
                 // in particular to ring, and the assistant has no ears
                 // (docs/protocol.md, "Voice calls"). A member this reader
@@ -1574,7 +1926,7 @@ pub fn conversation(props: &ConversationProps) -> Html {
                         }
                     </span>
                 }
-                if is_family {
+                if offers.polls {
                     <button class="open-polls" onclick={
                         let on_action = props.on_action.clone();
                         Callback::from(move |_: MouseEvent| on_action.emit(Action::ShowOpenPolls { chat_id }))
@@ -1587,7 +1939,9 @@ pub fn conversation(props: &ConversationProps) -> Html {
                 }
             </header>
             <div class="messages" ref={list} onscroll={on_scroll}>
-                if props.can_load_more {
+                // At the top of what is HELD only: with rows held above the
+                // window, scrolling up draws those first.
+                if props.can_load_more && start == 0 {
                     <button class="load-more" onclick={
                         let on_action = props.on_action.clone();
                         Callback::from(move |_: MouseEvent| on_action.emit(Action::LoadMore { chat_id }))
@@ -1625,33 +1979,33 @@ pub fn conversation(props: &ConversationProps) -> Html {
                                     message={message.clone()}
                                     my_user_id={props.my_user_id}
                                     names={names.clone()}
-                                    blocked={props.blocked.clone()}
+                                    blocked={blocked.clone()}
                                     {quote_revealed}
                                     {parent_revealed}
-                                    quote_round={quotes_round(message, &props.messages)}
+                                    quote_round={quoted.round(message)}
+                                    quote_animation={quoted.animation(message)}
                                     hidden={row.hidden && !revealed}
-                                    shows_sender={row.shows_sender || (row.hidden && revealed && is_family)}
+                                    shows_sender={row.shows_sender || (row.hidden && revealed && offers.sender_names)}
                                     sender_avatar_version={avatar_versions.get(&message.sender_id).copied().unwrap_or(0)}
                                     calls_enabled={props.calls_enabled && !props.on_call && !recording_on}
                                     video_calls_enabled={props.video_calls_enabled}
                                     run_end={row.run_end}
                                     seen={row.seen}
                                     awaited={row.awaited}
-                                    ai_failed={props.ai_failed.get(&message.id).copied()}
+                                    ai_failed={props.ai_failed.get(&message.id).cloned()}
                                     {failed}
-                                    is_family_chat={is_family}
-                                    is_ai_chat={is_ai}
+                                    chat_kind={chat_kind_value.clone()}
                                     {assistant_user_id}
                                     in_thread={false}
                                     {member_count}
-                                    member_ids={props.members.iter().map(|member| member.id).collect::<HashSet<i64>>()}
+                                    member_ids={member_ids.clone()}
                                     on_action={props.on_action.clone()}
                                     on_reply={on_reply.clone()}
                                     on_edit={on_edit.clone()}
                                     on_report={on_report.clone()}
                                     on_report_assistant={on_report_assistant.clone()}
                                     on_jump={on_jump.clone()}
-                                    transcription={transcription.clone()}
+                                    transcription={(*transcription).clone()}
                                     transcripts={props.transcripts.of(message.attachments().iter().map(|attachment| attachment.id))}
                                 />
                             </div>
@@ -1660,70 +2014,28 @@ pub fn conversation(props: &ConversationProps) -> Html {
                 }) }
                 </>
             </div>
+            // On a strip of its own under the list, not floating over it: a
+            // disc over the list covered the end of the last bubble — my own,
+            // which ends where it stood (#106). The list is shorter by the
+            // strip while it shows; what the reader is looking at stays put.
             if !*at_newest {
-                <button class="jump-newest" onclick={jump_to_newest} aria-label={t("Jump to the newest message")}>{ "↓" }</button>
+                <div class="jump-strip">
+                    <button class="jump-newest" onclick={jump_to_newest} aria-label={t("Jump to the newest message")}>{ "↓" }</button>
+                </div>
             }
             if !props.typing.is_empty() {
                 // Quiet while a recording runs: "… is typing" must never be
                 // spoken into a note (S6).
                 <p class="typing" aria-live={if recording_on { "off" } else { "polite" }}>{ typing_line(&props.typing) }</p>
             }
-            <StagingStrip
-                items={props.staged.clone()}
-                on_remove={{
-                    let on_action = props.on_action.clone();
-                    let changed = voice.changed.clone();
-                    Callback::from(move |index| {
-                        on_action.emit(Action::Unstage { chat_id, index });
-                        // Taken off by the person: never guarded (S1.1).
-                        changed.emit(());
-                    })
-                }}
-                recording={recording_on}
-                on_explain={notice.clone()}
-            />
-            <>
-            { for props.not_sent.iter().map(|row| html! {
-                <NotSentRow
-                    key={row.id}
-                    row={row.clone()}
-                    quote={quote_of(row.reply_to_message_id)}
-                    on_send={send_not_sent.clone()}
-                    on_delete={delete_not_sent.clone()}
-                    recording={recording_on}
-                    on_explain={notice.clone()}
-                />
-            }) }
-            </>
-            if let Some(text) = (*media_notice).clone() {
-                // Quiet while a recording runs, as every live region here is
-                // but the one that says what the recording does (S6).
-                <p class="composer-notice media-notice"
-                   role={(!recording_on).then_some("status")}
-                   aria-live={recording_on.then_some("off")}>
-                    if notice_said {
-                        <span aria-hidden="true">{ text }</span>
-                    } else {
-                        { text }
-                    }
-                    if *preparing {
-                        // Not a notice to dismiss but work to call off.
-                        <button class="link" onclick={cancel_preparing}>{ t("Cancel") }</button>
-                    } else {
-                        <button class="link" aria-label={t("Dismiss")}
-                                onclick={let media_notice = media_notice.clone(); Callback::from(move |_: MouseEvent| media_notice.set(None))}>
-                            { "✕" }
-                        </button>
-                    }
-                </p>
-            }
+            // The voice messages not sent, the staged strip and the busy line
+            // are drawn BY the composer, in the one order of #106 (doc 2.4).
             <Composer
                 key={format!("composer-{chat_id}")}
                 {chat_id}
-                is_family_chat={is_family}
-                is_ai_chat={is_ai}
+                chat_kind={chat_kind_value.clone()}
                 my_user_id={props.my_user_id}
-                members={props.members.clone()}
+                members={chat_members.clone()}
                 blocked={props.blocked.clone()}
                 assistant={props.assistant.clone()}
                 agreed_to_assistant={props.agreed_to_assistant}
@@ -1757,7 +2069,12 @@ pub fn conversation(props: &ConversationProps) -> Html {
                     }))
                 }}
                 attach={attach_menu}
+                stickers={sticker_menu.unwrap_or_default()}
+                ask_assistant={*ask}
                 staged={props.staged.len()}
+                {not_sent_rows}
+                {staging_strip}
+                {busy_line}
                 busy={composer_busy}
                 append={(*append).clone()}
                 take={*take}
@@ -1800,6 +2117,18 @@ pub fn conversation(props: &ConversationProps) -> Html {
             { report_dialog.unwrap_or_default() }
             { assistant_report_dialog.unwrap_or_default() }
             { consent_dialog.unwrap_or_default() }
+            if *group_info && props.item.chat.is_group() {
+                <GroupInfoDialog
+                    chat={props.item.chat.clone()}
+                    members={props.members.clone()}
+                    my_user_id={props.my_user_id}
+                    on_action={props.on_action.clone()}
+                    on_close={{
+                        let group_info = group_info.clone();
+                        Callback::from(move |_: ()| group_info.set(false))
+                    }}
+                />
+            }
         </section>
     }
 }
@@ -1820,6 +2149,86 @@ pub fn typing_line(names: &[String]) -> String {
 mod tests {
     use super::*;
     use wasm_bindgen_test::*;
+
+    fn message(id: i64, sender_id: i64) -> Message {
+        Message {
+            id,
+            chat_id: 42,
+            sender_id,
+            created_at: "2026-08-19T17:03:12Z".into(),
+            ..Message::default()
+        }
+    }
+
+    fn carrying(id: i64, round: bool, animation: bool) -> Message {
+        Message {
+            attachments: Some(vec![crate::model::Attachment {
+                id: id * 10,
+                kind: "video".into(),
+                round,
+                animation,
+                ..crate::model::Attachment::default()
+            }]),
+            ..message(id, 9)
+        }
+    }
+
+    fn quoting(id: i64, quoted: i64) -> Message {
+        Message {
+            reply_to: Some(crate::model::ReplyTo {
+                message_id: quoted,
+                sender_id: 9,
+                excerpt: String::new(),
+                parent: None,
+            }),
+            ..message(id, 7)
+        }
+    }
+
+    /// One pass for a whole draw says, for every reply, what a pass per
+    /// reply said: a video message's quote, an animation's, and neither for
+    /// a plain video, a message not held, or a pending row.
+    #[wasm_bindgen_test]
+    fn the_quoted_kinds_of_a_draw_are_the_rule_for_every_reply() {
+        let mut pending_round = carrying(0, true, false);
+        pending_round.client_msg_id = Some("c".into());
+        let held = vec![
+            carrying(1, true, false),
+            carrying(2, false, true),
+            carrying(3, false, false),
+            message(4, 9),
+            pending_round,
+        ];
+        let kinds = QuotedKinds::of(&held);
+        for quoted in [0, 1, 2, 3, 4, 99] {
+            let reply = quoting(100 + quoted, quoted);
+            assert_eq!(
+                kinds.round(&reply),
+                quotes_round(&reply, &held),
+                "quoting {quoted}"
+            );
+            assert_eq!(
+                kinds.animation(&reply),
+                quotes_animation(&reply, &held),
+                "quoting {quoted}"
+            );
+        }
+        assert!(kinds.round(&quoting(200, 1)));
+        assert!(kinds.animation(&quoting(201, 2)));
+        assert!(!kinds.round(&message(5, 7)), "not a reply at all");
+    }
+
+    /// In the assistant's own chat every sender but me is drawn with the
+    /// chat's name; anywhere else the roster's names are the names.
+    #[wasm_bindgen_test]
+    fn the_assistants_chat_names_every_other_sender_after_itself() {
+        let roster = HashMap::from([(7, "Me".to_string()), (9, "Anna".to_string())]);
+        assert_eq!(drawn_names(&roster, None, &[9, 2]), roster);
+        let drawn = drawn_names(&roster, Some("Assistant"), &[2, 9]);
+        assert_eq!(drawn.get(&2).map(String::as_str), Some("Assistant"));
+        assert_eq!(drawn.get(&9).map(String::as_str), Some("Assistant"));
+        assert_eq!(drawn.get(&7).map(String::as_str), Some("Me"));
+    }
 
     #[wasm_bindgen_test]
     fn the_typing_line_names_one_or_two_and_counts_the_rest() {

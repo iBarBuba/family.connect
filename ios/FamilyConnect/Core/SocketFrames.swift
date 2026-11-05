@@ -64,6 +64,18 @@ nonisolated enum ClientFrame: Encodable, Equatable, Sendable {
         clientMsgID: String,
         replyToMessageID: Int64?,
         attachmentID: Int64)
+    /// An ANIMATION (docs/protocol.md, "Animations", #96): the same `send`
+    /// frame with `"animation": true` and exactly one attachment. Unlike a
+    /// sticker or a video message it MAY carry a caption — and so the
+    /// members that caption names — but never a poll, which this case
+    /// cannot express.
+    case sendAnimation(
+        chatID: Int64,
+        clientMsgID: String,
+        body: String,
+        replyToMessageID: Int64?,
+        attachmentID: Int64,
+        mentions: [MentionDTO]?)
     case read(chatID: Int64, lastReadMessageID: Int64)
     case typing(chatID: Int64)
     case ping
@@ -95,6 +107,7 @@ nonisolated enum ClientFrame: Encodable, Equatable, Sendable {
         case mentions
         case sticker
         case round
+        case animation
         case callID = "call_id"
         case sdp
         case candidate
@@ -147,6 +160,16 @@ nonisolated enum ClientFrame: Encodable, Equatable, Sendable {
             try container.encodeIfPresent(replyToMessageID, forKey: .replyToMessageID)
             try container.encode([attachmentID], forKey: .attachmentIDs)
             try container.encode(true, forKey: .round)
+        case .sendAnimation(
+            let chatID, let clientMsgID, let body, let replyToMessageID, let attachmentID, let mentions):
+            try container.encode("send", forKey: .type)
+            try container.encode(chatID, forKey: .chatID)
+            try container.encode(clientMsgID, forKey: .clientMsgID)
+            try container.encode(body, forKey: .body)
+            try container.encodeIfPresent(replyToMessageID, forKey: .replyToMessageID)
+            try container.encode([attachmentID], forKey: .attachmentIDs)
+            try container.encodeIfPresent(mentions, forKey: .mentions)
+            try container.encode(true, forKey: .animation)
         case .read(let chatID, let lastReadMessageID):
             try container.encode("read", forKey: .type)
             try container.encode(chatID, forKey: .chatID)
@@ -218,9 +241,18 @@ nonisolated struct MemberJoinedPayload: Decodable, Equatable, Sendable {
     }
     let familyID: Int64
     let user: JoinedUser
+    /// Whether the reader may reset this member's password — TOP-LEVEL, not
+    /// on `user`, and only on the family OWNER's copy of the frame
+    /// (docs/protocol.md, "Several families"). Nil on everybody else's copy
+    /// and from an older server, and nil means "not told", never "allowed":
+    /// the flag already held for the member stands. An Optional, so the
+    /// synthesized decoder reads it with `decodeIfPresent` and an absent key
+    /// decodes rather than throws.
+    let passwordReset: Bool?
     enum CodingKeys: String, CodingKey {
         case familyID = "family_id"
         case user
+        case passwordReset = "password_reset"
     }
 }
 
@@ -383,11 +415,16 @@ nonisolated struct CallOfferPayload: Decodable, Equatable, Sendable {
 /// Only the values the protocol defines are here. Anything else the server
 /// sends decodes to nil — the same as no reason at all — so a value added
 /// later never makes this client invent a meaning for it.
-nonisolated enum AIErrorReason: String, Equatable, Sendable {
+nonisolated enum AIErrorReason: Equatable, Sendable {
     /// The AI provider's OWN safety or content filter refused the question,
     /// the answer, or a picture's description. Asking again in the same
     /// words gets the same refusal.
     case refused
+    /// A PAID family has used this month's assistant allowance, and the
+    /// provider was not called at all (docs/protocol.md, "Paid families",
+    /// 2026-10-30). `renewsAt` is the frame's `renews_at`, the start of the
+    /// next UTC month — nil only when a server left it out.
+    case allowanceUsed(renewsAt: Date?)
 }
 
 nonisolated enum ServerFrame: Decodable, Equatable, Sendable {
@@ -421,7 +458,11 @@ nonisolated enum ServerFrame: Decodable, Equatable, Sendable {
     case read(chatID: Int64, userID: Int64, lastReadMessageID: Int64)
     case typing(chatID: Int64, userID: Int64)
     case memberJoined(MemberJoinedPayload)
-    case memberLeft(userID: Int64)
+    /// Somebody left, or was removed from, the family `familyID` names —
+    /// THAT family, never "my family" (docs/protocol.md, "Several
+    /// families", 2026-10-22). Nil only from a server that predates the
+    /// field, where there is one family.
+    case memberLeft(familyID: Int64?, userID: Int64)
     /// A member deleted their account. Carries the tombstone to write; a
     /// `member_left` for the same person is sent alongside it.
     case memberDeleted(MemberDeletedPayload)
@@ -440,6 +481,26 @@ nonisolated enum ServerFrame: Decodable, Equatable, Sendable {
     /// it outlives either of them leaving.
     case memberBlocked(userID: Int64, blocked: Bool)
     case reaction(ReactionPayload)
+    /// A GROUP as it now stands — created, renamed, or its members or admin
+    /// changed (docs/protocol.md, "Groups", 2026-10-22). Sent to every member,
+    /// one just added included, which is how a group appears on their devices
+    /// at once rather than at the next resync.
+    case chatUpdated(ChatDTO)
+    /// A group gone from this member's list: they left it, were removed, or
+    /// its admin deleted it. The client drops the chat, its messages and
+    /// anything it was drafting there.
+    case chatRemoved(chatID: Int64)
+    /// An invitation into a family, to the invited person and the family's
+    /// owner (docs/protocol.md, "Several families", 2026-10-22).
+    case invitation(InvitationDTO)
+    /// That invitation is gone from both lists: accepted, declined,
+    /// withdrawn, or lapsed.
+    case invitationRemoved(invitationID: Int64)
+    /// A family's plan, and whether it is about to be deleted for want of
+    /// payment (docs/protocol.md, "Paid families", 2026-10-30). Sent to
+    /// every member when `delete_at` appears or goes; ABSENT `deleteAt`
+    /// clears it, which is how the banner goes away.
+    case familyPlan(familyID: Int64, plan: String?, deleteAt: Date?)
     /// A poll's full current state after a vote, a retraction or a close.
     /// Dispatched exactly like `reaction`, under its own seq guard.
     case poll(PollPayload)
@@ -485,6 +546,12 @@ nonisolated enum ServerFrame: Decodable, Equatable, Sendable {
         case sdp
         case candidate
         case reason
+        case chat
+        case invitation
+        case invitationID = "invitation_id"
+        case renewsAt = "renews_at"
+        case plan
+        case deleteAt = "delete_at"
     }
 
     init(from decoder: Decoder) throws {
@@ -514,8 +581,19 @@ nonisolated enum ServerFrame: Decodable, Equatable, Sendable {
             // as a malformed frame, so a later server can add a reason
             // without costing an old client the failure it would otherwise
             // show (docs/protocol.md, "The assistant").
-            let reason = (try? container.decodeIfPresent(String.self, forKey: .reason))
-                .flatMap(AIErrorReason.init(rawValue:))
+            let reason: AIErrorReason?
+            switch (try? container.decodeIfPresent(String.self, forKey: .reason)) ?? nil {
+            case "refused":
+                reason = .refused
+            case "allowance_used":
+                // A `renews_at` that is missing or malformed costs the date,
+                // never the reason (`AssistantFailure` falls back to the 1st
+                // of next month, UTC, which is what the server means by it).
+                reason = .allowanceUsed(
+                    renewsAt: (try? container.decodeIfPresent(Date.self, forKey: .renewsAt)) ?? nil)
+            default:
+                reason = nil
+            }
             self = .aiError(
                 chatID: try container.decode(Int64.self, forKey: .chatID),
                 messageID: try container.decode(Int64.self, forKey: .messageID),
@@ -533,7 +611,9 @@ nonisolated enum ServerFrame: Decodable, Equatable, Sendable {
             // Re-decode from the top so MemberJoinedPayload owns its keys.
             self = .memberJoined(try MemberJoinedPayload(from: decoder))
         case "member_left":
-            self = .memberLeft(userID: try container.decode(Int64.self, forKey: .userID))
+            self = .memberLeft(
+                familyID: try container.decodeIfPresent(Int64.self, forKey: .familyID),
+                userID: try container.decode(Int64.self, forKey: .userID))
         case "member_deleted":
             // Re-decode from the top so MemberDeletedPayload owns its keys.
             self = .memberDeleted(try MemberDeletedPayload(from: decoder))
@@ -551,6 +631,20 @@ nonisolated enum ServerFrame: Decodable, Equatable, Sendable {
         case "poll":
             // Re-decode from the top so PollPayload owns its keys.
             self = .poll(try PollPayload(from: decoder))
+        case "chat_updated":
+            self = .chatUpdated(try container.decode(ChatDTO.self, forKey: .chat))
+        case "chat_removed":
+            self = .chatRemoved(chatID: try container.decode(Int64.self, forKey: .chatID))
+        case "invitation":
+            self = .invitation(try container.decode(InvitationDTO.self, forKey: .invitation))
+        case "invitation_removed":
+            self = .invitationRemoved(
+                invitationID: try container.decode(Int64.self, forKey: .invitationID))
+        case "family_plan":
+            self = .familyPlan(
+                familyID: try container.decode(Int64.self, forKey: .familyID),
+                plan: try container.decodeIfPresent(String.self, forKey: .plan),
+                deleteAt: try container.decodeIfPresent(Date.self, forKey: .deleteAt))
         case "call_offer":
             // Re-decode from the top so CallOfferPayload owns its keys.
             self = .callOffer(try CallOfferPayload(from: decoder))

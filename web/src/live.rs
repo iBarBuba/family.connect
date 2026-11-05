@@ -71,6 +71,12 @@ pub enum Panel {
     Settings,
     /// Who is in the family — and, for its owner, the family's settings.
     Family,
+    /// Starting another family, for an account already in one — the create
+    /// screen with a word on what it means (docs/protocol.md, "Getting
+    /// another family").
+    NewFamily,
+    /// Joining another family with its invite code — the join screen.
+    JoinFamily,
 }
 
 /// What the viewer shows: a message's media, in sent order, at one of them.
@@ -117,6 +123,17 @@ impl Live {
     /// Look at the state as it is NOW.
     pub fn read<R>(&self, look: impl FnOnce(&AppState) -> R) -> R {
         look(&self.state.borrow())
+    }
+
+    /// The state, borrowed — for a draw, which reads it from top to bottom
+    /// and could not do so through `read` without being a closure.
+    ///
+    /// Held only for the length of a draw, and never across anything that
+    /// changes the state: `update` borrows it to write and would panic. A
+    /// draw cannot call `update` — callbacks and tasks run later, and the
+    /// redraw `update` asks for is scheduled, not run inside it.
+    pub fn borrow(&self) -> std::cell::Ref<'_, AppState> {
+        self.state.borrow()
     }
 
     pub fn session(&self) -> u64 {

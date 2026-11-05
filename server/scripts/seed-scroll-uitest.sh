@@ -15,6 +15,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 pkill -f "family-connect" 2>/dev/null || true; sleep 1
 docker exec fc-test-pg psql -U postgres -c "DROP DATABASE IF EXISTS family_connect_dev WITH (FORCE);" -c "CREATE DATABASE family_connect_dev;" >/dev/null
 cd "$SCRIPT_DIR/.."
+# The fixture's storage key (uitest-server.toml), made once; it refuses to overwrite.
+[ -f /tmp/fc-uitest-storage.key ] ||
+  cargo run --quiet -- storage-key new /tmp/fc-uitest-storage.key >/dev/null
 (cargo run --quiet -- --config "$SCRIPT_DIR/uitest-server.toml" > /tmp/fc-uitest-server.log 2>&1 &)
 sleep 5
 curl -s http://127.0.0.1:8091/api/v1/healthz

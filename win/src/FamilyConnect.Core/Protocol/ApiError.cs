@@ -180,6 +180,73 @@ public static class ErrorCodes
     public const string PackItemTooLarge = "pack_item_too_large";
     public const string PackItemNotFound = "pack_item_not_found";
     public const string NotPackItemAuthor = "not_pack_item_author";
+
+    /// <summary>
+    /// Renaming a group, adding or removing its members, or deleting it, by a member who is not its admin (docs/protocol.md,
+    /// "Groups"): a 403, added 2026-10-22.
+    /// </summary>
+    public const string NotGroupAdmin = "not_group_admin";
+
+    /// <summary>The family already has its 50 groups (docs/protocol.md, "Groups"): a 409, added 2026-10-22.</summary>
+    public const string TooManyGroups = "too_many_groups";
+
+    /// <summary>
+    /// A family the caller is not in — or one that never existed, the same answer, so the families on a server cannot be
+    /// counted by trying ids (docs/protocol.md, "Several families"): a 404, added 2026-10-22. A client treats the family
+    /// as gone and resyncs.
+    /// </summary>
+    public const string FamilyNotFound = "family_not_found";
+
+    /// <summary>The account is already in <c>max_families_per_account</c> families: a 409, added 2026-10-22.</summary>
+    public const string TooManyFamilies = "too_many_families";
+
+    /// <summary>Starting another family while owning one, by hand-off included: a 409, added 2026-10-22.</summary>
+    public const string AlreadyOwnAFamily = "already_own_a_family";
+
+    /// <summary>The operator's <c>[families] member_families</c> is off: a 403, added 2026-10-22.</summary>
+    public const string MemberFamiliesDisabled = "member_families_disabled";
+
+    /// <summary>
+    /// A password reset of a member who is also in a family the owner does not own — only they may change it: a 403,
+    /// added 2026-10-22.
+    /// </summary>
+    public const string MemberInOtherFamilies = "member_in_other_families";
+
+    /// <summary>
+    /// An invitation that is no longer pending: accepted, declined, withdrawn, somebody else's, or never there. A 409,
+    /// added 2026-10-22.
+    /// </summary>
+    public const string InvitationNotPending = "invitation_not_pending";
+
+    /// <summary>
+    /// A new family on a server that charges for them, from an account with no active subscription (docs/protocol.md, "Paid
+    /// families"): a 403, added 2026-10-30, checked after every other refusal <c>POST /families</c> has. Terminal.
+    /// </summary>
+    public const string SubscriptionRequired = "subscription_required";
+
+    /// <summary>What the App Store signed did not verify (<c>PUT /me/subscription</c>, Apple's apps only): a 400, added 2026-10-30.</summary>
+    public const string SubscriptionInvalid = "subscription_invalid";
+
+    /// <summary>That subscription belongs to another account: a 409, added 2026-10-30.</summary>
+    public const string SubscriptionTaken = "subscription_taken";
+
+    /// <summary>The server's subscriptions are off: a 403, added 2026-10-30.</summary>
+    public const string SubscriptionsDisabled = "subscriptions_disabled";
+
+    /// <summary>
+    /// An upload for a PAID family that has used its storage allowance (docs/protocol.md, "Paid families"): a 403, added
+    /// 2026-10-30, decided before the body is read. Terminal — the same bytes would be refused again — and not
+    /// <see cref="StorageFull"/>, which is the server's own disk.
+    /// </summary>
+    public const string StorageAllowanceUsed = "storage_allowance_used";
+
+    /// <summary>
+    /// A transcript or a board backdrop for a PAID family past this month's minutes or pictures: a 403, added 2026-10-30. The
+    /// allowance starts again on the 1st of the next UTC month. In a chat the same thing arrives as <c>ai_error</c>'s
+    /// <c>"allowance_used"</c> instead.
+    /// </summary>
+    public const string AiAllowanceUsed = "ai_allowance_used";
+
     public const string TooManyRequests = "too_many_requests";
     public const string Internal = "internal";
 
@@ -199,6 +266,9 @@ public static class ErrorCodes
         InvalidCall, CallNotFound, CallBusy, PeerBusy, PeerUnreachable, AvatarTooLarge,
         InvalidImage, AttachmentTooLarge, InvalidAttachment, AttachmentNotFound,
         AttachmentExpired, AttachmentAlreadyUsed, StorageFull, PackFull, PackItemTooLarge,
-        PackItemNotFound, NotPackItemAuthor, TooManyRequests, Internal,
+        PackItemNotFound, NotPackItemAuthor, NotGroupAdmin, TooManyGroups, FamilyNotFound, TooManyFamilies,
+        AlreadyOwnAFamily, MemberFamiliesDisabled, MemberInOtherFamilies, InvitationNotPending, SubscriptionRequired,
+        SubscriptionInvalid, SubscriptionTaken, SubscriptionsDisabled, StorageAllowanceUsed, AiAllowanceUsed, TooManyRequests,
+        Internal,
     ];
 }

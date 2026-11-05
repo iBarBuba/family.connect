@@ -59,26 +59,35 @@ import androidx.navigation.navArgument
 import me.nettrash.familyconnect.R
 import me.nettrash.familyconnect.navigation.Routes
 import me.nettrash.familyconnect.ui.chat.ChatScreen
+import me.nettrash.familyconnect.ui.group.GroupInfoScreen
+import me.nettrash.familyconnect.ui.components.LIST_PANE_WIDTH_DP
 import me.nettrash.familyconnect.ui.thread.ThreadScreen
 import me.nettrash.familyconnect.ui.polls.OpenPollsScreen
 
-/** The list pane's width: the iPad sidebar's 320pt, which fits a two-line family name beside its time. */
-private val LIST_PANE_WIDTH = 340.dp
+/** The list pane's width — shared with isTwoPane, which keeps the conversation beside it at least 400dp. */
+private val LIST_PANE_WIDTH = LIST_PANE_WIDTH_DP.dp
 
 @Composable
 fun ChatListDetailPane(
     onOpenSettings: () -> Unit,
     onOpenBoard: () -> Unit,
+    onNewFamily: () -> Unit = {},
+    onJoinFamily: () -> Unit = {},
     viewModel: ChatListViewModel = hiltViewModel(),
 ) {
-    // Survives rotation and a fold; a process death lands on the empty
-    // pane, which is where a launch lands too.
-    var selectedChatId by rememberSaveable { mutableStateOf<Long?>(null) }
     val chats by viewModel.chats.collectAsStateWithLifecycle()
     val members by viewModel.pickableMembers.collectAsStateWithLifecycle()
-    // The family chat's title IS the family's name (the server titles it
-    // so); the roster's pickable members plus me is everyone still in.
-    val familyName = chats?.firstOrNull { it.kind == "family" }?.title
+    val families by viewModel.families.collectAsStateWithLifecycle()
+    // Survives rotation and a fold; a process death lands on the empty
+    // pane, which is where a launch lands too. Keyed by the family shown:
+    // a switch is a different list, and the thread beside it goes.
+    var selectedChatId by rememberSaveable(families.currentFamilyId) { mutableStateOf<Long?>(null) }
+    // The CURRENT family's name (docs/protocol.md, "Several families") —
+    // or, before the family list is known, the family chat's title, which
+    // the server sets to it. `chats` is the current family's already, so
+    // its family chat is this family's. The roster's pickable members plus
+    // me is everyone still in.
+    val familyName = families.currentName ?: chats?.firstOrNull { it.kind == "family" }?.title
     val memberCount = members.size + 1
 
     Row(modifier = Modifier.fillMaxSize()) {
@@ -92,6 +101,8 @@ fun ChatListDetailPane(
                 onOpenSettings = onOpenSettings,
                 onOpenBoard = onOpenBoard,
                 selectedChatId = selectedChatId,
+                onNewFamily = onNewFamily,
+                onJoinFamily = onJoinFamily,
                 viewModel = viewModel,
             )
         }
@@ -123,6 +134,17 @@ fun ChatListDetailPane(
                                 onOpenPolls = { id -> detailNav.navigate(Routes.openPolls(id)) },
                                 onOpenThread = { id, rootId -> detailNav.navigate(Routes.thread(id, rootId)) },
                                 onOpenChat = { id -> selectedChatId = id },
+                                onOpenGroupInfo = { id -> detailNav.navigate(Routes.groupInfo(id)) },
+                            )
+                        }
+                        composable(
+                            Routes.GROUP_INFO,
+                            arguments = listOf(navArgument("chatId") { type = NavType.LongType }),
+                        ) {
+                            GroupInfoScreen(
+                                onBack = { detailNav.popBackStack() },
+                                // The group is gone, and the thread with it.
+                                onGroupGone = { selectedChatId = null },
                             )
                         }
                         // The chat's own surfaces open inside the detail
@@ -148,6 +170,8 @@ fun ChatListDetailPane(
                                 chatId = entry.arguments?.getLong("chatId") ?: 0L,
                                 rootId = entry.arguments?.getLong("rootId") ?: 0L,
                                 onBack = { detailNav.popBackStack() },
+                                // The chat is gone, and the thread with it.
+                                onChatGone = { selectedChatId = null },
                                 onOpenChat = { id -> selectedChatId = id },
                             )
                         }

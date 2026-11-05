@@ -68,6 +68,31 @@ extension View {
         #endif
     }
 
+    /// Text entry somebody writes SENTENCES in — the composer, a thread
+    /// reply, a note, a list's line, a poll, a report's note (#97,
+    /// docs/capitals-and-rich-markdown-2026-10-17.md, "Who already has
+    /// them"). iOS's keyboard capitalises sentences by default already;
+    /// this says so explicitly, so the list of prose fields is written
+    /// down in the code rather than inherited from a default that could
+    /// change, and matches Android's `KeyboardCapitalization.Sentences`
+    /// field for field. The Mac has no keyboard capitalisation to ask for —
+    /// MacCapitalKeys does it there, on the multi-line fields.
+    ///
+    /// Emoji as you type (#101) runs on the same fields. On the Mac this
+    /// marks the field for it (MacProseFieldMark): every multi-line field
+    /// is prose already, and the mark is how MacCapitalKeys tells a
+    /// single-line prose field — a list's line, a poll's option — from a
+    /// search or a username. On iOS it is the field's binding instead
+    /// (EmojiTypingField), because a phone's keyboard sends no keys.
+    @ViewBuilder
+    func proseTextEntry() -> some View {
+        #if os(iOS)
+        textInputAutocapitalization(.sentences)
+        #else
+        background(MacProseFieldMark())
+        #endif
+    }
+
     /// `navigationBarTitleDisplayMode(.inline)`, which does not exist on
     /// macOS — a Mac window title has no large/inline distinction.
     @ViewBuilder
@@ -249,6 +274,21 @@ enum MacSheetSize {
     static let resetPassword = CGSize(width: 460, height: 460)
     /// The roster's Birthday — its section header carries a display name.
     static let memberBirthday = CGSize(width: 460, height: 440)
+
+    /// New Group (#107) — a name field over the family's members, ticked.
+    /// Hangs from the main window, whose thread alone is at least 420pt
+    /// wide beside a 240pt sidebar, so it has the roster sheet's room.
+    static let newGroup = CGSize(width: 440, height: 520)
+    /// Group Info (#107) — the members with the admin's controls, and the
+    /// rename / add / leave / delete rows under them. Also opened from a
+    /// conversation's own window; its list scrolls when that is short.
+    static let groupInfo = CGSize(width: 440, height: 520)
+
+    /// The subscription screen (docs/protocol.md, "Paid families") — Apple's
+    /// store view over what a family gets. Opened from Settings ▸ Renew as
+    /// well as from the main window, so it is held to the Settings window's
+    /// ceiling like its neighbours, and scrolls.
+    static let subscription = CGSize(width: 440, height: 415)
 
     /// What each sheet's parent offers at its SMALLEST, which is the size the
     /// sheet actually has to fit: Settings is resizable down to its minimum,

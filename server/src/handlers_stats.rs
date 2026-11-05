@@ -17,6 +17,7 @@ use sqlx::Row;
 
 use crate::auth::AuthUser;
 use crate::error::ApiError;
+use crate::keyring::{KeyError, SealedRow};
 use crate::state::AppState;
 
 /// `GET /families/mine/stats`
@@ -25,17 +26,15 @@ pub async fn family_stats(
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     // Same rule every family endpoint follows: no family, nothing to count.
-    let family_id = sqlx::query("SELECT family_id FROM users WHERE id = $1")
-        .bind(auth.user_id)
-        .fetch_optional(&state.pool)
-        .await?
-        .and_then(|row| row.get::<Option<i64>, _>("family_id"))
-        .ok_or_else(|| {
-            ApiError::conflict(
-                crate::error::codes::NOT_IN_FAMILY,
-                "you are not in a family",
-            )
-        })?;
+    // The family is the request's — `/families/{family}/stats`, `mine`
+    // being the home family — so each family's statistics are its own
+    // (docs/protocol.md, "Several families").
+    let family_id = auth.family_id.ok_or_else(|| {
+        ApiError::conflict(
+            crate::error::codes::NOT_IN_FAMILY,
+            "you are not in a family",
+        )
+    })?;
 
     // Every SUM is cast to BIGINT: PostgreSQL widens SUM() over a bigint to
     // NUMERIC, which does not decode to i64 and fails at the row read
@@ -105,7 +104,8 @@ pub async fn family_stats(
              WHERE family_id = $1
              GROUP BY user_id
          ) ai ON ai.user_id = u.id
-         WHERE u.family_id = $1
+         WHERE EXISTS (SELECT 1 FROM family_members fm
+                        WHERE fm.family_id = $1 AND fm.user_id = u.id)
            -- A member the caller has blocked is left out of the per-member
            -- rows: a leaderboard row naming somebody whose every bubble is
            -- a hidden row is exactly the presence a block removes, and this
@@ -121,20 +121,27 @@ pub async fn family_stats(
                SELECT 1 FROM member_blocks mb
                 WHERE mb.blocker_user_id = $2 AND mb.blocked_user_id = u.id
            )
-         ORDER BY messages DESC, u.display_name ASC",
+         ORDER BY messages DESC, u.id ASC",
     )
     .bind(family_id)
     .bind(auth.user_id)
     .fetch_all(&state.pool)
     .await?;
 
-    let member_rows: Vec<serde_json::Value> = members
+    // Most messages first, and among equals by name — ordered here rather
+    // than in SQL, because the names are sealed (#59) and PostgreSQL can no
+    // longer compare them. Case is ignored, as a reader expects of a list of
+    // names; the id settles what is left.
+    let mut member_rows: Vec<(i64, String, i64, serde_json::Value)> = members
         .iter()
         .map(|row| {
-            json!({
-                "user_id": row.get::<i64, _>("id"),
-                "display_name": row.get::<String, _>("display_name"),
-                "messages": row.get::<i64, _>("messages"),
+            let display_name = row.text(&state.keys, "display_name")?;
+            let messages = row.get::<i64, _>("messages");
+            let id = row.get::<i64, _>("id");
+            let value = json!({
+                "user_id": id,
+                "display_name": display_name,
+                "messages": messages,
                 "attachments": {
                     "count": row.get::<i64, _>("att_count"),
                     "bytes": row.get::<i64, _>("att_bytes"),
@@ -153,8 +160,18 @@ pub async fn family_stats(
                     "transcript_duration_ms": row.get::<i64, _>("ai_audio_ms"),
                     "searches": row.get::<i64, _>("ai_searches"),
                 },
-            })
+            });
+            Ok((messages, display_name, id, value))
         })
+        .collect::<Result<_, KeyError>>()?;
+    member_rows.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    let member_rows: Vec<serde_json::Value> = member_rows
+        .into_iter()
+        .map(|(_, _, _, value)| value)
         .collect();
 
     // Family totals. Summed in SQL rather than from the rows above, because
@@ -164,7 +181,7 @@ pub async fn family_stats(
     // what dedup saved.
     let totals = sqlx::query(
         "SELECT
-            (SELECT COUNT(*) FROM users WHERE family_id = $1) AS members,
+            (SELECT COUNT(*) FROM family_members WHERE family_id = $1) AS members,
             (SELECT COUNT(*) FROM messages msg
                 JOIN chats c ON c.id = msg.chat_id
                 WHERE c.family_id = $1) AS messages,
@@ -234,7 +251,7 @@ pub async fn family_stats(
     .fetch_one(&state.pool)
     .await?;
 
-    let body = json!({
+    let mut body = json!({
         "generated_at": time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
@@ -266,6 +283,12 @@ pub async fn family_stats(
         },
         "members": member_rows,
     });
+    // A PAID family's allowance, beside everything else every member sees
+    // (protocol.md, "Family statistics", amended 2026-10-30). Absent for a
+    // free family and on a server that does not charge.
+    if let Some(allowance) = crate::subscriptions::allowance_json(&state, family_id).await? {
+        body["allowance"] = allowance;
+    }
 
     Ok((StatusCode::OK, Json(body)).into_response())
 }

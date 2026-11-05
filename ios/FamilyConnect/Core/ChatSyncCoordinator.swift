@@ -79,19 +79,25 @@ nonisolated enum BackdropOutcome: Equatable, Sendable {
     /// for a consent withdrawn on another device (protocol.md, "Consenting
     /// to the assistant").
     case consentRequired
+    /// `ai_allowance_used` (403): a paid family past this month's pictures
+    /// (docs/protocol.md, "Paid families"). The note is untouched; asking
+    /// again works once the allowance renews on `renewsAt`.
+    case allowanceUsed(renewsAt: Date)
     /// Anything else: no images deployment, a transport failure, the
     /// provider's own failure (`internal`), a picture that never landed.
     case failed
 
     /// Sorted from what the request threw. Only the protocol's code decides
     /// a refusal; a 400 with any other code is an ordinary failure, and so
-    /// is a 403 with any code but the consent one.
-    init(error: Error) {
+    /// is a 403 with any code but the consent and allowance ones.
+    init(error: Error, now: Date = .now) {
         switch error {
         case APIError.conflict(let code, _) where code == "picture_refused":
             self = .refused
         case APIError.forbidden(let code) where code == "assistant_consent_required":
             self = .consentRequired
+        case APIError.forbidden(let code) where code == "ai_allowance_used":
+            self = .allowanceUsed(renewsAt: PaidFamilies.nextMonthStartUTC(after: now))
         default:
             self = .failed
         }
@@ -116,6 +122,8 @@ nonisolated enum BackdropOutcome: Equatable, Sendable {
         case .drawn: nil
         case .refused:
             String(localized: "The assistant's provider refused that. Try putting it another way.")
+        case .allowanceUsed(let renewsAt):
+            PaidFamilies.assistantAllowanceUsed(renewsAt: renewsAt)
         // Shown only where the question cannot be asked
         // (`asksForConsent`): then it is simply the backdrop failing.
         case .consentRequired, .failed: String(localized: "Couldn't draw that.")
@@ -198,6 +206,22 @@ final class ChatSyncCoordinator {
     /// kept alive should now go.
     private var isInBackground = false
     private weak var attachmentStore: AttachmentStore?
+
+    /// Told the id of every chat this device drops, after its rows are gone
+    /// — so whatever keeps per-chat state OUTSIDE the store (the parked "not
+    /// sent" voice notes) can let it go too. Wired by the app; a test leaves
+    /// it nil and touches nothing on disk.
+    var onChatDropped: (@MainActor (Int64) -> Void)?
+
+    /// Groups that changed by frame or by this device's own request while a
+    /// `GET /chats` was in flight, and so cannot be judged by that response
+    /// (docs/protocol.md, "Groups", 2026-10-22). The list was built before
+    /// it was sent: a group created or joined since is ABSENT from it and
+    /// must not be pruned for that, and a group left or deleted since is
+    /// still PRESENT in it and must not be brought back. Cleared as each
+    /// request starts; nil while none is running, so nothing collects.
+    private var chatsUpsertedDuringList: Set<Int64>?
+    private var chatsRemovedDuringList: Set<Int64>?
 
     // MARK: - Internals
 
@@ -546,12 +570,17 @@ final class ChatSyncCoordinator {
         }
     }
 
-    /// `{base}/api/v1/ws` with https→wss / http→ws scheme swap.
+    /// `{base}/api/v1/ws?families=1` with https→wss / http→ws scheme swap.
+    /// The query is the socket's `X-FC-Families: 1` (docs/protocol.md,
+    /// "Several families"): without it the server sends only what concerns
+    /// the home family, and every other family's frames are lost to this
+    /// connection.
     static func webSocketURL(base: URL) -> URL? {
         var text = base.absoluteString
         if text.hasSuffix("/") { text.removeLast() }
         guard var components = URLComponents(string: text + "/api/v1/ws") else { return nil }
         components.scheme = (components.scheme == "https") ? "wss" : "ws"
+        components.queryItems = [URLQueryItem(name: "families", value: "1")]
         return components.url
     }
 
@@ -624,12 +653,17 @@ final class ChatSyncCoordinator {
             if applied { announce(note) }
 
         case .packItem(let item):
-            applyPackItem(item)
+            // Whose pack, by the item's own `family_id` (docs/protocol.md,
+            // "Several families"); the pack on screen from an older server.
+            let familyKey = familyKey(named: item.familyID)
+            applyPackItem(item, familyKey: familyKey)
             // The frame moves the cursor ONLY once this connection has
             // caught up (docs/protocol.md, "Sticker pack"): before that, a
             // frame's seq sits above changes the catch-up has not fetched
             // yet, and a cursor moved to it would skip them for good.
-            if packCaughtUp { packCursor = max(packCursor, item.packSeq) }
+            if packCaughtUp(for: familyKey) {
+                setPackCursor(max(packCursor(for: familyKey), item.packSeq), for: familyKey)
+            }
             saveContext()
 
         case .aiDelta(_, let messageID, let text):
@@ -749,12 +783,45 @@ final class ChatSyncCoordinator {
             scheduleTypingPrune()
 
         case .memberJoined(let payload):
+            // To THAT family's roster (docs/protocol.md, "Several families").
+            // One naming this account, for a family it does not hold — an
+            // approval, an accepted invitation, a family created on another
+            // device — means "you are in a new family": `/me` and that
+            // family are read again, which is what a resync does first.
+            if payload.user.id == currentUserID,
+               let session, !session.families.contains(where: { $0.id == payload.familyID }) {
+                Task { await self.resync() }
+                return
+            }
+            // The owner's copy carries `password_reset`, so a newcomer —
+            // approved, invited or through the open door — is never offered
+            // a reset the server would refuse. Everybody else's copy, and an
+            // older server's, does not: then whatever flag this device holds
+            // for the member stands (`.none`), never cleared by a frame that
+            // did not mention it — which `.some(nil)` would do.
+            var passwordReset: Bool?? = .none
+            if let flag = payload.passwordReset { passwordReset = .some(flag) }
+            // The frame carries no role, so "member" is only what a NEW row
+            // on that family's roster starts as — anybody who joins is one
+            // (`keepsHeldRole`). A member this device already holds there
+            // keeps the role it holds. The case that needs it: "New Family…"
+            // from inside the app makes the server send `member_joined`
+            // naming the CREATOR, who is the family's OWNER; by then
+            // `createFamily` has adopted the family and the resync it starts
+            // may already have read the roster with the creator as owner,
+            // and writing "member" over that demoted them on this device
+            // until the next roster read. The same goes for a duplicate or
+            // late frame about anybody whose role has since moved
+            // (`family_owner`).
             upsertMember(
                 userID: payload.user.id,
                 username: payload.user.username,
                 displayName: payload.user.displayName,
                 role: "member",
-                avatarVersion: payload.user.avatarVersion)
+                avatarVersion: payload.user.avatarVersion,
+                familyKey: familyKey(named: payload.familyID),
+                passwordReset: passwordReset,
+                keepsHeldRole: true)
 
         case .reaction(let payload):
             // Full-state apply under the per-message seq guard; the chat
@@ -769,6 +836,41 @@ final class ChatSyncCoordinator {
                 chat.maxReactionSeq = payload.reactionSeq
                 saveContext()
             }
+
+        case .chatUpdated(let dto):
+            // A group as it now stands — created, renamed, members or admin
+            // changed (docs/protocol.md, "Groups"). Only the chat's own
+            // fields move: the preview, the count and the cursors are the
+            // message pipeline's, and a rename is not a message. A member
+            // just added gets the group from this frame and its history
+            // when they open it, starting with nothing unread.
+            // Its `family_ids` may have changed with it — a direct chat
+            // listed in fewer families once two people stop sharing one
+            // (docs/protocol.md, "Several families") — and `applyChat`
+            // writes them like every other field.
+            applyChat(dto)
+            saveContext()
+
+        case .chatRemoved(let chatID):
+            // Left, removed, or deleted by its admin: the chat goes, with
+            // its messages and anything drafted there. An open thread is
+            // closed by the list's own vanish hook (ChatListView, MacChatView).
+            dropChat(chatID: chatID)
+
+        case .invitation(let invitation):
+            // An invitation to this account, or — on the owner's devices —
+            // one their family sent (docs/protocol.md, "Several families").
+            session?.applyInvitation(invitation)
+
+        case .invitationRemoved(let invitationID):
+            session?.removeInvitation(id: invitationID)
+
+        case .familyPlan(let familyID, let plan, let deleteAt):
+            // A paid family stopped, or started again, being covered by its
+            // owner's subscription (docs/protocol.md, "Paid families"). To
+            // the family it NAMES: the banner over that family's chat list
+            // appears or goes with it, live.
+            session?.applyFamilyPlan(familyID: familyID, plan: plan, deleteAt: deleteAt)
 
         case .poll(let payload):
             // The reaction case's twin, and deliberately identical: full
@@ -809,13 +911,34 @@ final class ChatSyncCoordinator {
             // nothing to reconcile against a roster.
             applyBlock(userID: userID, blocked: blocked)
 
-        case .memberLeft(let userID):
+        case .memberLeft(let familyID, let userID):
             if userID == currentUserID {
-                // We were removed. Resync's /me reconcile routes the
-                // session to needsFamily and purges family-scoped data.
+                // We are out of THAT family (docs/protocol.md, "Several
+                // families"): its chats, board, pack, roster and cursors go
+                // — and only its. A family this device holds is dropped at
+                // once; the resync then reconciles the rest. When it was the
+                // last family, `removeFamily` purges and routes the session
+                // itself — to the gate, or to the waiting screen while a
+                // join request is pending elsewhere, whose own `/me` poll
+                // takes over from there — and the socket closes with the
+                // phase, so there is nothing for a resync to do.
+                //
+                // This frame also reaches the device that sent a leave,
+                // possibly before the leave's own answer does
+                // (`AppSession.leaveFamily`, which is written to come to the
+                // same end whichever arrives first).
+                if let familyID, let session, session.families.contains(where: { $0.id == familyID }) {
+                    session.removeFamily(familyID)
+                    guard session.phase == .active else { return }
+                }
                 Task { await self.resync() }
             } else if let member = fetchMember(userID) {
-                member.hasLeft = true
+                // Off THAT family's roster, never "my family": somebody
+                // leaving one family is still in the others.
+                var roles = member.familyRoles
+                roles[familyKey(named: familyID)] = nil
+                member.familyRoles = roles
+                member.project(onto: currentFamilyKey)
                 saveContext()
             }
 
@@ -1003,18 +1126,188 @@ final class ChatSyncCoordinator {
         saveContext()
     }
 
-    /// The board catch-up cursor, persisted so a relaunch resumes rather
-    /// than re-reading the whole wall.
-    var boardCursor: Int64 {
-        get { AppSettings.boardCursor }
-        set { AppSettings.boardCursor = newValue }
+    // MARK: - Families (docs/protocol.md, "Several families", 2026-10-22)
+
+    /// The family on screen, as the store keys it: `0` when none is known —
+    /// a test with no session, or an offline launch before the first `/me`.
+    /// Every family-level thing a frame or a request does not attribute
+    /// itself (a server that predates `family_id`) is the current family's.
+    var currentFamilyKey: Int64 { session?.currentFamilyID ?? 0 }
+
+    /// The family id a request for `familyKey` names in its path: nil — the
+    /// home family's old form — for `0`, and on a server that predates
+    /// several families (`AppSession.apiFamilyID(for:)`).
+    private func pathFamily(_ familyKey: Int64) -> Int64? {
+        guard familyKey != 0, let session else { return nil }
+        return session.apiFamilyID(for: familyKey)
     }
 
-    /// Whether this launch has already decided about seeding the badge's
-    /// content mark. Not a "seeded" flag: the answer "there was nothing to
-    /// seed" is just as final, and re-asking would fetch the whole board on
-    /// every applied note.
-    private var boardContentMarkChecked = false
+    /// The family a frame or a read names, as the store keys it. Only while
+    /// the session holds a family list does a `family_id` stand for itself;
+    /// before that — a test with no session, a launch before the first
+    /// `/me` — there is one family as far as this device can tell, and
+    /// everything is the current key's, as it was before several families.
+    func familyKey(named familyID: Int64?) -> Int64 {
+        guard let familyID, let families = session?.families, !families.isEmpty else {
+            return currentFamilyKey
+        }
+        return familyID
+    }
+
+    /// Every family this device holds, by id — the session's list, or the
+    /// current key alone when there is no session to ask.
+    private var heldFamilyKeys: [Int64] {
+        if let families = session?.families, !families.isEmpty { return families.map(\.id) }
+        return [currentFamilyKey]
+    }
+
+    /// Re-point every roster row's `role` and `hasLeft` at the family on
+    /// screen — what a switch does (`AppSession.onCurrentFamilyChanged`), so
+    /// every roster, picker and predicate in the app reads the current
+    /// family without knowing there is more than one.
+    func projectRoster(onto familyKey: Int64? = nil) {
+        let familyKey = familyKey ?? currentFamilyKey
+        for member in (try? modelContext.fetch(FetchDescriptor<MemberEntity>())) ?? [] {
+            member.project(onto: familyKey)
+        }
+        saveContext()
+    }
+
+    /// The families a held chat is listed in, or `.none` when this device
+    /// does not hold it — for a push that names no family. `.some(nil)` is a
+    /// held chat whose `family_ids` nobody sent, the HOME family's; flattened
+    /// into one nil, as `fetchChat(id)?.familyIDs` does, it read as "not
+    /// held" and the push stayed wherever the app was
+    /// (`AppSession.resolvePendingPushFamily`).
+    func chatFamilyIDs(of chatID: Int64) -> [Int64]?? {
+        guard let chat = fetchChat(chatID) else { return .none }
+        return .some(chat.familyIDs)
+    }
+
+    /// Whether this device holds anything that is a family's at all: a chat,
+    /// a roster row, a note, a sticker — or a board or pack mark, which live
+    /// in the defaults and can outlast rows that went without them. What a
+    /// `/me` listing NO family asks before it purges (`AppSession
+    /// .holdsFamilyData`): on a cold launch the session's list is still
+    /// empty, and only what was persisted can say a family's data is here.
+    /// Every one of these goes with a purge, so the answer is "no" after one.
+    func holdsFamilyData() -> Bool {
+        func holds<Model: PersistentModel>(_: Model.Type) -> Bool {
+            var descriptor = FetchDescriptor<Model>()
+            descriptor.fetchLimit = 1
+            return ((try? modelContext.fetchCount(descriptor)) ?? 0) > 0
+        }
+        return holds(ChatEntity.self) || holds(MemberEntity.self) || holds(NoteEntity.self)
+            || holds(PackItemEntity.self) || AppSettings.holdsFamilyMarks
+    }
+
+    /// Everything this device holds that is ONE family's, gone: the account
+    /// left it or was removed (docs/protocol.md, "Several families"). Its
+    /// family chat, groups and `ai` chat go with their messages; a direct
+    /// chat stays while its `family_ids` still name another family this
+    /// device holds, and only loses this one. A direct chat the server has
+    /// already listed in NO family goes too: that `chat_updated` (`[]`)
+    /// reaches the side that left just before this, so the chat no longer
+    /// names the family it closed with (`FamilyRules.survivesLeaving`). Its
+    /// board and gone notes, its pack and gone items, its roster
+    /// memberships, its cursors — and nobody else's.
+    func dropFamily(_ familyKey: Int64) {
+        let held = Set(heldFamilyKeys).subtracting([familyKey])
+        for chat in (try? modelContext.fetch(FetchDescriptor<ChatEntity>())) ?? [] {
+            let listed = chat.familyIDs
+            if !FamilyRules.survivesLeaving(chatFamilyIDs: listed, left: familyKey, held: held) {
+                deleteChat(chat)
+            } else if let listed, listed.contains(familyKey) {
+                chat.familyIDs = listed.filter { $0 != familyKey }
+            }
+        }
+        for note in notes(of: familyKey) {
+            attachmentStore?.forget(attachmentIDs: note.attachmentID.map { [$0] } ?? [])
+            modelContext.delete(note)
+        }
+        let goneNotes = FetchDescriptor<GoneNoteEntity>(predicate: #Predicate { $0.familyID == familyKey })
+        for gone in (try? modelContext.fetch(goneNotes)) ?? [] { modelContext.delete(gone) }
+        for item in packEntities(of: familyKey) {
+            attachmentStore?.forget(attachmentIDs: [item.attachmentID])
+        }
+        forgetPack(familyKey: familyKey)
+        for member in (try? modelContext.fetch(FetchDescriptor<MemberEntity>())) ?? []
+        where member.isMember(of: familyKey) {
+            var roles = member.familyRoles
+            roles[familyKey] = nil
+            member.familyRoles = roles
+            member.project(onto: currentFamilyKey)
+        }
+        setBoardCursor(0, for: familyKey)
+        AppSettings.setBoardMarks(BoardBadge.Marks(seenNoteID: 0, seenContentSeq: 0), family: familyKey)
+        boardContentMarkChecked.remove(familyKey)
+        saveContext()
+    }
+
+    /// The general repair: drop whatever this device holds of a family the
+    /// account is no longer in — left on another device, or removed while
+    /// the socket was down, so no `member_left` ever reached it.
+    private func pruneFamilies(keeping kept: Set<Int64>) {
+        guard let families = session?.families, !families.isEmpty else { return }
+        var seen: Set<Int64> = []
+        for note in (try? modelContext.fetch(FetchDescriptor<NoteEntity>())) ?? [] { seen.insert(note.familyID) }
+        for item in (try? modelContext.fetch(FetchDescriptor<PackItemEntity>())) ?? [] { seen.insert(item.familyID) }
+        for member in (try? modelContext.fetch(FetchDescriptor<MemberEntity>())) ?? [] {
+            seen.formUnion(member.familyRoles.keys)
+        }
+        for familyKey in seen.subtracting(kept) where familyKey != 0 {
+            dropFamily(familyKey)
+        }
+        // `0` is "no family known yet", which no `/me` can make stale.
+        AppSettings.forgetFamilies(except: kept.union([0]))
+    }
+
+    /// What a build from before several families cached — the board, the
+    /// pack and their gone sets, and the roster — was all the HOME family's:
+    /// it read `/families/mine` and nothing else. Handed to it once, at the
+    /// first `/me` that names it.
+    func adoptUnattributed(into homeKey: Int64) {
+        guard homeKey != 0 else { return }
+        let notes = FetchDescriptor<NoteEntity>(predicate: #Predicate { $0.familyID == 0 })
+        for note in (try? modelContext.fetch(notes)) ?? [] { note.familyID = homeKey }
+        let items = FetchDescriptor<PackItemEntity>(predicate: #Predicate { $0.familyID == 0 })
+        for item in (try? modelContext.fetch(items)) ?? [] { item.familyID = homeKey }
+        let goneNotes = FetchDescriptor<GoneNoteEntity>(predicate: #Predicate { $0.familyID == 0 })
+        for gone in (try? modelContext.fetch(goneNotes)) ?? [] { gone.familyID = homeKey }
+        let goneItems = FetchDescriptor<GonePackItemEntity>(predicate: #Predicate { $0.familyID == 0 })
+        for gone in (try? modelContext.fetch(goneItems)) ?? [] { gone.familyID = homeKey }
+        for member in (try? modelContext.fetch(FetchDescriptor<MemberEntity>())) ?? []
+        where member.familyRolesText.isEmpty && !member.accountDeleted && !member.hasLeft {
+            member.familyRoles = [homeKey: member.role.isEmpty ? "member" : member.role]
+        }
+        // The pack's caught-up mark was the home pack's too.
+        if let caughtUp = packCaughtUpConnection.removeValue(forKey: 0) {
+            packCaughtUpConnection[homeKey] = caughtUp
+        }
+        saveContext()
+    }
+
+    /// The board catch-up cursor of the family on screen, persisted so a
+    /// relaunch resumes rather than re-reading the whole wall. One per
+    /// family (`boardCursor(for:)`).
+    var boardCursor: Int64 {
+        get { boardCursor(for: currentFamilyKey) }
+        set { setBoardCursor(newValue, for: currentFamilyKey) }
+    }
+
+    func boardCursor(for familyKey: Int64) -> Int64 {
+        AppSettings.boardCursor(family: familyKey)
+    }
+
+    func setBoardCursor(_ value: Int64, for familyKey: Int64) {
+        AppSettings.setBoardCursor(value, family: familyKey)
+    }
+
+    /// The families this launch has already decided about seeding the
+    /// badge's content mark for. Not a "seeded" flag: the answer "there was
+    /// nothing to seed" is just as final, and re-asking would fetch the
+    /// whole board on every applied note.
+    private var boardContentMarkChecked: Set<Int64> = []
 
     /// Apply one note under the per-note seq guard.
     ///
@@ -1024,13 +1317,18 @@ final class ChatSyncCoordinator {
     /// not remove a note that has since been re-created… which cannot
     /// happen (ids are never reused), but the same rule covers an
     /// out-of-order MOVE, which very much can.
+    ///
+    /// `familyKey` is the board the caller read the note from; the note's
+    /// own `family_id` wins over it, and the family on screen stands in for
+    /// both on a server that predates several families.
     @discardableResult
-    func applyNote(_ dto: NoteDTO) -> Bool {
+    func applyNote(_ dto: NoteDTO, familyKey: Int64? = nil) -> Bool {
+        let familyKey = dto.familyID.map { self.familyKey(named: $0) } ?? familyKey ?? currentFamilyKey
         // Before the first note that carries a content seq is written, and
         // only ever once per launch: a device that had shown this board
         // before the field existed needs its content mark seeded, or the
         // server's backfill badges the whole wall (BoardBadge).
-        seedBoardContentMarkIfNeeded()
+        seedBoardContentMarkIfNeeded(familyKey: familyKey)
         // A TOMBSTONE IS THE LAST WORD (docs/protocol.md, "Board"). Board seqs commit out of
         // order and a catch-up page carries the pre-delete copy, so without this an older answer
         // crossing the tombstone on the wire puts a note the family took down back on the wall.
@@ -1049,7 +1347,7 @@ final class ChatSyncCoordinator {
             // The guard above covers deletion too, so a stale tombstone never reaches here and
             // removes nothing. One that does is remembered even when this device held no row for
             // it: the copy it is about may still be on its way.
-            rememberNoteGone(dto.id)
+            rememberNoteGone(dto.id, familyKey: familyKey)
             if let existing { modelContext.delete(existing) }
             return true
         }
@@ -1097,6 +1395,7 @@ final class ChatSyncCoordinator {
             existing.updatedAt = dto.updatedAt ?? existing.updatedAt
             existing.boardSeq = dto.boardSeq
             existing.contentSeq = contentSeq
+            if existing.familyID != familyKey { existing.familyID = familyKey }
         } else {
             modelContext.insert(NoteEntity(
                 noteID: dto.id,
@@ -1120,7 +1419,8 @@ final class ChatSyncCoordinator {
                 createdAt: dto.createdAt ?? Date(),
                 updatedAt: dto.updatedAt ?? Date(),
                 boardSeq: dto.boardSeq,
-                contentSeq: contentSeq))
+                contentSeq: contentSeq,
+                familyID: familyKey))
         }
         return true
     }
@@ -1129,14 +1429,20 @@ final class ChatSyncCoordinator {
     /// content seqs (docs/protocol.md, "Board"). Cheap to ask: the flag
     /// costs one comparison, and the fetch behind it happens at most once
     /// per launch and only on a device that has one to do.
-    private func seedBoardContentMarkIfNeeded() {
-        guard !boardContentMarkChecked else { return }
-        boardContentMarkChecked = true
-        let marks = AppSettings.boardMarks
-        let notes = (try? modelContext.fetch(FetchDescriptor<NoteEntity>())) ?? []
+    private func seedBoardContentMarkIfNeeded(familyKey: Int64) {
+        guard !boardContentMarkChecked.contains(familyKey) else { return }
+        boardContentMarkChecked.insert(familyKey)
+        let marks = AppSettings.boardMarks(family: familyKey)
+        let notes = notes(of: familyKey)
         guard let seed = BoardBadge.contentMarkSeed(notes: notes, marks: marks) else { return }
-        AppSettings.boardMarks = BoardBadge.Marks(
-            seenNoteID: marks.seenNoteID, seenContentSeq: seed)
+        AppSettings.setBoardMarks(
+            BoardBadge.Marks(seenNoteID: marks.seenNoteID, seenContentSeq: seed), family: familyKey)
+    }
+
+    /// One family's notes, as this device holds them.
+    private func notes(of familyKey: Int64) -> [NoteEntity] {
+        let descriptor = FetchDescriptor<NoteEntity>(predicate: #Predicate { $0.familyID == familyKey })
+        return (try? modelContext.fetch(descriptor)) ?? []
     }
 
     private func fetchNote(_ noteID: Int64) -> NoteEntity? {
@@ -1161,9 +1467,9 @@ final class ChatSyncCoordinator {
     /// SwiftData upserts a second insert of the same id rather than duplicating it or throwing.
     /// It stays because a fetch is cheaper than an insert, and because the intent — one row per
     /// note, ever — should be readable without knowing that.
-    func rememberNoteGone(_ id: Int64) {
+    func rememberNoteGone(_ id: Int64, familyKey: Int64? = nil) {
         guard !noteIsGone(id) else { return }
-        modelContext.insert(GoneNoteEntity(noteID: id))
+        modelContext.insert(GoneNoteEntity(noteID: id, familyID: familyKey ?? currentFamilyKey))
     }
 
     /// Full board read — used the first time a board is opened, and
@@ -1175,42 +1481,53 @@ final class ChatSyncCoordinator {
     /// this device was not listening on the wall for as long as the cache
     /// lived. The one exception is a note held at a seq ABOVE the read's
     /// mark — it arrived after the read was taken — and it stays.
-    func loadBoard() async {
-        guard let response = try? await api.board() else { return }
-        replaceBoard(with: response)
-        boardCursor = max(boardCursor, response.maxBoardSeq)
+    ///
+    /// ONE family's board: the one on screen unless `familyKey` names another
+    /// (a resync reads every family's).
+    func loadBoard(familyKey: Int64? = nil) async {
+        let familyKey = familyKey ?? currentFamilyKey
+        guard let response = try? await api.board(family: pathFamily(familyKey)) else { return }
+        replaceBoard(with: response, familyKey: familyKey)
+        setBoardCursor(max(boardCursor(for: familyKey), response.maxBoardSeq), for: familyKey)
         saveContext()
     }
 
-    /// The cache half of `loadBoard`: everything but the cursor.
-    func replaceBoard(with response: BoardResponse) {
+    /// The cache half of `loadBoard`: everything but the cursor. It replaces
+    /// what is held OF THAT FAMILY — another family's notes are not on this
+    /// board, and are not gone because this read left them out.
+    func replaceBoard(with response: BoardResponse, familyKey: Int64? = nil) {
+        let familyKey = familyKey ?? currentFamilyKey
         let listed = Set(response.notes.map(\.id))
-        let held = (try? modelContext.fetch(FetchDescriptor<NoteEntity>())) ?? []
-        for note in held
+        for note in notes(of: familyKey)
         where !listed.contains(note.noteID) && note.boardSeq <= response.maxBoardSeq {
             // Remembered as well as removed: a note the read left out is a note that is gone,
             // and the next page that carries it must not put it back.
-            rememberNoteGone(note.noteID)
+            rememberNoteGone(note.noteID, familyKey: familyKey)
             modelContext.delete(note)
         }
-        for note in response.notes { applyNote(note) }
+        for note in response.notes { applyNote(note, familyKey: familyKey) }
     }
 
     /// Board catch-up: after_seq pages until a short page, tombstones
     /// included. Mirrors the reaction and edit loops.
-    func catchUpBoard(serverMaxSeq: Int64) async {
-        if boardCursor == 0 {
+    func catchUpBoard(serverMaxSeq: Int64, familyKey: Int64? = nil) async {
+        let familyKey = familyKey ?? currentFamilyKey
+        if boardCursor(for: familyKey) == 0 {
             // Nothing applied yet: one full read is cheaper than replaying
             // the whole history of every note that ever existed.
-            await loadBoard()
+            await loadBoard(familyKey: familyKey)
             return
         }
-        guard serverMaxSeq > boardCursor else { return }
+        guard serverMaxSeq > boardCursor(for: familyKey) else { return }
         let limit = 100
         while true {
-            guard let page = try? await api.boardChanges(afterSeq: boardCursor, limit: limit) else { return }
-            for note in page { applyNote(note) }
-            if let last = page.last { boardCursor = max(boardCursor, last.boardSeq) }
+            guard let page = try? await api.boardChanges(
+                afterSeq: boardCursor(for: familyKey), limit: limit, family: pathFamily(familyKey))
+            else { return }
+            for note in page { applyNote(note, familyKey: familyKey) }
+            if let last = page.last {
+                setBoardCursor(max(boardCursor(for: familyKey), last.boardSeq), for: familyKey)
+            }
             saveContext()
             if page.count < limit { return }
         }
@@ -1218,24 +1535,33 @@ final class ChatSyncCoordinator {
 
     // MARK: - Sticker pack
 
-    /// The pack's catch-up cursor, persisted like the board's so a relaunch
-    /// resumes rather than re-reading the whole pack.
+    /// The pack catch-up cursor of the family on screen, persisted like the
+    /// board's so a relaunch resumes rather than re-reading the whole pack.
+    /// One per family (`packCursor(for:)`).
     var packCursor: Int64 {
-        get { packCursorOverride ?? AppSettings.packCursor }
-        set {
-            if packCursorOverride != nil {
-                packCursorOverride = newValue
-            } else {
-                AppSettings.packCursor = newValue
-            }
+        get { packCursor(for: currentFamilyKey) }
+        set { setPackCursor(newValue, for: currentFamilyKey) }
+    }
+
+    func packCursor(for familyKey: Int64) -> Int64 {
+        if let packCursorOverride { return memoryPackCursors[familyKey] ?? packCursorOverride }
+        return AppSettings.packCursor(family: familyKey)
+    }
+
+    func setPackCursor(_ value: Int64, for familyKey: Int64) {
+        if packCursorOverride != nil {
+            memoryPackCursors[familyKey] = value
+        } else {
+            AppSettings.setPackCursor(value, family: familyKey)
         }
     }
 
     /// Test seam, `currentUserIDOverride`'s twin: a test that sets this
-    /// keeps the cursor on the coordinator and out of the app's real
-    /// UserDefaults — which every suite in the bundle shares, and which a
-    /// sign-out test wipes. The app never sets it.
+    /// keeps the cursors on the coordinator (starting at this value) and out
+    /// of the app's real UserDefaults — which every suite in the bundle
+    /// shares, and which a sign-out test wipes. The app never sets it.
     var packCursorOverride: Int64?
+    private var memoryPackCursors: [Int64: Int64] = [:]
 
     /// Which connection this is, counted from launch: it moves on every
     /// `.connected` and every `.disconnected`, and on a purge of the pack.
@@ -1252,23 +1578,29 @@ final class ChatSyncCoordinator {
     /// that number.
     private(set) var packConnection = 0
 
-    /// The connection whose catch-up ran to its end, or nil for none.
-    private var packCaughtUpConnection: Int?
+    /// Per family, the connection whose catch-up of that family's pack ran
+    /// to its end. A family absent here has caught up under none.
+    private var packCaughtUpConnection: [Int64: Int] = [:]
 
-    /// Whether THIS connection has caught the pack up — the condition under
-    /// which a `pack_item` frame may move the cursor. False from launch and
-    /// from every disconnect until a catch-up that BEGAN under this
+    /// Whether THIS connection has caught the pack on screen up — the
+    /// condition under which a `pack_item` frame may move its cursor.
+    var packCaughtUp: Bool { packCaughtUp(for: currentFamilyKey) }
+
+    /// The same for one family's pack. False from launch and from every
+    /// disconnect until a catch-up of THAT pack that BEGAN under this
     /// connection has run to its end.
-    var packCaughtUp: Bool { packCaughtUpConnection == packConnection }
+    func packCaughtUp(for familyKey: Int64) -> Bool {
+        packCaughtUpConnection[familyKey] == packConnection
+    }
 
     /// A pass finished: the flag goes up for the connection it started
     /// under, which is a no-op when a reconnect has overtaken it.
-    private func markPackCaughtUp(for connection: Int) {
+    private func markPackCaughtUp(for connection: Int, familyKey: Int64) {
         guard connection == packConnection else {
             AppLog.sync.info("Pack catch-up was overtaken by a reconnect; not marking caught up")
             return
         }
-        packCaughtUpConnection = connection
+        packCaughtUpConnection[familyKey] = connection
     }
 
     /// Let go of the pack WHOLE: the items, the gone set and the cursor.
@@ -1290,23 +1622,33 @@ final class ChatSyncCoordinator {
     /// The flag goes too: whatever this connection had caught up with was
     /// the pack that is gone, and a frame must not move a cursor that the
     /// next catch-up has yet to set.
-    func forgetPack() {
+    ///
+    /// `familyKey` nil is EVERY family's pack — a purge; a family's id is
+    /// that family's alone, which is what leaving one of several takes.
+    func forgetPack(familyKey: Int64? = nil) {
         // Row by row, not `delete(model:)`: that is a batch delete against
         // the STORE, and it does not see a row this context has inserted
         // and not yet saved — an item a frame delivered a moment ago would
         // survive its own pack. A pack is a couple of hundred rows at most.
-        for item in (try? modelContext.fetch(FetchDescriptor<PackItemEntity>())) ?? [] {
+        for item in (try? modelContext.fetch(FetchDescriptor<PackItemEntity>())) ?? []
+        where familyKey == nil || item.familyID == familyKey {
             modelContext.delete(item)
         }
         // The gone set with it — ids are the server's, and a different
         // server hands out the same small numbers.
-        for gone in (try? modelContext.fetch(FetchDescriptor<GonePackItemEntity>())) ?? [] {
+        for gone in (try? modelContext.fetch(FetchDescriptor<GonePackItemEntity>())) ?? []
+        where familyKey == nil || gone.familyID == familyKey {
             modelContext.delete(gone)
         }
-        packCursor = 0
+        if let familyKey {
+            setPackCursor(0, for: familyKey)
+            packCaughtUpConnection[familyKey] = nil
+        } else {
+            for key in Set(memoryPackCursors.keys).union([currentFamilyKey]) { setPackCursor(0, for: key) }
+            packCaughtUpConnection = [:]
+        }
         // A new number and not only a lowered flag: a catch-up of the pack
         // that is gone may still be in flight, and must not raise it.
-        packCaughtUpConnection = nil
         packConnection += 1
         saveContext()
     }
@@ -1323,8 +1665,12 @@ final class ChatSyncCoordinator {
     /// family keeps, not something a person said, and a panel one sticker
     /// short for one member would be a quantity that moved when they
     /// blocked somebody.
+    ///
+    /// `familyKey` is the pack the caller read the item from; the item's own
+    /// `family_id` wins over it, as on a note.
     @discardableResult
-    func applyPackItem(_ dto: PackItemDTO) -> Bool {
+    func applyPackItem(_ dto: PackItemDTO, familyKey: Int64? = nil) -> Bool {
+        let familyKey = dto.familyID.map { self.familyKey(named: $0) } ?? familyKey ?? currentFamilyKey
         // A tombstone is the last word, and the seq guard is no defence: a
         // copy still in flight may carry a seq above the tombstone's.
         if packItemIsGone(dto.id) { return false }
@@ -1336,7 +1682,7 @@ final class ChatSyncCoordinator {
         if let existing, dto.packSeq <= existing.packSeq { return false }
 
         if dto.isTombstone {
-            rememberPackItemGone(dto.id)
+            rememberPackItemGone(dto.id, familyKey: familyKey)
             if let existing {
                 // The picture goes with it: the server has dropped the
                 // attachment row, and a cached file nothing names is only
@@ -1361,6 +1707,7 @@ final class ChatSyncCoordinator {
             existing.label = dto.label
             existing.createdAt = dto.createdAt ?? existing.createdAt
             existing.packSeq = dto.packSeq
+            if existing.familyID != familyKey { existing.familyID = familyKey }
         } else {
             modelContext.insert(PackItemEntity(
                 itemID: dto.id,
@@ -1372,7 +1719,8 @@ final class ChatSyncCoordinator {
                 height: attachment.height,
                 label: dto.label,
                 createdAt: dto.createdAt ?? Date(),
-                packSeq: dto.packSeq))
+                packSeq: dto.packSeq,
+                familyID: familyKey))
         }
         return true
     }
@@ -1383,11 +1731,18 @@ final class ChatSyncCoordinator {
         return (try? modelContext.fetch(descriptor))?.first
     }
 
-    /// Everything the pack holds, in the order it was added — the panel's
-    /// order, and the list "does the pack already hold this?" is asked of.
+    /// Everything the pack on screen holds, in the order it was added — the
+    /// panel's order, and the list "does the pack already hold this?" is
+    /// asked of.
     func packItems() -> [PackItemSnapshot] {
-        let descriptor = FetchDescriptor<PackItemEntity>(sortBy: [SortDescriptor(\.itemID)])
-        return ((try? modelContext.fetch(descriptor)) ?? []).map(\.snapshot)
+        packEntities(of: currentFamilyKey).map(\.snapshot)
+    }
+
+    /// One family's pack, as this device holds it, in the order added.
+    private func packEntities(of familyKey: Int64) -> [PackItemEntity] {
+        let descriptor = FetchDescriptor<PackItemEntity>(
+            predicate: #Predicate { $0.familyID == familyKey }, sortBy: [SortDescriptor(\.itemID)])
+        return (try? modelContext.fetch(descriptor)) ?? []
     }
 
     /// Whether this device has been told that item is gone.
@@ -1398,17 +1753,19 @@ final class ChatSyncCoordinator {
         return ((try? modelContext.fetchCount(descriptor)) ?? 0) > 0
     }
 
-    func rememberPackItemGone(_ id: Int64) {
+    func rememberPackItemGone(_ id: Int64, familyKey: Int64? = nil) {
         guard !packItemIsGone(id) else { return }
-        modelContext.insert(GonePackItemEntity(itemID: id))
+        modelContext.insert(GonePackItemEntity(itemID: id, familyID: familyKey ?? currentFamilyKey))
     }
 
-    /// Full read of the pack. Answers whether the server was reached.
+    /// Full read of one family's pack — the one on screen unless
+    /// `familyKey` names another. Answers whether the server was reached.
     @discardableResult
-    func loadPack() async -> Bool {
-        guard let response = try? await api.pack() else { return false }
-        guard replacePack(with: response) else { return true }
-        packCursor = max(packCursor, response.maxPackSeq)
+    func loadPack(familyKey: Int64? = nil) async -> Bool {
+        let familyKey = familyKey ?? currentFamilyKey
+        guard let response = try? await api.pack(family: pathFamily(familyKey)) else { return false }
+        guard replacePack(with: response, familyKey: familyKey) else { return true }
+        setPackCursor(max(packCursor(for: familyKey), response.maxPackSeq), for: familyKey)
         saveContext()
         return true
     }
@@ -1426,18 +1783,21 @@ final class ChatSyncCoordinator {
     /// changes commit in seq order, so such a read is simply OLDER than
     /// what is held, and replacing from it would take away stickers that
     /// exist.
+    ///
+    /// Only THAT family's items are replaced: another family's pack is not
+    /// this read's to judge.
     @discardableResult
-    func replacePack(with response: PackResponse) -> Bool {
-        guard response.maxPackSeq >= packCursor else { return false }
+    func replacePack(with response: PackResponse, familyKey: Int64? = nil) -> Bool {
+        let familyKey = familyKey ?? currentFamilyKey
+        guard response.maxPackSeq >= packCursor(for: familyKey) else { return false }
         let listed = Set(response.items.map(\.id))
-        let held = (try? modelContext.fetch(FetchDescriptor<PackItemEntity>())) ?? []
-        for item in held
+        for item in packEntities(of: familyKey)
         where !listed.contains(item.itemID) && item.packSeq <= response.maxPackSeq {
-            rememberPackItemGone(item.itemID)
+            rememberPackItemGone(item.itemID, familyKey: familyKey)
             attachmentStore?.forget(attachmentIDs: [item.attachmentID])
             modelContext.delete(item)
         }
-        for item in response.items { applyPackItem(item) }
+        for item in response.items { applyPackItem(item, familyKey: familyKey) }
         return true
     }
 
@@ -1458,28 +1818,34 @@ final class ChatSyncCoordinator {
     /// What the pass reads is applied either way, item by item under the
     /// guard; only the flag is withheld from a connection that did not run
     /// it.
-    func catchUpPack(serverMaxSeq: Int64, connection: Int? = nil) async {
+    func catchUpPack(serverMaxSeq: Int64, connection: Int? = nil, familyKey: Int64? = nil) async {
         let connection = connection ?? packConnection
-        guard serverMaxSeq > packCursor else {
-            markPackCaughtUp(for: connection)
+        let familyKey = familyKey ?? currentFamilyKey
+        guard serverMaxSeq > packCursor(for: familyKey) else {
+            markPackCaughtUp(for: connection, familyKey: familyKey)
             return
         }
-        if packCursor == 0 {
+        if packCursor(for: familyKey) == 0 {
             // First sight: the current state in one request rather than
             // the history of every sticker that ever came and went.
-            if await loadPack() { markPackCaughtUp(for: connection) }
+            if await loadPack(familyKey: familyKey) {
+                markPackCaughtUp(for: connection, familyKey: familyKey)
+            }
             return
         }
         let limit = 200
         while true {
-            guard let page = try? await api.packChanges(afterSeq: packCursor, limit: limit)
+            guard let page = try? await api.packChanges(
+                afterSeq: packCursor(for: familyKey), limit: limit, family: pathFamily(familyKey))
             else { return }
-            for item in page { applyPackItem(item) }
-            if let last = page.last { packCursor = max(packCursor, last.packSeq) }
+            for item in page { applyPackItem(item, familyKey: familyKey) }
+            if let last = page.last {
+                setPackCursor(max(packCursor(for: familyKey), last.packSeq), for: familyKey)
+            }
             saveContext()
             if page.count < limit { break }
         }
-        markPackCaughtUp(for: connection)
+        markPackCaughtUp(for: connection, familyKey: familyKey)
     }
 
     /// The pack's step of a resync: catch up, and when a reconnect
@@ -1493,20 +1859,22 @@ final class ChatSyncCoordinator {
     /// socket that flaps faster than a request answers is not something to
     /// chase; the next `.connected` has a resync of its own.
     func catchUpPackForThisConnection(
-        connection: Int, mine: FamilyMineResponse
+        connection: Int, mine: FamilyMineResponse, familyKey: Int64? = nil
     ) async {
+        let familyKey = familyKey ?? currentFamilyKey
         var connection = connection
         var mine = mine
         for _ in 0..<3 {
             // Only against a server that has packs: one that predates them
             // has no endpoint to ask.
             guard mine.maxPackItems != nil else { return }
-            await catchUpPack(serverMaxSeq: mine.maxPackSeq ?? 0, connection: connection)
+            await catchUpPack(
+                serverMaxSeq: mine.maxPackSeq ?? 0, connection: connection, familyKey: familyKey)
             // Not overtaken — caught up, or a request failed and the next
             // resync tries again. Either way there is nothing to redo.
             guard connection != packConnection else { return }
             connection = packConnection
-            guard let again = try? await api.myFamily() else { return }
+            guard let again = try? await api.myFamily(family: pathFamily(familyKey)) else { return }
             mine = again
         }
     }
@@ -1530,6 +1898,9 @@ final class ChatSyncCoordinator {
     /// may; the limits are the family's and are checked here first so the
     /// refusal arrives beside the picker, with the server as the backstop.
     func addSticker(_ made: StickerPack.Made, label: String?) async -> PackAddOutcome {
+        // The pack on screen when the person pressed Add, held for the whole
+        // attempt: a switch mid-upload must not file it under another family.
+        let familyKey = currentFamilyKey
         // The label first, because it is the one refusal that needs no
         // request at all: over 64 is `validation` on the server, and asked
         // there it would arrive after the picture had been uploaded for
@@ -1562,21 +1933,25 @@ final class ChatSyncCoordinator {
         // race, and falls to the ordinary failure below and is shown.
         for attempt in 0..<2 {
             do {
+                // For the pack on screen, and uploaded for that family: a
+                // sticker may only use an attachment uploaded for its own
+                // family's pack (docs/protocol.md, "Several families").
                 let uploaded = try await api.uploadAttachment(
                     fileURL: fileURL,
                     mime: made.mime,
                     kind: AttachmentDTO.Kind.photo,
                     width: made.width,
                     height: made.height,
-                    durationMS: nil)
+                    durationMS: nil,
+                    family: pathFamily(familyKey))
                 let answer = try await api.addPackItem(
-                    attachmentID: uploaded.id, label: cleanLabel)
+                    attachmentID: uploaded.id, label: cleanLabel, family: pathFamily(familyKey))
                 // Applied under the per-item guard, and the cursor does NOT
                 // move: the answer to this client's own add says nothing
                 // about another member's change with a lower seq that this
                 // device has not heard yet (the board's rule, and its
                 // reason).
-                applyPackItem(answer.item)
+                applyPackItem(answer.item, familyKey: familyKey)
                 saveContext()
                 // The item's attachment id is the one to cache under — on a
                 // `200` it is the pack's EXISTING id, not the upload's.
@@ -1611,6 +1986,8 @@ final class ChatSyncCoordinator {
             return String(localized: "A sticker has to be a WebP or PNG picture.")
         case .forbidden(code: "not_pack_item_author"?):
             return String(localized: "Only whoever added a sticker, or the family owner, can remove it.")
+        case .forbidden(code: "storage_allowance_used"?):
+            return PaidFamilies.storageAllowanceUsed
         case .transport, .throttled, .server:
             return String(localized: "The sticker didn't reach the server. Check your connection and try again.")
         default:
@@ -1625,8 +2002,9 @@ final class ChatSyncCoordinator {
     /// Nothing that was ever SENT changes: a sticker message carries its
     /// own copy of the picture under its own attachment id.
     func removeSticker(id: Int64) async -> String? {
+        let familyKey = fetchPackItem(id)?.familyID ?? currentFamilyKey
         do {
-            try await api.deletePackItem(id: id)
+            try await api.deletePackItem(id: id, family: pathFamily(familyKey))
         } catch APIError.unauthorized {
             session?.handleUnauthorized()
             return Self.packFailure(APIError.unauthorized)
@@ -1645,7 +2023,7 @@ final class ChatSyncCoordinator {
         // Remembered as well as deleted, so the answer to somebody else's
         // change that was already in flight cannot put it back in the
         // panel. The tombstone frame arrives too, and finds nothing to do.
-        rememberPackItemGone(id)
+        rememberPackItemGone(id, familyKey: familyKey)
         if let existing = fetchPackItem(id) {
             attachmentStore?.forget(attachmentIDs: [existing.attachmentID])
             modelContext.delete(existing)
@@ -1792,11 +2170,13 @@ final class ChatSyncCoordinator {
         } else {
             nil
         }
+        // On the board on screen (docs/protocol.md, "Several families").
+        let familyKey = currentFamilyKey
         guard let dto = try? await api.createNote(
             text: text, color: color, size: size, font: font, x: x, y: y,
             kind: kind, attachmentID: attachmentID,
             startsAt: startsAt, endsAt: endsAt, place: place,
-            mentions: namedMembers(in: text), items: items)
+            mentions: namedMembers(in: text), items: items, family: pathFamily(familyKey))
         else {
             return false
         }
@@ -1804,9 +2184,15 @@ final class ChatSyncCoordinator {
         // (docs/protocol.md, "Board"): it says nothing about another note's
         // lower seq, and REST works while the socket is down — exactly when
         // the frames carrying those were missed.
-        applyNote(dto)
+        applyNote(dto, familyKey: familyKey)
         saveContext()
         return true
+    }
+
+    /// The board a note this device holds is on — the one on screen for a
+    /// note it does not hold, which is the only board it could be acting on.
+    private func familyKey(ofNote noteID: Int64) -> Int64 {
+        fetchNote(noteID)?.familyID ?? currentFamilyKey
     }
 
     /// Pin a prepared photo to the board: upload, preview, note — in that
@@ -1819,6 +2205,10 @@ final class ChatSyncCoordinator {
     /// does, so the pinning device draws its sticker from bytes it already
     /// holds rather than fetching back what it just sent.
     func pinPhoto(_ prepared: MediaPrep.Prepared, color: String, x: Double, y: Double) async -> String? {
+        // Uploaded FOR this family's board: a note may only use an
+        // attachment uploaded for its own family (docs/protocol.md,
+        // "Several families").
+        let familyKey = currentFamilyKey
         let uploaded: AttachmentDTO
         do {
             uploaded = try await api.uploadAttachment(
@@ -1827,7 +2217,8 @@ final class ChatSyncCoordinator {
                 kind: prepared.kind,
                 width: prepared.width,
                 height: prepared.height,
-                durationMS: nil)
+                durationMS: nil,
+                family: pathFamily(familyKey))
         } catch {
             return Self.pinFailure(error)
         }
@@ -1838,8 +2229,9 @@ final class ChatSyncCoordinator {
         do {
             let dto = try await api.createNote(
                 text: "", color: color, size: NoteSize.medium.name, font: NoteFont.plain.name,
-                x: x, y: y, kind: NoteKind.photo.name, attachmentID: uploaded.id)
-            applyNote(dto)
+                x: x, y: y, kind: NoteKind.photo.name, attachmentID: uploaded.id,
+                family: pathFamily(familyKey))
+            applyNote(dto, familyKey: familyKey)
             saveContext()
             return nil
         } catch {
@@ -1854,6 +2246,8 @@ final class ChatSyncCoordinator {
         switch error as? APIError {
         case .conflict(code: "board_full"?, message: _):
             return String(localized: "The board is full. Take a note down to make room for this one.")
+        case .forbidden(code: "storage_allowance_used"?):
+            return PaidFamilies.storageAllowanceUsed
         case .transport, .throttled, .server:
             return String(localized: "The photo didn't reach the server. Check your connection and try again.")
         case .payloadTooLarge:
@@ -1890,10 +2284,11 @@ final class ChatSyncCoordinator {
         // (docs/protocol.md, "Board"). A move sends none, so a note that
         // was only dragged keeps the names it had.
         let named = text.map { namedMembers(in: $0) }
+        let familyKey = familyKey(ofNote: id)
         guard let dto = try? await api.patchNote(
             id: id, text: text, color: color, size: size, font: font, x: x, y: y,
             startsAt: startsAt, endsAt: endsAt, place: place, mentions: named,
-            items: items)
+            items: items, family: pathFamily(familyKey))
         else {
             return false
         }
@@ -1911,7 +2306,9 @@ final class ChatSyncCoordinator {
     /// (docs/protocol.md, "Board").
     @discardableResult
     func answerEvent(id: Int64, answer: String?) async -> Bool {
-        guard let dto = try? await api.answerNote(id: id, answer: answer) else { return false }
+        guard let dto = try? await api.answerNote(
+            id: id, answer: answer, family: pathFamily(familyKey(ofNote: id)))
+        else { return false }
         // The answer to this device's own change moves NO cursor
         // (docs/protocol.md, "Board"): it says nothing about another note's
         // lower seq, and REST works while the socket is down — exactly when
@@ -1926,7 +2323,8 @@ final class ChatSyncCoordinator {
     /// a STATE rather than a toggle (docs/protocol.md, "Board").
     @discardableResult
     func tickTask(noteID: Int64, itemID: Int64, done: Bool) async -> Bool {
-        guard let dto = try? await api.tickTask(noteID: noteID, itemID: itemID, done: done)
+        guard let dto = try? await api.tickTask(
+            noteID: noteID, itemID: itemID, done: done, family: pathFamily(familyKey(ofNote: noteID)))
         else { return false }
         applyNote(dto)
         saveContext()
@@ -1954,7 +2352,8 @@ final class ChatSyncCoordinator {
     func drawBackdrop(noteID: Int64) async -> BackdropOutcome {
         let dto: NoteDTO
         do {
-            dto = try await api.drawBackdrop(noteID: noteID)
+            dto = try await api.drawBackdrop(
+                noteID: noteID, family: pathFamily(familyKey(ofNote: noteID)))
         } catch {
             return BackdropOutcome(error: error)
         }
@@ -1965,15 +2364,16 @@ final class ChatSyncCoordinator {
     }
 
     func deleteNote(id: Int64) async -> Bool {
+        let familyKey = familyKey(ofNote: id)
         do {
-            try await api.deleteNote(id: id)
+            try await api.deleteNote(id: id, family: pathFamily(familyKey))
         } catch {
             return false
         }
         // The third of the protocol's three doors to "gone": a tombstone, a full read that left
         // it out, and this client's own DELETE. The frame confirming it arrives later and finds
         // the id already remembered, which is the point.
-        rememberNoteGone(id)
+        rememberNoteGone(id, familyKey: familyKey)
         if let existing = fetchNote(id) { modelContext.delete(existing) }
         saveContext()
         return true
@@ -2118,11 +2518,23 @@ final class ChatSyncCoordinator {
     ///   OUTSIDE the contiguous window — a root older than it, a reply
     ///   newer — and must not drag the history or catch-up cursor to them,
     ///   or the next page would skip everything in between, for good.
+    /// - `saves`: false for a caller applying a whole PAGE, which then saves
+    ///   once after the last row (`savePage`). A save is a store transaction
+    ///   plus the icon badge's fetch of every chat (`refreshUnreadBadge`),
+    ///   and paying both per message is what made a catch-up after a long
+    ///   absence — a hundred rows a page, several pages — hold the main
+    ///   actor for whole seconds while the reader watched the thread stutter
+    ///   its way down. The rows a page leaves unsaved are still found by the
+    ///   next row's dedup lookups (a fetch includes pending changes), and
+    ///   the cursors written alongside them are saved in the same
+    ///   transaction, so a crash mid-page loses the page AND its cursor
+    ///   together and the next catch-up simply asks again.
     func upsert(
         _ dto: MessageDTO,
         bumpUnread: Bool,
         live: Bool = false,
-        movesCursors: Bool = true
+        movesCursors: Bool = true,
+        saves: Bool = true
     ) -> MessageEntity {
         let entity: MessageEntity
         if let clientMsgID = dto.clientMsgID,
@@ -2182,6 +2594,7 @@ final class ChatSyncCoordinator {
                 attachments: dto.attachmentList,
                 call: dto.call)
             modelContext.insert(entity)
+            pageLookup?.noteInserted(entity)
             // First sight counts for the chain only when it is LIVE (see
             // `live` above): a history page or the thread read deliver
             // replies the root's own recomputed count already includes.
@@ -2205,7 +2618,7 @@ final class ChatSyncCoordinator {
             entity.pollJSON = Self.pollJSON(poll)
         }
         updateChat(after: dto, bumpUnread: bumpUnread, movesCursors: movesCursors)
-        saveContext()
+        if saves { saveContext() }
         return entity
     }
 
@@ -2313,7 +2726,15 @@ final class ChatSyncCoordinator {
             messageID: dto.id,
             title: ChatNotifier.title(
                 chatKind: chat.kind,
-                chatTitle: chat.title,
+                // A family chat is titled with THAT chat's family's name —
+                // with several families, "the" family is only whichever one
+                // happens to be on screen (docs/protocol.md, "Several
+                // families").
+                chatTitle: chat.kind == ChatRules.family
+                    ? FamilyRules.familyName(
+                        chatFamilyIDs: chat.familyIDs ?? [], families: session?.families ?? [],
+                        fallback: chat.title) ?? chat.title
+                    : chat.title,
                 senderName: displayName(of: dto.senderID),
                 namesMe: dto.mentions?.contains { $0.userID == currentUserID } == true),
             body: String(localized: "New message"))
@@ -2326,21 +2747,27 @@ final class ChatSyncCoordinator {
     private func announce(_ note: NoteDTO) {
         #if os(macOS)
         guard !note.isTombstone, let authorID = note.authorID else { return }
+        // Whose board: the note's own family, or the one on screen.
+        let familyKey = familyKey(named: note.familyID)
         let verdict = DesktopNotificationRules.note(
             authorID: authorID,
             me: currentUserID,
             blocked: blockedUserIDs,
             isNews: BoardBadge.isUnread(
-                noteID: note.id, contentSeq: note.contentSeq ?? 0, marks: AppSettings.boardMarks),
-            boardInFront: boardInFront,
+                noteID: note.id, contentSeq: note.contentSeq ?? 0,
+                marks: AppSettings.boardMarks(family: familyKey)),
+            // The board in front is the CURRENT family's; another family's
+            // note is news whatever is on screen.
+            boardInFront: boardInFront && familyKey == currentFamilyKey,
             wanted: AppSettings.desktopNotificationsEnabled)
         AppLog.push.info("Note \(note.id, privacy: .public): \(String(describing: verdict), privacy: .public)")
         guard verdict == .announce else { return }
         let author = displayName(of: authorID)
-        let family = session?.family?.name
+        let family = session?.families.first { $0.id == familyKey }?.name ?? session?.family?.name
         ChatNotifier.announceNote(
             noteID: note.id,
-            title: family.map { "\($0) — \(author)" } ?? author)
+            title: family.map { "\($0) — \(author)" } ?? author,
+            familyID: familyKey == 0 ? nil : familyKey)
         #endif
     }
 
@@ -2369,13 +2796,18 @@ final class ChatSyncCoordinator {
     /// re-delivery and a no-op. Returns false when the message isn't held
     /// locally — the state is dropped silently (history paging
     /// re-delivers it embedded on the Message objects).
+    ///
+    /// `saves: false` is a catch-up page applying many, which saves once
+    /// after the last (`upsert` has why).
     @discardableResult
-    func applyReactionState(messageServerID: Int64, seq: Int64, reactions: [ReactionDTO]) -> Bool {
+    func applyReactionState(
+        messageServerID: Int64, seq: Int64, reactions: [ReactionDTO], saves: Bool = true
+    ) -> Bool {
         guard let row = fetchMessage(serverID: messageServerID) else { return false }
         if seq > row.reactionSeq {
             row.reactionSeq = seq
             row.reactionList = Self.reactionSnapshots(reactions)
-            saveContext()
+            if saves { saveContext() }
         }
         return true
     }
@@ -2466,13 +2898,16 @@ final class ChatSyncCoordinator {
     /// re-delivery and a no-op. Returns false when the message isn't held
     /// locally — the state is dropped silently, exactly as a reaction
     /// state is (history paging re-delivers it embedded on the Message).
+    ///
+    /// `saves: false` is a catch-up page applying many, which saves once
+    /// after the last (`upsert` has why).
     @discardableResult
-    func applyPollState(messageServerID: Int64, poll: PollDTO) -> Bool {
+    func applyPollState(messageServerID: Int64, poll: PollDTO, saves: Bool = true) -> Bool {
         guard let row = fetchMessage(serverID: messageServerID) else { return false }
         if poll.pollSeq > row.pollSeq {
             row.pollSeq = poll.pollSeq
             row.pollJSON = Self.pollJSON(poll)
-            saveContext()
+            if saves { saveContext() }
         }
         return true
     }
@@ -2641,11 +3076,14 @@ final class ChatSyncCoordinator {
         while true {
             guard let page = try? await api.polls(chatID: step.chatID, afterSeq: afterSeq, limit: limit)
             else { return }
+            // One save per page: the cursor's own save below carries every
+            // state applied above it.
             for state in page {
-                applyPollState(messageServerID: state.messageID, poll: state.poll)
+                applyPollState(messageServerID: state.messageID, poll: state.poll, saves: false)
             }
             if let last = page.last { afterSeq = max(afterSeq, last.poll.pollSeq) }
             advancePollCursor(chatID: step.chatID, seq: afterSeq)
+            savePage(page.count)
             if page.count < limit { return }
         }
     }
@@ -2786,6 +3224,13 @@ final class ChatSyncCoordinator {
         round: Bool = false
     ) -> String? {
         guard !prepared.isEmpty else { return nil }
+        // An ANIMATION is one attachment carrying the flag — the server's
+        // own test, and a refusal (`invalid_attachment`) for anything else
+        // (docs/protocol.md, "Animations", #96). So the flag is the SET's:
+        // an animation staged beside other items goes as the ordinary video
+        // it also is, and plays like one.
+        let animation = !sticker && !round && prepared.count == 1 && prepared[0].animation
+            && prepared[0].kind == AttachmentDTO.Kind.video
         guard let localID = enqueue(
             body: caption, in: chatID, replyTo: replyTo, allowEmpty: true, mentions: mentions)
         else { return nil }
@@ -2820,6 +3265,7 @@ final class ChatSyncCoordinator {
                 name: item.name,
                 sticker: sticker,
                 isRound: round,
+                animation: animation,
                 // Audio only: the server refuses a waveform on anything
                 // else (docs/protocol.md, "A voice note's waveform").
                 waveform: item.kind == AttachmentDTO.Kind.audio ? item.waveform : nil))
@@ -2872,6 +3318,12 @@ final class ChatSyncCoordinator {
                   let jpeg = try? Data(contentsOf: url)
             else { continue }
             attachmentStore?.seed(jpeg, id: item.provisionalAttachmentID, preview: true)
+            // An animation's tile plays its own video (#96): the staged
+            // MP4 is it.
+            if item.animation, let fileName = item.fileName,
+               let full = PendingMediaStaging.url(for: fileName) {
+                attachmentStore?.seedAnimation(copying: full, id: item.provisionalAttachmentID)
+            }
             if item.kind == AttachmentDTO.Kind.photo,
                let fileName = item.fileName,
                let full = PendingMediaStaging.url(for: fileName),
@@ -2981,15 +3433,32 @@ final class ChatSyncCoordinator {
 
     /// One item's bytes, its preview and its bookkeeping. Answers whether
     /// the caller should carry on with the rest of the set.
+    /// The family an upload for a message in `chatID` is for
+    /// (`POST /attachments?family_id=`, docs/protocol.md "Several
+    /// families"): the family on screen when the chat is listed there, else
+    /// the first family that lists it — a message may only claim an
+    /// attachment uploaded for a family in its chat's `family_ids`. Nil (no
+    /// parameter, the home family) on a server that predates several
+    /// families, and when no family is known at all.
+    func uploadFamily(forChat chatID: Int64) -> Int64? {
+        let chatFamilies = fetchChat(chatID)?.familyIDs ?? []
+        guard let family = FamilyRules.uploadFamily(
+            chatFamilyIDs: chatFamilies, current: session?.currentFamilyID)
+        else { return nil }
+        return pathFamily(family)
+    }
+
     private func upload(item: PendingMediaItemEntity, localID: String) async -> Bool {
         let attachment: AttachmentDTO
+        let family = uploadFamily(forChat: item.chatID)
         do {
             if item.kind == AttachmentDTO.Kind.location {
                 attachment = try await api.uploadLocation(
                     latitude: item.latitude ?? 0,
                     longitude: item.longitude ?? 0,
                     accuracyM: item.accuracyM,
-                    name: item.name)
+                    name: item.name,
+                    family: family)
             } else {
                 guard let fileName = item.fileName,
                       let fileURL = PendingMediaStaging.url(for: fileName)
@@ -3011,7 +3480,8 @@ final class ChatSyncCoordinator {
                     height: item.height,
                     durationMS: item.durationMS,
                     name: item.name,
-                    waveform: item.waveform)
+                    waveform: item.waveform,
+                    family: family)
             }
         } catch APIError.unauthorized {
             session?.handleUnauthorized()
@@ -3042,6 +3512,10 @@ final class ChatSyncCoordinator {
            let url = PendingMediaStaging.url(for: fileName),
            let full = try? Data(contentsOf: url) {
             attachmentStore?.seed(full, id: attachment.id, preview: false)
+        }
+        if item.animation, let fileName = item.fileName,
+           let url = PendingMediaStaging.url(for: fileName) {
+            attachmentStore?.seedAnimation(copying: url, id: attachment.id)
         }
 
         // The id and the count move in ONE save. Writing the count without
@@ -3120,6 +3594,7 @@ final class ChatSyncCoordinator {
             let durationMS: Int?
             let name: String?
             let waveform: String?
+            let family: Int64?
         }
         let owed: [Owed] = items.compactMap { item in
             // A location has no bytes to upload and a missing file has none
@@ -3132,7 +3607,8 @@ final class ChatSyncCoordinator {
             return Owed(
                 itemID: item.itemID, fileURL: fileURL, mime: item.mime, kind: item.kind,
                 width: item.width, height: item.height, durationMS: item.durationMS,
-                name: item.name, waveform: item.waveform)
+                name: item.name, waveform: item.waveform,
+                family: uploadFamily(forChat: item.chatID))
         }
         var handovers: [BackgroundUploads.Handover] = []
         for item in owed {
@@ -3143,7 +3619,8 @@ final class ChatSyncCoordinator {
                 height: item.height,
                 durationMS: item.durationMS,
                 name: item.name,
-                waveform: item.waveform)
+                waveform: item.waveform,
+                family: item.family)
             else { continue }
             handovers.append(BackgroundUploads.Handover(
                 itemID: item.itemID, request: request, fileURL: item.fileURL))
@@ -3375,6 +3852,9 @@ final class ChatSyncCoordinator {
         // past the plural arm and the caption: S5.1's test is one
         // attachment and no body, and both are already settled.
         if attachment.isVideo, attachment.isRound { return String(localized: "Video message") }
+        // An animation says "GIF" where a video says "Video" — the word
+        // every messenger uses, and the server's in its push (#96).
+        if attachment.isAnimation { return String(localized: "GIF") }
         if attachment.isVideo { return String(localized: "Video") }
         if attachment.isAudio {
             return attachment.name.flatMap { $0.isEmpty ? nil : $0 }
@@ -3556,6 +4036,16 @@ final class ChatSyncCoordinator {
             else { return nil }
             return only.id
         }()
+        // An animation, read off the row for the same reason (#96): a retry
+        // must still say `animation: true`, or the clip arrives as an
+        // ordinary video. One video carrying the flag — the server's test.
+        let animationID: Int64? = {
+            let list = row.attachmentList
+            guard stickerID == nil, roundID == nil, list.count == 1, let only = list.first,
+                  only.isAnimation
+            else { return nil }
+            return only.id
+        }()
         row.state = .pending
         saveContext()
 
@@ -3574,6 +4064,14 @@ final class ChatSyncCoordinator {
                     clientMsgID: clientMsgID,
                     replyToMessageID: replyToMessageID,
                     attachmentID: roundID))
+            } else if let animationID {
+                try await socket.send(.sendAnimation(
+                    chatID: chatID,
+                    clientMsgID: clientMsgID,
+                    body: body,
+                    replyToMessageID: replyToMessageID,
+                    attachmentID: animationID,
+                    mentions: mentions))
             } else {
                 try await socket.send(.send(
                     chatID: chatID,
@@ -3604,7 +4102,8 @@ final class ChatSyncCoordinator {
                 pollOptions: pollOptions,
                 mentions: mentions,
                 sticker: stickerID != nil,
-                round: roundID != nil)
+                round: roundID != nil,
+                animation: animationID != nil)
             _ = upsert(dto, bumpUnread: false, live: true)
         } catch APIError.unauthorized {
             session?.handleUnauthorized()
@@ -3626,7 +4125,7 @@ final class ChatSyncCoordinator {
     /// Codes that mean the server READ the send and refused it. Every
     /// other answer leaves the outcome unknown, and an unknown outcome is
     /// never a red bubble (docs/protocol.md, "Error shape").
-    static let terminalSendCodes: Set<String> = [
+    nonisolated static let terminalSendCodes: Set<String> = [
         "validation", "message_empty", "message_too_long", "not_chat_member",
         "chat_not_found", "blocked", "invalid_poll", "invalid_attachment",
         "attachment_not_found", "attachment_already_used",
@@ -3691,9 +4190,23 @@ final class ChatSyncCoordinator {
             row.nextAttemptAt = nil
             AppLog.sync.info(
                 "Send failed for \(localID, privacy: .public) after \(row.sendAttempts, privacy: .public) attempt(s): \(String(describing: error))")
+            // A refusal the red bubble cannot explain on its own: the
+            // family's storage, not this message, is what stops it — and
+            // trying again changes nothing until there is room
+            // (docs/protocol.md, "Paid families"). Said once, by the chat
+            // list, over whatever is on screen.
+            if case APIError.forbidden(let code) = error, code == "storage_allowance_used" {
+                sendRefusalNotice = PaidFamilies.storageAllowanceUsed
+            }
             saveContext()
         }
     }
+
+    /// A sentence about a send the server refused for a reason the failed
+    /// bubble cannot say — today only a paid family's used storage
+    /// (`storage_allowance_used`). The chat list shows it as an alert and
+    /// clears it.
+    var sendRefusalNotice: String?
 
     /// Re-fetch locations this device stored without their coordinates.
     ///
@@ -3899,7 +4412,7 @@ final class ChatSyncCoordinator {
         do {
             let me = try await api.me()
             session?.apply(me: me)
-            guard me.family != nil else { return }
+            guard !FamilyRules.families(from: me).isEmpty else { return }
         } catch APIError.unauthorized {
             session?.handleUnauthorized()
             return
@@ -3908,12 +4421,44 @@ final class ChatSyncCoordinator {
             return
         }
 
-        // 2. Roster, for sender-name resolution and the member picker.
-        if let mine = try? await api.myFamily() {
-            // Both arrays, one store: the tombstones are what let a stored
-            // message still name its sender. Only `members` is a roster
-            // (protocol.md, "Deleting an account").
-            upsertMembers(mine.members, formerMembers: mine.formerMembers)
+        // The general repair for a family this account left while this
+        // device was not listening: whatever it still holds of a family
+        // `/me` no longer lists goes (docs/protocol.md, "Several families").
+        let familyKeys = heldFamilyKeys
+        pruneFamilies(keeping: Set(familyKeys))
+
+        // 2. Rosters — EVERY family's, for sender-name resolution and the
+        // member pickers (docs/protocol.md, resync step 1, 2026-10-22).
+        //
+        // Each family's read is kept for step 7 as well, which needs only
+        // its board and pack marks: one `GET /families/{id}` per family per
+        // resync, not two. With it goes the connection number taken BEFORE
+        // the read (`packConnection`), because a mark is a promise about the
+        // connection it was read under — and step 7 trusts the read only
+        // while that connection is still the one up.
+        var mines: [Int64: FamilyMineResponse] = [:]
+        var packConnectionsAtRead: [Int64: Int] = [:]
+        var familyGone = false
+        for familyKey in familyKeys {
+            let packConnectionAtRead = packConnection
+            do {
+                let mine = try await api.myFamily(family: pathFamily(familyKey))
+                mines[familyKey] = mine
+                packConnectionsAtRead[familyKey] = packConnectionAtRead
+                // Both arrays, one store: the tombstones are what let a
+                // stored message still name its sender. Only `members` is a
+                // roster (protocol.md, "Deleting an account").
+                upsertMembers(mine.members, formerMembers: mine.formerMembers, familyKey: familyKey)
+            } catch {
+                // `family_not_found`: the family is gone for this account
+                // (left elsewhere, removed). `/me` says so below.
+                if FamilyRules.isFamilyGone(error) { familyGone = true }
+            }
+        }
+        if familyGone, let me = try? await api.me() { session?.apply(me: me) }
+        // What the server says about itself rides on every family's read
+        // and is the same in each; the family on screen's is taken.
+        if let mine = mines[currentFamilyKey] ?? familyKeys.lazy.compactMap({ mines[$0] }).first {
             // The assistant is NOT a member and is not upserted as one —
             // it belongs to no family, so it appears in no roster. It is
             // kept aside purely so the family chat can put a name on its
@@ -3965,9 +4510,10 @@ final class ChatSyncCoordinator {
             AppSettings.roundVideoMaxBytes = mine.maxRoundVideoBytes
         }
 
-        // 3. Chat list: server unread wins; direct chats the server
-        // dropped go — with their messages and everything else keyed by
-        // their id (see `dropChats`, and `deleteChat` under it).
+        // 3. Chat list: server unread wins; chats the server no longer
+        // lists go, whatever their kind — with their messages and everything
+        // else keyed by their id (see `dropChats`, and `deleteChat` under
+        // it).
         //
         // "Wins" with one correction. `unread_count` is computed on the
         // server BEFORE the response is sent, so a live `message` frame
@@ -3985,9 +4531,18 @@ final class ChatSyncCoordinator {
         // `unread_count` either way; what needs the marker is Notification
         // Center, which would otherwise still be showing banners for
         // messages this person read on their phone while this one was off.
-        guard let chatList = try? await api.chats() else { return }
+        chatsUpsertedDuringList = []
+        chatsRemovedDuringList = []
+        let listed = try? await api.chats()
+        let upsertedSince = chatsUpsertedDuringList ?? []
+        let removedSince = chatsRemovedDuringList ?? []
+        chatsUpsertedDuringList = nil
+        chatsRemovedDuringList = nil
+        guard let chatList = listed else { return }
         var readElsewhere: [Int64: Int64] = [:]
-        for item in chatList.chats {
+        // A group this device has already been told it left is not
+        // re-created from a list built before it did.
+        for item in chatList.chats where !removedSince.contains(item.chat.id) {
             if let marker = upsertChat(
                 item,
                 uncountedLiveMessages: uncountedBumps(in: item),
@@ -3996,7 +4551,13 @@ final class ChatSyncCoordinator {
                 readElsewhere[item.chat.id] = marker
             }
         }
-        dropChats(absentFrom: chatList.chats)
+        // A chat a frame listed in NO family while the list was in flight
+        // (`family_ids: []`, a direct chat that closed for this reader) is
+        // not kept for having changed: it is gone for this reader, and the
+        // list that omits it is right about that.
+        dropChats(
+            absentFrom: chatList.chats,
+            keeping: upsertedSince.filter { fetchChat($0)?.familyIDs?.isEmpty != true })
         saveContext()
         // After the save, so the icon is already showing the server's number
         // when the banners go.
@@ -4041,19 +4602,46 @@ final class ChatSyncCoordinator {
             await runPollCatchUp(step)
         }
 
-        // 7. Board catch-up, on the third cursor. The family read already
-        // told us the server's max, so a board nothing has happened on
-        // costs no request at all.
+        // 7. Board catch-up, on the third cursor — EVERY family's board,
+        // each against its own cursor. The family read already told us the
+        // server's max, so a board nothing has happened on costs no request
+        // at all.
         //
-        // The pack's connection number is taken BEFORE the read: the mark
-        // below is only a promise about the connection it was read under
-        // (`packConnection`).
-        let packConnectionAtRead = packConnection
-        if let mine = try? await api.myFamily() {
-            await catchUpBoard(serverMaxSeq: mine.maxBoardSeq ?? 0)
-            // 7a. The sticker pack, on its own cursor and by the board's
-            // own rule.
-            await catchUpPackForThisConnection(connection: packConnectionAtRead, mine: mine)
+        // That read is step 2's, with the connection number taken BEFORE
+        // it: the mark below is only a promise about the connection it was
+        // read under (`packConnection`). A family step 2 has no read of (its
+        // read failed, or the family arrived since) is read here, as every
+        // family used to be.
+        //
+        // And so is one whose read a reconnect has overtaken. The resync the
+        // new connection starts finds this one running and returns
+        // (`isResyncing`), so a board change made while the socket was down
+        // — note 51 over a step-2 mark of 50 — reached this device by no
+        // frame, and the old mark, equal to the cursor, let the catch-up skip
+        // it until some later resync. A mark read under the connection that
+        // is still up is only a gate — the catch-up pages from the cursor to
+        // a short page whatever it says — and is reused; `packConnection`
+        // moves on at every connect and disconnect (and every purge of a
+        // pack), so one that has moved since step 2 is read again, under the
+        // connection that is up now. One read per family on an ordinary
+        // resync, two only for a family a reconnect made stale. (The pack
+        // noticed on its own — `catchUpPackForThisConnection` re-reads when
+        // overtaken — but only after a first pass under the old mark.)
+        for familyKey in heldFamilyKeys {
+            let read: (mine: FamilyMineResponse, packConnection: Int)?
+            if let mine = mines[familyKey], packConnectionsAtRead[familyKey] == packConnection {
+                read = (mine, packConnection)
+            } else {
+                let connection = packConnection
+                read = (try? await api.myFamily(family: pathFamily(familyKey))).map { ($0, connection) }
+            }
+            if let read {
+                await catchUpBoard(serverMaxSeq: read.mine.maxBoardSeq ?? 0, familyKey: familyKey)
+                // 7a. The sticker pack, on its own cursor and by the board's
+                // own rule.
+                await catchUpPackForThisConnection(
+                    connection: read.packConnection, mine: read.mine, familyKey: familyKey)
+            }
         }
 
         // 6a. Repair any location that was stored without its coordinates.
@@ -4100,10 +4688,15 @@ final class ChatSyncCoordinator {
         var afterID = step.afterID
         while true {
             guard let page = try? await api.messages(chatID: step.chatID, afterID: afterID, limit: limit) else { return }
-            for dto in page {
+            // One save per page, not per row — see `upsert`'s `saves` — and
+            // the page's dedup lookups answered from two queries rather than
+            // two per row (`applyPage`).
+            applyPage(page) { dto in
                 _ = upsert(dto, bumpUnread: false,
-                           live: Self.catchUpCounts(forRootOf: dto, heldThrough: heldThrough))
+                           live: Self.catchUpCounts(forRootOf: dto, heldThrough: heldThrough),
+                           saves: false)
             }
+            savePage(page.count)
             if let last = page.last { afterID = max(afterID, last.id) }
             if page.count < limit { return }
         }
@@ -4124,7 +4717,8 @@ final class ChatSyncCoordinator {
         var afterSeq = step.afterSeq
         while true {
             guard let page = try? await api.edits(chatID: step.chatID, afterSeq: afterSeq, limit: limit) else { return }
-            for dto in page { _ = upsert(dto, bumpUnread: false) }
+            // Saved once, below, with the cursor.
+            applyPage(page) { dto in _ = upsert(dto, bumpUnread: false, saves: false) }
             if let last = page.last, let seq = last.editSeq { afterSeq = max(afterSeq, seq) }
             if let chat = fetchChat(step.chatID), afterSeq > chat.maxEditSeq {
                 chat.maxEditSeq = afterSeq
@@ -4139,17 +4733,19 @@ final class ChatSyncCoordinator {
         var afterSeq = step.afterSeq
         while true {
             guard let page = try? await api.reactions(chatID: step.chatID, afterSeq: afterSeq, limit: limit) else { return }
+            // One save per page, with the cursor — see `upsert`'s `saves`.
             for state in page {
                 applyReactionState(
                     messageServerID: state.messageID,
                     seq: state.reactionSeq,
-                    reactions: state.reactions)
+                    reactions: state.reactions,
+                    saves: false)
             }
             if let last = page.last { afterSeq = max(afterSeq, last.reactionSeq) }
             if let chat = fetchChat(step.chatID), afterSeq > chat.maxReactionSeq {
                 chat.maxReactionSeq = afterSeq
-                saveContext()
             }
+            savePage(page.count)
             if page.count < limit { return }
         }
     }
@@ -4229,10 +4825,14 @@ final class ChatSyncCoordinator {
         do {
             // No cursor yet (fresh chat): fetch the newest page instead.
             let page = try await api.messages(chatID: chatID, beforeID: beforeID, limit: limit)
-            for dto in page { _ = upsert(dto, bumpUnread: false) }
+            // One save for the page — see `upsert`'s `saves`.
+            applyPage(page) { dto in _ = upsert(dto, bumpUnread: false, saves: false) }
             if page.count < limit {
+                // Even an EMPTY short page changed something: the flag.
                 chat.hasFullHistory = true
                 saveContext()
+            } else {
+                savePage(page.count)
             }
             return page.count
         } catch {
@@ -4253,7 +4853,14 @@ final class ChatSyncCoordinator {
             while true {
                 let page = try await api.thread(
                     chatID: chatID, messageID: rootID, afterID: afterID, limit: limit)
-                for dto in page { _ = upsert(dto, bumpUnread: false, movesCursors: false) }
+                // Saved PER PAGE, never once at the end: rows left unsaved
+                // slow every later lookup (each fetch has to merge them in),
+                // and across a long chain that cost grows with the square
+                // of the rows held back.
+                applyPage(page) { dto in
+                    _ = upsert(dto, bumpUnread: false, movesCursors: false, saves: false)
+                }
+                savePage(page.count)
                 guard page.count == limit, let last = page.last else { break }
                 afterID = last.id
             }
@@ -4399,6 +5006,69 @@ final class ChatSyncCoordinator {
         return dto.id
     }
 
+    // MARK: - Groups (docs/protocol.md, "Groups", 2026-10-22)
+    //
+    // Every answer that carries the group's Chat is applied at once, so the
+    // device that made a change shows it without waiting for its own
+    // `chat_updated` (which arrives too, and changes nothing the second
+    // time). An answer that ends the group for this member drops it here.
+    // Failures are thrown for the screen to say (`GroupRules.createFailure`
+    // and `changeFailure`); nothing here retries, because a person is
+    // looking at the form and the same tap is the retry.
+
+    /// Create a group and hold it locally; returns its id for navigation.
+    func createGroup(title: String, memberIDs: [Int64]) async throws -> Int64 {
+        // In the family on screen (docs/protocol.md, "Several families"):
+        // its roster is what the member picker offered.
+        let dto = try await api.createGroup(
+            title: title, memberIDs: memberIDs, family: pathFamily(currentFamilyKey))
+        applyChat(dto)
+        saveContext()
+        return dto.id
+    }
+
+    func renameGroup(chatID: Int64, title: String) async throws {
+        let dto = try await api.renameGroup(chatID: chatID, title: title)
+        applyChat(dto)
+        saveContext()
+    }
+
+    func addGroupMembers(chatID: Int64, userIDs: [Int64]) async throws {
+        let dto = try await api.addGroupMembers(chatID: chatID, userIDs: userIDs)
+        applyChat(dto)
+        saveContext()
+    }
+
+    func removeGroupMember(chatID: Int64, userID: Int64) async throws {
+        let dto = try await api.removeGroupMember(chatID: chatID, userID: userID)
+        applyChat(dto)
+        saveContext()
+    }
+
+    /// Leave: the caller's own id, any member, `204`. A group that is
+    /// already gone (`chat_not_found` — deleted, or this member removed,
+    /// while the screen was open) is the same outcome for this person, so it
+    /// is dropped rather than reported as a failure.
+    func leaveGroup(chatID: Int64) async throws {
+        do {
+            try await api.leaveGroup(chatID: chatID, userID: currentUserID)
+        } catch APIError.notFound(code: "chat_not_found"?) {
+            // Gone already; drop it below.
+        }
+        dropChat(chatID: chatID)
+    }
+
+    /// Delete, for everyone — admin only. Gone already counts as done, for
+    /// the reason `leaveGroup` gives.
+    func deleteGroup(chatID: Int64) async throws {
+        do {
+            try await api.deleteGroup(chatID: chatID)
+        } catch APIError.notFound(code: "chat_not_found"?) {
+            // Gone already; drop it below.
+        }
+        dropChat(chatID: chatID)
+    }
+
     /// How many of this chat's live bumps the response in `item` cannot
     /// have counted — and forget the ones it can.
     ///
@@ -4460,22 +5130,7 @@ final class ChatSyncCoordinator {
         /// the same way (protocol.md, "Mentioning a member").
         uncountedMention: Bool = false
     ) -> Int64? {
-        let dto = item.chat
-        let chat: ChatEntity
-        if let existing = fetchChat(dto.id) {
-            chat = existing
-        } else {
-            chat = ChatEntity(
-                chatID: dto.id,
-                kind: dto.kind,
-                pinRank: dto.kind == "family" ? 0 : 1,
-                title: dto.title)
-            modelContext.insert(chat)
-        }
-        chat.kind = dto.kind
-        chat.pinRank = dto.kind == "family" ? 0 : 1
-        chat.peerUserID = dto.peerUserID
-        chat.title = dto.title
+        let chat = applyChat(item.chat)
         chat.unreadCount = item.unreadCount + max(0, uncountedLiveMessages) // server-authoritative
         // Server-authoritative too, and absent means no — plus what named
         // the reader after the server counted, which is the same message
@@ -4518,15 +5173,54 @@ final class ChatSyncCoordinator {
         return readMarkerAdvanced
     }
 
+    /// The chat's OWN fields — kind, title, peer, and a group's members and
+    /// admin — written onto its row, created if this device has never held
+    /// it. Shared by the chat list (`upsertChat`) and the `chat_updated`
+    /// frame, which carries a Chat and nothing about its messages.
+    @discardableResult
+    func applyChat(_ dto: ChatDTO) -> ChatEntity {
+        let chat: ChatEntity
+        if let existing = fetchChat(dto.id) {
+            chat = existing
+        } else {
+            chat = ChatEntity(
+                chatID: dto.id,
+                kind: dto.kind,
+                pinRank: dto.kind == ChatRules.family ? 0 : 1,
+                title: dto.title)
+            modelContext.insert(chat)
+        }
+        chat.kind = dto.kind
+        // Family first; every other kind — a group included — below it by
+        // recency, the list's own two-key sort.
+        chat.pinRank = dto.kind == ChatRules.family ? 0 : 1
+        chat.peerUserID = dto.peerUserID
+        chat.title = dto.title
+        // Present only on a group; absent clears, so a row can never carry
+        // members it does not have.
+        let members = dto.memberIDs ?? []
+        if chat.groupMemberIDs != members { chat.groupMemberIDs = members }
+        if chat.groupAdminUserID != dto.adminUserID { chat.groupAdminUserID = dto.adminUserID }
+        // The families it is listed in. Absent from a server that predates
+        // them — and then nothing held is cleared, because absence there
+        // means "the one family", not "none". `[]` IS "none", and is stored
+        // as such (`FamilyIDList.encodeListed`), never as the absent value.
+        if let familyIDs = dto.familyIDs, chat.familyIDs != familyIDs { chat.familyIDs = familyIDs }
+        chatsUpsertedDuringList?.insert(dto.id)
+        return chat
+    }
+
     /// THE local delete-by-chat, and the only one: everything this device
     /// holds that is keyed by a chat id goes here, in one place, so the two
     /// callers below cannot prune half of it each.
     ///
     /// Nothing in this protocol needed it until account deletion. A member
-    /// leaving does NOT take a chat away — that history is retained and
-    /// resurfaces if they rejoin — so the only chat that can genuinely
-    /// vanish is a direct one whose peer deleted their account, and it
-    /// vanishes in BOTH halves (docs/protocol.md, "Deleting an account").
+    /// leaving does NOT take the family chat away — that history is retained
+    /// and resurfaces if they rejoin — so the chats that can genuinely
+    /// vanish are a direct one whose peer deleted their account, which goes
+    /// in BOTH halves (docs/protocol.md, "Deleting an account"), and since
+    /// 2026-10-22 a group this member left, was removed from, or whose admin
+    /// deleted it (docs/protocol.md, "Groups").
     ///
     /// The messages go first and by hand: nothing here is a SwiftData
     /// relationship, so deleting the chat row alone would leave every one
@@ -4557,30 +5251,51 @@ final class ChatSyncCoordinator {
         liveMentionedMessageIDs[chatID] = nil
         readPostsInFlight.remove(chatID)
         pendingReadTargets[chatID] = nil
+        // "…and anything it was drafting there" (docs/protocol.md, "Groups"):
+        // the parked text, and whatever the app keeps beside the store.
+        ComposerDrafts.forget(chatID: chatID)
+        onChatDropped?(chatID)
     }
 
-    /// The GENERAL REPAIR: prune the direct chats a full `GET /chats` did
-    /// not list. This is what heals a device that was asleep when a peer
-    /// deleted their account — the frame that says so was never delivered
-    /// (the socket is a live wire, not a queue), and nothing else would
-    /// ever tell it.
+    /// The IMMEDIATE half for a group: a `chat_removed` frame, or this
+    /// device's own leave or delete answered. A chat this device never held
+    /// is nothing to drop, and is remembered only so a list already in
+    /// flight cannot bring it back.
+    func dropChat(chatID: Int64) {
+        chatsRemovedDuringList?.insert(chatID)
+        chatsUpsertedDuringList?.remove(chatID)
+        guard let chat = fetchChat(chatID) else { return }
+        deleteChat(chat)
+        saveContext()
+    }
+
+    /// The GENERAL REPAIR: prune the chats a full `GET /chats` did not
+    /// list. This is what heals a device that was asleep when a peer
+    /// deleted their account, or when a group it was in was left, emptied
+    /// or deleted — the frame that says so was never delivered (the socket
+    /// is a live wire, not a queue), and nothing else would ever tell it.
     ///
-    /// ONLY DIRECT CHATS, and that is deliberate rather than defensive: a
-    /// direct chat is the only kind that can disappear. The family chat is
-    /// in every response of every member of a family, the assistant thread
-    /// is returned to its owner, and a client that pruned either because a
-    /// response looked thin would be throwing away history the server still
-    /// holds. An unknown future kind is left alone for the same reason.
+    /// EVERY KIND, since 2026-10-22 (docs/protocol.md, resync step 2:
+    /// "a client drops every chat that leaves `GET /chats`, of any kind").
+    /// It used to be direct chats only, on the reasoning that nothing else
+    /// could disappear; a group can, and a client that kept an absent one
+    /// would keep a deleted group with every message in it forever. The
+    /// family chat and the assistant thread are in every complete response,
+    /// so pruning on absence costs them nothing.
+    ///
+    /// `keeping` is the groups that arrived by frame or by this device's own
+    /// request while the list was in flight — absent from a response built
+    /// before they existed here, and not gone.
     ///
     /// The caller runs this ONLY on a response that actually arrived and
     /// was complete — `GET /chats` is unpaginated, so "complete" is the
     /// same thing as "succeeded". On a network failure resync returns
     /// before reaching here, because pruning on a flaky connection would
     /// wipe somebody's history.
-    private func dropChats(absentFrom items: [ChatListItemDTO]) {
-        let serverIDs = Set(items.map { $0.chat.id })
+    private func dropChats(absentFrom items: [ChatListItemDTO], keeping: Set<Int64> = []) {
+        let serverIDs = Set(items.map { $0.chat.id }).union(keeping)
         guard let locals = try? modelContext.fetch(FetchDescriptor<ChatEntity>()) else { return }
-        for chat in locals where chat.kind == "direct" && !serverIDs.contains(chat.chatID) {
+        for chat in locals where !serverIDs.contains(chat.chatID) {
             deleteChat(chat)
         }
     }
@@ -4604,7 +5319,14 @@ final class ChatSyncCoordinator {
         saveContext()
     }
 
-    private func upsertMembers(_ members: [MemberDTO], formerMembers: [MemberDTO] = []) {
+    /// One family's roster, written as THAT family's (docs/protocol.md,
+    /// "Several families"): its members gain the family, anybody this device
+    /// holds that it omits loses it, and every row is then re-projected onto
+    /// the family on screen.
+    private func upsertMembers(
+        _ members: [MemberDTO], formerMembers: [MemberDTO] = [], familyKey: Int64? = nil
+    ) {
+        let familyKey = familyKey ?? currentFamilyKey
         let present = Set(members.map(\.id))
         for member in members {
             upsertMember(
@@ -4615,13 +5337,23 @@ final class ChatSyncCoordinator {
                 // does not, and tombstones do not come through here.
                 role: member.role ?? "member",
                 avatarVersion: member.avatarVersion,
-                birthday: .some(member.birthday))
+                birthday: .some(member.birthday),
+                familyKey: familyKey,
+                passwordReset: .some(member.passwordReset))
         }
-        // Anyone we know locally but the roster omits has left; keep the
-        // row (name resolution on old bubbles) but flag it.
+        // Anyone we know locally but the roster omits has left THIS family;
+        // keep the row (name resolution on old bubbles), drop the family
+        // from it, and let the projection flag it.
         if let locals = try? modelContext.fetch(FetchDescriptor<MemberEntity>()) {
-            for local in locals where !present.contains(local.userID) {
-                local.hasLeft = true
+            for local in locals where !present.contains(local.userID) && !local.accountDeleted {
+                // A row nobody had described yet is described now: on no
+                // roster this device has read, which is what "left" means.
+                if local.isMember(of: familyKey) || local.familyRolesText.isEmpty {
+                    var roles = local.familyRoles
+                    roles[familyKey] = nil
+                    local.familyRoles = roles
+                }
+                local.project(onto: currentFamilyKey)
             }
         }
         // The tombstones last. The sweep above has just flagged every
@@ -4665,9 +5397,11 @@ final class ChatSyncCoordinator {
         member.displayName = dto.displayName
         member.accountDeleted = true
         // Not a member of anything any more: no role, and out of every
-        // roster, picker and count.
+        // roster, picker and count — in every family.
         member.role = ""
         member.hasLeft = true
+        member.familyRolesText = ""
+        member.passwordResetDeniedText = ""
         member.isCurrentUser = false
         // Nothing to fetch — the server reports 0 and answers 404 for the
         // bytes, so a request would only cache a miss.
@@ -4726,6 +5460,8 @@ final class ChatSyncCoordinator {
     @discardableResult
     func block(userID: Int64) async -> Bool {
         do {
+            // The form without a family: "anybody I share any family with"
+            // (docs/protocol.md, "Several families") — a block is a pair.
             try await api.blockMember(userID: userID)
         } catch {
             return false
@@ -4757,8 +5493,15 @@ final class ChatSyncCoordinator {
     @discardableResult
     func report(reportedUserID: Int64, reason: String, messageID: Int64?) async -> Bool {
         do {
+            // To the owner of the family the message was in, or of the
+            // family on screen for a report about a person (docs/protocol.md,
+            // "Several families").
+            let family = messageID
+                .flatMap { fetchMessage(serverID: $0)?.chatID }
+                .flatMap { uploadFamily(forChat: $0) }
+                ?? pathFamily(currentFamilyKey)
             _ = try await api.createReport(
-                reportedUserID: reportedUserID, reason: reason, messageID: messageID)
+                reportedUserID: reportedUserID, reason: reason, messageID: messageID, family: family)
             return true
         } catch {
             return false
@@ -4838,19 +5581,30 @@ final class ChatSyncCoordinator {
     /// family would otherwise wait for its next `GET /me` to find out.
     private func applyFamilyOwner(familyID: Int64, userID: Int64) {
         // A frame about a family this device is not in is not ours to
-        // apply; ignore it rather than rewriting a roster with it.
-        if let known = session?.family?.id, known != familyID { return }
+        // apply; ignore it rather than rewriting a roster with it. Applied
+        // to THAT family — the owner of one family is nobody's owner in
+        // another (docs/protocol.md, "Several families").
+        if let families = session?.families, !families.isEmpty,
+           !families.contains(where: { $0.id == familyID }) { return }
+        let familyKey = familyKey(named: familyID)
         if let locals = try? modelContext.fetch(FetchDescriptor<MemberEntity>()) {
             for local in locals where !local.accountDeleted {
+                var roles = local.familyRoles
                 if local.userID == userID {
-                    local.role = "owner"
-                } else if local.role == "owner" {
+                    roles[familyKey] = "owner"
+                } else if roles[familyKey] == "owner" {
+                    roles[familyKey] = "member"
+                } else if roles.isEmpty, local.role == "owner" {
+                    // A row from before several families: its role was this
+                    // family's.
                     local.role = "member"
                 }
+                if roles != local.familyRoles { local.familyRoles = roles }
+                local.project(onto: currentFamilyKey)
             }
         }
         saveContext()
-        session?.applyFamilyOwner(userID: userID)
+        session?.applyFamilyOwner(familyID: familyID, userID: userID)
     }
 
     private func upsertMember(
@@ -4867,8 +5621,22 @@ final class ChatSyncCoordinator {
         /// rejoins would otherwise lose theirs to a frame that never
         /// mentioned it — the same "absent fields never wipe" rule the
         /// reaction upsert follows.
-        birthday: BirthdayDTO?? = .none
+        birthday: BirthdayDTO?? = .none,
+        /// The family whose roster says so; the one on screen when nil.
+        familyKey: Int64? = nil,
+        /// The owner's `password_reset` for this member, doubly wrapped for
+        /// the birthday's reason: `.none` was never told, `.some(nil)` is a
+        /// read that does not carry it (a member's, or an older server's).
+        passwordReset: Bool?? = .none,
+        /// True when `role` is a DEFAULT rather than something the server
+        /// said — a `member_joined`, which carries no role. It then applies
+        /// only to a row new to this family's roster; one already on it
+        /// keeps the role it holds, so a frame can never demote an owner.
+        /// A roster read says the role outright and leaves this false.
+        keepsHeldRole: Bool = false
     ) {
+        let familyKey = familyKey ?? currentFamilyKey
+        let member: MemberEntity
         if let existing = fetchMember(userID) {
             // Deletion is one-way and ids are never reused, so a live
             // roster entry for a tombstoned row can only be a response
@@ -4878,24 +5646,36 @@ final class ChatSyncCoordinator {
             guard !existing.accountDeleted else { return }
             existing.username = username
             existing.displayName = displayName
-            existing.role = role
             existing.isCurrentUser = userID == currentUserID
-            existing.hasLeft = false
             existing.avatarVersion = avatarVersion
             if let birthday {
                 existing.birthdayMonth = birthday?.month
                 existing.birthdayDay = birthday?.day
             }
+            member = existing
         } else {
-            modelContext.insert(MemberEntity(
+            member = MemberEntity(
                 userID: userID,
                 username: username,
                 displayName: displayName,
                 role: role,
                 isCurrentUser: userID == currentUserID,
                 avatarVersion: avatarVersion,
-                birthday: birthday ?? nil))
+                birthday: birthday ?? nil)
+            modelContext.insert(member)
         }
+        // On THIS family's roster, in this role; `role` and `hasLeft` are
+        // then the projection onto the family on screen.
+        var roles = member.familyRoles
+        if !keepsHeldRole || roles[familyKey] == nil { roles[familyKey] = role }
+        if roles != member.familyRoles { member.familyRoles = roles }
+        if let passwordReset {
+            var denied = Set(FamilyIDList.decode(member.passwordResetDeniedText))
+            if passwordReset == false { denied.insert(familyKey) } else { denied.remove(familyKey) }
+            let text = FamilyIDList.encode(denied.sorted())
+            if member.passwordResetDeniedText != text { member.passwordResetDeniedText = text }
+        }
+        member.project(onto: currentFamilyKey)
         saveContext()
     }
 
@@ -4914,8 +5694,8 @@ final class ChatSyncCoordinator {
 
     // MARK: - Fetch helpers
 
-    /// The kind of a chat this device holds — `"family"`, `"direct"` or
-    /// `"ai"` — or nil when it holds no such chat. For the one rule that
+    /// The kind of a chat this device holds — `"family"`, `"direct"`, `"ai"`
+    /// or `"group"` — or nil when it holds no such chat. For the one rule that
     /// needs it from inside a bubble, which knows its chat only by id:
     /// whether "Show text" is offered under a recording (`TranscriptDoor`).
     func chatKind(of chatID: Int64) -> String? {
@@ -4935,6 +5715,11 @@ final class ChatSyncCoordinator {
     }
 
     func fetchMessage(localID: String) -> MessageEntity? {
+        // Inside `applyPage`, a key the page prefetched is answered from it
+        // — including "not held", which is as authoritative as the query.
+        if let page = pageLookup, page.covers(localID: localID) {
+            return page.row(localID: localID)
+        }
         var descriptor = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.localID == localID })
         descriptor.fetchLimit = 1
         return (try? modelContext.fetch(descriptor))?.first
@@ -4951,6 +5736,9 @@ final class ChatSyncCoordinator {
     }
 
     private func fetchMessage(clientMsgID: String, chatID: Int64) -> MessageEntity? {
+        if let page = pageLookup, page.covers(clientMsgID: clientMsgID, chatID: chatID) {
+            return page.row(clientMsgID: clientMsgID, chatID: chatID)
+        }
         let target: String? = clientMsgID
         var descriptor = FetchDescriptor<MessageEntity>(
             predicate: #Predicate { $0.clientMsgID == target && $0.chatID == chatID })
@@ -4988,6 +5776,121 @@ final class ChatSyncCoordinator {
         return Dictionary(uniqueKeysWithValues: chats.map { ($0.chatID, $0.maxPollSeq) })
     }
 
+    // MARK: - Applying a page
+
+    /// The rows one page's dedup lookups will ask for, fetched up front.
+    ///
+    /// `upsert` asks the store up to two questions per row before it writes
+    /// anything — "do I hold this client id in this chat?" and "do I hold
+    /// `s:<id>`?" — and the first is a scan, because `clientMsgID` has no
+    /// index (a `#Index` needs iOS 18). Measured on a Mac over a 5,000-row
+    /// chat: a third of a millisecond each, so a hundred-row page spent more
+    /// time asking than writing, and a phone spends longer. Here both are
+    /// asked ONCE for the whole page — one query whose rows are a superset of
+    /// every row the per-row helpers could find (`makePageLookup` has the
+    /// argument) — and answered from memory.
+    ///
+    /// A key the page did not prefetch falls through to the ordinary query,
+    /// so nothing outside the page can be answered wrongly; and a row the
+    /// page itself inserts is added as it is inserted, so two copies of one
+    /// message in one page still dedup exactly as they did.
+    private final class PageLookup {
+        private let localIDs: Set<String>
+        private let clientKeys: Set<String>
+        private var byLocalID: [String: MessageEntity] = [:]
+        private var byClientKey: [String: MessageEntity] = [:]
+
+        init(localIDs: Set<String>, clientKeys: Set<String>, rows: [MessageEntity]) {
+            self.localIDs = localIDs
+            self.clientKeys = clientKeys
+            for row in rows { noteInserted(row) }
+        }
+
+        private static func clientKey(_ clientMsgID: String, _ chatID: Int64) -> String {
+            "\(chatID)|\(clientMsgID)"
+        }
+
+        func covers(localID: String) -> Bool { localIDs.contains(localID) }
+
+        func covers(clientMsgID: String, chatID: Int64) -> Bool {
+            clientKeys.contains(Self.clientKey(clientMsgID, chatID))
+        }
+
+        func row(localID: String) -> MessageEntity? { byLocalID[localID] }
+
+        func row(clientMsgID: String, chatID: Int64) -> MessageEntity? {
+            byClientKey[Self.clientKey(clientMsgID, chatID)]
+        }
+
+        /// Index a row under both keys. The FIRST row seen for a key keeps
+        /// it, as `fetchLimit = 1` kept whichever came first.
+        func noteInserted(_ row: MessageEntity) {
+            if byLocalID[row.localID] == nil { byLocalID[row.localID] = row }
+            if let clientMsgID = row.clientMsgID {
+                let key = Self.clientKey(clientMsgID, row.chatID)
+                if byClientKey[key] == nil { byClientKey[key] = row }
+            }
+        }
+    }
+
+    /// Set only while `applyPage` runs — synchronously, on the main actor,
+    /// with no suspension inside — so no other path can ever see it.
+    private var pageLookup: PageLookup?
+
+    /// Apply a page of messages with its dedup lookups prefetched
+    /// (`PageLookup`). If the prefetch itself fails, the page is applied
+    /// exactly as before, one query per lookup.
+    private func applyPage(_ page: [MessageDTO], _ apply: (MessageDTO) -> Void) {
+        pageLookup = makePageLookup(page)
+        defer { pageLookup = nil }
+        for dto in page { apply(dto) }
+    }
+
+    private func makePageLookup(_ page: [MessageDTO]) -> PageLookup? {
+        // One chat per page, which every caller's endpoint guarantees; a
+        // mixed page (none exists) simply goes row by row.
+        guard page.count > 1, let chatID = page.first?.chatID,
+              page.allSatisfy({ $0.chatID == chatID }),
+              let low = page.map(\.id).min(), let high = page.map(\.id).max()
+        else { return nil }
+        let localIDs = Set(page.map { "s:\($0.id)" })
+        // An EMPTY client id is left to the ordinary query, exactly as typed.
+        let clientKeys = Set(page.compactMap { dto -> String? in
+            guard let clientMsgID = dto.clientMsgID, !clientMsgID.isEmpty else { return nil }
+            return "\(chatID)|\(clientMsgID)"
+        })
+        // ONE query covers both lookups, built only from predicate forms this
+        // file already relies on (no `contains` over an optional column,
+        // which SwiftData can refuse with an exception no `try` catches):
+        //
+        //   - `s:<id>` is only ever written on a row whose server id IS that
+        //     id, so every such row of the page lies in its id range;
+        //   - a row holding one of the page's client ids is either still
+        //     pending (no server id yet) or already carries the server id
+        //     the server gave that client id — the same message, in range.
+        //     A retried send is answered with the ORIGINAL message
+        //     (docs/protocol.md, "Dedup": `(chat_id, sender, client_msg_id)`
+        //     is unique), so no other server id can carry it. The one row
+        //     this could miss is another SENDER's with the same random UUID,
+        //     which the per-row lookup would have wrongly reconciled into.
+        //
+        // Rows in range that the page does not name come back too and are
+        // simply never asked about.
+        let descriptor = FetchDescriptor<MessageEntity>(
+            predicate: #Predicate { message in
+                message.chatID == chatID
+                    && (message.serverID == nil
+                        || ((message.serverID ?? 0) >= low && (message.serverID ?? 0) <= high))
+            })
+        do {
+            let rows = try modelContext.fetch(descriptor)
+            return PageLookup(localIDs: localIDs, clientKeys: clientKeys, rows: rows)
+        } catch {
+            AppLog.sync.error("Page prefetch failed, applying row by row: \(String(describing: error), privacy: .public)")
+            return nil
+        }
+    }
+
     private func saveContext() {
         do {
             try modelContext.save()
@@ -4995,6 +5898,13 @@ final class ChatSyncCoordinator {
             AppLog.sync.error("ModelContext save failed: \(String(describing: error))")
         }
         refreshUnreadBadge()
+    }
+
+    /// The one save after a page applied with `saves: false`. An empty page
+    /// changed nothing and costs nothing.
+    private func savePage(_ count: Int) {
+        guard count > 0 else { return }
+        saveContext()
     }
 
     /// The number the icon should be showing, according to the store alone.

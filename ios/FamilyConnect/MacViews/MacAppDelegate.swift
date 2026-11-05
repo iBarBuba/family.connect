@@ -51,6 +51,11 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationC
         // LaunchWindowBackstop for why an app can get here with none. A
         // launch that starts in the menu bar has its window, hidden on purpose.
         LaunchWindowBackstop.start(startedInMenuBar: hidden)
+        // Return with ⌥ ⌘ ⌃ or ⇧ is a new line in every multi-line field (#95).
+        MacNewLineKeys.install()
+        // …and a sentence starts with a capital there, while the system's
+        // "Capitalise words automatically" is on (#97).
+        MacCapitalKeys.install()
 
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -161,11 +166,13 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationC
             return
         }
         let route = PushRoute.parse(userInfo: content.userInfo)
+        let familyID = PushRoute.familyID(userInfo: content.userInfo)
         Task { @MainActor in
             // The window first — hidden in the menu bar, or really closed —
             // because only the main window's chat view applies a route (#80).
             MacMenuBar.shared.showMainWindow()
-            MacAppDelegate.session?.pendingPushRoute = route
+            // In ITS family (docs/protocol.md, "Several families").
+            MacAppDelegate.session?.routePush(route, familyID: familyID)
             completionHandler()
         }
     }

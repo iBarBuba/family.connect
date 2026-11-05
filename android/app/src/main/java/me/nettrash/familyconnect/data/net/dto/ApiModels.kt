@@ -16,6 +16,7 @@ package me.nettrash.familyconnect.data.net.dto
 
 import kotlinx.serialization.SerialName
 import me.nettrash.familyconnect.util.PollVoteState
+import me.nettrash.familyconnect.util.LruMemo
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -99,6 +100,13 @@ data class MemberDto(
      * left behind.
      */
     val deleted: Boolean? = null,
+    /**
+     * Whether the OWNER reading their own family may reset this member's
+     * password — true only when the owner owns every family the member is
+     * in (docs/protocol.md, "Several families"). Present in the owner's own
+     * read only; null everywhere else and from a server that predates it.
+     */
+    @SerialName("password_reset") val passwordReset: Boolean? = null,
 ) {
     val isDeleted: Boolean get() = deleted == true
 }
@@ -248,6 +256,34 @@ data class FamilyDto(
      * failing the whole family read; read it through [places].
      */
     @SerialName("greeting_places") val greetingPlaces: List<String>? = null,
+    /**
+     * The caller's role in THIS family, "owner" | "member" — present on the
+     * entries of `GET /me`'s `families` (docs/protocol.md, "Several
+     * families"), absent from every other read of a Family. Null here means
+     * "not said", never "no role".
+     */
+    val role: String? = null,
+    /**
+     * The most members this family may have whatever its owner sets: the
+     * operator's `max_family_members`, or for a PAID family the lower paid
+     * limit (docs/protocol.md, "Paid families", added 2026-10-30). The
+     * owner's cap picker draws its range from this, and falls back to
+     * `MeResponse.maxFamilyMembers` when it is null — every server that
+     * predates it.
+     */
+    @SerialName("member_ceiling") val memberCeiling: Int? = null,
+    /**
+     * "free" | "paid", present only while the server's subscriptions are
+     * on. Null means payment does not apply: every family on a server that
+     * has them off, or predates them.
+     */
+    val plan: String? = null,
+    /**
+     * The moment the server will delete this PAID family, present only
+     * while its owner's subscription does not cover it. While it is here
+     * the chat list shows the unpaid banner; null is no deadline.
+     */
+    @SerialName("delete_at") val deleteAt: String? = null,
 ) {
     /** [greetingPlaces], with absent read as none. */
     val places: List<String> get() = greetingPlaces.orEmpty()
@@ -267,12 +303,69 @@ data class JoinRequestDto(
     @SerialName("created_at") val createdAt: String,
 )
 
+/**
+ * An owner's invitation into their family (docs/protocol.md, "Several
+ * families"), pending until [user] — the invited person — accepts or
+ * declines. The same object reaches both ends: the invited person in
+ * `GET /me` and the `invitation` frame, the owner in
+ * `GET /families/{id}/invitations`.
+ */
+@Serializable
+data class InvitationDto(
+    val id: Long,
+    @SerialName("family_id") val familyId: Long,
+    @SerialName("family_name") val familyName: String,
+    @SerialName("invited_by") val invitedBy: UserDto,
+    val user: UserDto,
+    @SerialName("created_at") val createdAt: String? = null,
+)
+
+/** `POST /families/{id}/invitations` → the invitation, new or the pending one. */
+@Serializable
+data class InvitationResponse(val invitation: InvitationDto)
+
+/** `GET /families/{id}/invitations` — pending only, oldest first. */
+@Serializable
+data class InvitationsResponse(val invitations: List<InvitationDto> = emptyList())
+
+/** `POST /families/{id}/invitations` — the person to invite. */
+@Serializable
+data class InviteRequest(@SerialName("user_id") val userId: Long)
+
+/**
+ * A chat as the server describes it (docs/protocol.md, `Chat`).
+ *
+ * [kind] is `"family"`, `"direct"`, `"ai"` or — since 2026-10-22 —
+ * `"group"`. [title] is the family's name, the peer's, the assistant's or
+ * the group's own.
+ */
 @Serializable
 data class ChatDto(
     val id: Long,
     val kind: String,
     val title: String,
     @SerialName("peer_user_id") val peerUserId: Long? = null,
+    /**
+     * Everyone in a GROUP, the caller included, in the order they joined
+     * (docs/protocol.md, "Groups"). Present only for `kind == "group"`, so
+     * nullable with a default: every other chat, and every server before
+     * groups, simply omits it.
+     */
+    @SerialName("member_ids") val memberIds: List<Long>? = null,
+    /**
+     * The one member of a GROUP who may rename it, add and remove members
+     * and delete it — its creator, until a hand-off. Present only for a
+     * group.
+     */
+    @SerialName("admin_user_id") val adminUserId: Long? = null,
+    /**
+     * The families this chat is listed in (docs/protocol.md, "Several
+     * families"): exactly one for a family chat, a group and an `ai` chat;
+     * every family the two people share for a direct chat. Null from a
+     * server that predates it, where it means the one family the account
+     * has.
+     */
+    @SerialName("family_ids") val familyIds: List<Long>? = null,
 )
 
 @Serializable
@@ -425,6 +518,14 @@ data class MentionDto(
 )
 
 /**
+ * How many parsed values each stored-JSON codec below keeps (util/LruMemo.kt).
+ * Several screens' worth of a chat's window — the window starts at 100 rows
+ * and grows by pages — and small enough that the strings it pins are
+ * nothing next to the rows Room already holds.
+ */
+private const val MEMO_CAPACITY = 512
+
+/**
  * Local persistence codec: the messages table stores the mention list
  * verbatim in its WIRE shape (`mentionsJson` — null = names nobody).
  */
@@ -434,8 +535,16 @@ object MentionsCodec {
     fun encode(mentions: List<MentionDto>): String = json.encodeToString(mentions)
 
     fun decode(raw: String?): List<MentionDto> =
-        raw?.let { runCatching { json.decodeFromString<List<MentionDto>>(it) }.getOrNull() }
-            .orEmpty()
+        raw?.let { text ->
+            memo.getOrCompute(text) { runCatching { json.decodeFromString<List<MentionDto>>(text) }.getOrNull() }
+        }.orEmpty()
+
+    /**
+     * Parsed lists by their stored text. A bubble decodes this on its first
+     * composition, every time it scrolls back in — the same few strings over
+     * and over. See util/LruMemo.kt for why this is the same answer, earlier.
+     */
+    private val memo = LruMemo<String, List<MentionDto>>(MEMO_CAPACITY)
 }
 
 @Serializable
@@ -649,6 +758,22 @@ data class AttachmentDto(
      */
     val round: Boolean? = null,
     /**
+     * `true` when (and only when) the message carrying this was sent as an
+     * ANIMATION (docs/protocol.md, "Animations"; #96): an animated GIF, WebP
+     * or PNG the sender turned into a silent looping H.264 MP4, still a
+     * `kind=video` in every other respect — drawn as a picture that moves,
+     * with a small "GIF" label and no player chrome. The round flag's pattern
+     * exactly: absent otherwise and never `false`, nullable so a stored copy
+     * round-trips what the wire said, set by the send and never changed,
+     * never beside `sticker` or `round`.
+     *
+     * Rides inside the attachments JSON a message row stores. A row cached by
+     * a build from before the key was written back without it; such rows are
+     * marked (`MessageEntity.attachmentsKnowAnimation`, MIGRATION_32_33) and
+     * read again on resync by `MessageRepository.repairUnknownAnimationFlags`.
+     */
+    val animation: Boolean? = null,
+    /**
      * A voice note's WAVEFORM (#79; docs/protocol.md, "A voice note's
      * waveform"): 48 lowercase hex digits, one level 0–15 per equal slice of
      * the recording, made by the sender's own meter — so the bubble draws its
@@ -674,6 +799,13 @@ data class AttachmentDto(
      * that attachment otherwise is.
      */
     val isRound: Boolean get() = round == true && kind == KIND_VIDEO
+
+    /**
+     * Sent as an animation (#96). The kind is checked too, as the round
+     * flag's is: the flag on anything but a video draws as what it is. The
+     * MESSAGE-level test ("exactly one attachment") is the caller's.
+     */
+    val isAnimation: Boolean get() = animation == true && kind == KIND_VIDEO
     val isFile: Boolean get() = kind == KIND_FILE
     val isAudio: Boolean get() = kind == KIND_AUDIO
     val isLocation: Boolean get() = kind == KIND_LOCATION
@@ -775,8 +907,16 @@ object ReactionsCodec {
     fun encode(reactions: List<ReactionDto>): String = json.encodeToString(reactions)
 
     fun decode(raw: String?): List<ReactionDto> =
-        raw?.let { runCatching { json.decodeFromString<List<ReactionDto>>(it) }.getOrNull() }
-            .orEmpty()
+        raw?.let { text ->
+            memo.getOrCompute(text) { runCatching { json.decodeFromString<List<ReactionDto>>(text) }.getOrNull() }
+        }.orEmpty()
+
+    /**
+     * Parsed lists by their stored text: the chat's item builder decodes
+     * every row of its window on every emission, and nearly all of them are
+     * the rows it decoded the time before (util/LruMemo.kt).
+     */
+    private val memo = LruMemo<String, List<ReactionDto>>(MEMO_CAPACITY)
 }
 
 /**
@@ -797,7 +937,10 @@ object PollCodec {
 
     /** Null for a message that is not a poll, or for a row we cannot read. */
     fun decode(raw: String?): PollDto? =
-        raw?.let { runCatching { json.decodeFromString<PollDto>(it) }.getOrNull() }
+        raw?.let { text -> memo.getOrCompute(text) { runCatching { json.decodeFromString<PollDto>(text) }.getOrNull() } }
+
+    /** Parsed polls by their stored text, for the reason [ReactionsCodec] keeps its own. */
+    private val memo = LruMemo<String, PollDto>(MEMO_CAPACITY)
 }
 
 /**
@@ -856,7 +999,19 @@ object AttachmentsCodec {
     /** Null when the column is null or unreadable — the caller then falls
      *  back to the flat columns a pre-plurality row still carries. */
     fun decode(raw: String?): List<AttachmentDto>? =
-        raw?.let { runCatching { json.decodeFromString<List<AttachmentDto>>(it) }.getOrNull() }
+        raw?.let { text ->
+            memo.getOrCompute(text) { runCatching { json.decodeFromString<List<AttachmentDto>>(text) }.getOrNull() }
+        }
+
+    /**
+     * Parsed sets by their stored text. The heaviest of the four memos'
+     * customers: `MessageEntity.attachmentList` is a GETTER over this, and
+     * one bubble asks it whether the message is media-only, a sticker, a
+     * video message and an animation before it draws anything — each of
+     * which used to be a fresh parse, on the main thread, for every row
+     * that scrolled in (util/LruMemo.kt).
+     */
+    private val memo = LruMemo<String, List<AttachmentDto>>(MEMO_CAPACITY)
 }
 
 // -- Request bodies ----------------------------------------------------------
@@ -1001,6 +1156,30 @@ data class BirthdayRequest(
 @Serializable
 data class CreateDirectChatRequest(@SerialName("user_id") val userId: Long)
 
+/**
+ * `POST /chats/groups` — a new group (docs/protocol.md, "Groups"). The
+ * caller is added and becomes its admin; [memberIds] names the others.
+ */
+@Serializable
+data class CreateGroupRequest(
+    val title: String,
+    @SerialName("member_ids") val memberIds: List<Long>,
+    /**
+     * The family the group is in (docs/protocol.md, "Several families") —
+     * the one the app is showing. Null is left off the wire (`encodeDefaults
+     * = false`), which a server reads as the home family.
+     */
+    @SerialName("family_id") val familyId: Long? = null,
+)
+
+/** `PATCH /chats/{id}` — renames a group. Admin only. */
+@Serializable
+data class RenameGroupRequest(val title: String)
+
+/** `POST /chats/{id}/members` — adds members to a group. Admin only. */
+@Serializable
+data class AddGroupMembersRequest(@SerialName("user_ids") val userIds: List<Long>)
+
 @Serializable
 data class SendMessageRequest(
     @SerialName("client_msg_id") val clientMsgId: String,
@@ -1038,6 +1217,13 @@ data class SendMessageRequest(
      * is; never sent as `false`, and never beside it.
      */
     val round: Boolean? = null,
+    /**
+     * `true` sends the message's one `kind=video` attachment as an ANIMATION
+     * (docs/protocol.md, "Animations"; #96). Null — and therefore omitted —
+     * for every other message, exactly as [round] is; never sent as `false`,
+     * and never beside [sticker] or [round].
+     */
+    val animation: Boolean? = null,
 )
 
 /**
@@ -1118,6 +1304,8 @@ data class NoteDto(
      */
     @SerialName("content_seq") val contentSeq: Long? = null,
     val deleted: Boolean? = null,
+    /** The family whose board it is on (docs/protocol.md, "Several families"); null from an older server. */
+    @SerialName("family_id") val familyId: Long? = null,
     /**
      * One of plain/serif/mono/casual — an INTENT each client draws with a
      * system face of its own. Null on a tombstone, and null from a server
@@ -1248,6 +1436,8 @@ data class PackItemDto(
      */
     val label: String? = null,
     val deleted: Boolean? = null,
+    /** Whose pack it is in (docs/protocol.md, "Several families"); null from an older server. */
+    @SerialName("family_id") val familyId: Long? = null,
 ) {
     val isTombstone: Boolean get() = deleted == true
 }
@@ -1460,10 +1650,79 @@ data class MeResponse(
      * `processor` and nobody else.
      */
     @SerialName("assistant_lookup_consent_at") val assistantLookupConsentAt: String? = null,
+    /**
+     * Every family the caller is in, home family first and then in the order
+     * they were joined, each with its own [FamilyDto.role] (docs/protocol.md,
+     * "Several families"). NULL — not empty — from a server that predates
+     * several families: that server's whole answer is [family] and [role],
+     * and the client makes its one-entry list out of them.
+     */
+    val families: List<FamilyDto>? = null,
+    /** Every live join request; null from an older server, which sends [pendingJoinRequest]. */
+    @SerialName("pending_join_requests") val pendingJoinRequests: List<PendingJoinRequestDto>? = null,
+    /** The caller's pending invitations, oldest first. */
+    val invitations: List<InvitationDto> = emptyList(),
+    /** Whether a member may start ANOTHER family in the app (`[families] member_families`). */
+    @SerialName("member_families_enabled") val memberFamiliesEnabled: Boolean = false,
+    /** The most families one account may be in; null from an older server. */
+    @SerialName("max_families_per_account") val maxFamiliesPerAccount: Int? = null,
+    /**
+     * Whether a NEW family on this server needs its owner's App Store
+     * subscription (`[subscriptions] enabled`, docs/protocol.md "Paid
+     * families", added 2026-10-30). ALWAYS present on a current server;
+     * absent means false, and with it false nothing below applies.
+     *
+     * This app sells nothing (Google Play's payments policy): it only reads
+     * whether the caller already holds an active subscription, which is
+     * what lets it offer "Create a family" at all.
+     */
+    @SerialName("subscriptions_enabled") val subscriptionsEnabled: Boolean = false,
+    /** The caller's own subscription — the active one, or else the one that ended last; null for none. */
+    val subscription: SubscriptionDto? = null,
+    /** What a paid family gets; each limit present only while the operator has it on. */
+    @SerialName("paid_family_limits") val paidFamilyLimits: PaidFamilyLimitsDto? = null,
+    /** Days a paid family the owner stops paying for has before it is deleted; null with subscriptions off. */
+    @SerialName("unpaid_days") val unpaidDays: Int? = null,
+)
+
+/**
+ * An App Store subscription, as the server verified it (docs/protocol.md,
+ * "Paid families"). Every field defaults, so one the server leaves out
+ * never fails the whole `/me` it rides on.
+ */
+@Serializable
+data class SubscriptionDto(
+    @SerialName("product_id") val productId: String? = null,
+    /** "Production" | "Sandbox". */
+    val environment: String? = null,
+    /** When it stops covering anything: the expiry, or the grace-period end when that is later. */
+    @SerialName("expires_at") val expiresAt: String? = null,
+    /** Whether it covers its owner's families right now. Absent reads as not. */
+    val active: Boolean = false,
+    /** Whether it will renew, when the server knows; null when it does not. */
+    val renews: Boolean? = null,
+)
+
+/** A paid family's limits (`paid_family_limits` on `GET /me`); each absent while that limit is off. */
+@Serializable
+data class PaidFamilyLimitsDto(
+    val members: Int? = null,
+    @SerialName("storage_bytes") val storageBytes: Long? = null,
+    @SerialName("ai_tokens") val aiTokens: Long? = null,
+    val images: Int? = null,
+    @SerialName("transcript_ms") val transcriptMs: Long? = null,
 )
 
 @Serializable
-data class JoinResponse(val status: String)
+data class JoinResponse(
+    val status: String,
+    /**
+     * Which family the code was for — joined or asked to join
+     * (docs/protocol.md, "Several families"). Null from a server that
+     * predates it; the client then finds the new family by comparing `/me`.
+     */
+    @SerialName("family_id") val familyId: Long? = null,
+)
 
 /** PUT /me/avatar — the caller's user with its bumped avatar_version. */
 @Serializable
@@ -1938,6 +2197,31 @@ data class ErrorBody(val error: ErrorPayload) {
 data class FamilyStatsDto(
     val totals: StatsTotalsDto,
     val members: List<MemberStatsDto> = emptyList(),
+    /**
+     * What a PAID family has used of its limits, and when the monthly ones
+     * start again (docs/protocol.md, "Family statistics", amended
+     * 2026-10-30). Absent for a free family and on a server with
+     * subscriptions off — and then no section is drawn.
+     */
+    val allowance: AllowanceDto? = null,
+)
+
+/** A paid family's allowance; each limit absent when the operator turned that one off. */
+@Serializable
+data class AllowanceDto(
+    /** The start of the next UTC month, when the monthly limits start again. */
+    @SerialName("renews_at") val renewsAt: String? = null,
+    @SerialName("storage_bytes") val storageBytes: AllowanceUseDto? = null,
+    @SerialName("ai_tokens") val aiTokens: AllowanceUseDto? = null,
+    val images: AllowanceUseDto? = null,
+    @SerialName("transcript_ms") val transcriptMs: AllowanceUseDto? = null,
+)
+
+/** One limit: how much of it is used, of how much. */
+@Serializable
+data class AllowanceUseDto(
+    val used: Long = 0,
+    val limit: Long = 0,
 )
 
 @Serializable

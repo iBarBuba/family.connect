@@ -37,7 +37,7 @@ class TranscriptRulesTest {
 
     @Test
     fun `my own recording may be asked about in every kind of chat`() {
-        for (kind in listOf("family", "direct", "ai")) {
+        for (kind in listOf("family", "direct", "ai", "group")) {
             assertThat(mayAsk(kind, ME, familyAllowsOthers = false)).isTrue()
         }
     }
@@ -49,22 +49,42 @@ class TranscriptRulesTest {
     }
 
     @Test
-    fun `another member's recording in a direct chat is never asked about`() {
-        // Not even with the switch on: nothing reads a direct chat.
-        assertThat(mayAsk("direct", ANNA, familyAllowsOthers = true)).isFalse()
-        assertThat(mayAsk("direct", ANNA, familyAllowsOthers = false)).isFalse()
+    fun `the other person's recording in a direct chat is offered whatever the switch says`() {
+        // The owner's switch does not reach a direct chat; the server asks
+        // the sender's consent (amended 2026-10-21).
+        assertThat(mayAsk("direct", ANNA, familyAllowsOthers = true)).isTrue()
+        assertThat(mayAsk("direct", ANNA, familyAllowsOthers = false)).isTrue()
+        assertThat(
+            TranscriptRules.mayAsk("direct", ANNA, myUserId = null, assistantUserId = ASSISTANT, familyAllowsOthers = true),
+        ).isFalse()
+    }
+
+    /**
+     * D4 (docs/protocol.md, "Transcripts on request", amended 2026-10-22): a
+     * GROUP follows the direct chat's rule — the sender's consent alone,
+     * which the server asks — and the owner's `ai_transcripts`, which is
+     * about the family chat, does not reach it in either direction.
+     */
+    @Test
+    fun `another member's recording in a group follows the direct chat's rule, not the switch`() {
+        assertThat(mayAsk("group", ANNA, familyAllowsOthers = false)).isTrue()
+        assertThat(mayAsk("group", ANNA, familyAllowsOthers = true)).isTrue()
+        assertThat(
+            TranscriptRules.mayAsk("group", ANNA, myUserId = null, assistantUserId = ASSISTANT, familyAllowsOthers = true),
+        ).isFalse()
     }
 
     @Test
     fun `the assistant's own messages are never asked about`() {
         assertThat(mayAsk("ai", ASSISTANT, familyAllowsOthers = true)).isFalse()
         assertThat(mayAsk("family", ASSISTANT, familyAllowsOthers = true)).isFalse()
+        assertThat(mayAsk("group", ASSISTANT, familyAllowsOthers = true)).isFalse()
     }
 
     @Test
     fun `an unknown chat kind or an unknown me offers nothing`() {
         assertThat(mayAsk(null, ANNA, familyAllowsOthers = true)).isFalse()
-        assertThat(mayAsk("group", ANNA, familyAllowsOthers = true)).isFalse()
+        assertThat(mayAsk("unknown", ANNA, familyAllowsOthers = true)).isFalse()
         assertThat(
             TranscriptRules.mayAsk("family", ME, myUserId = null, assistantUserId = ASSISTANT, familyAllowsOthers = true),
         ).isFalse()
@@ -150,7 +170,8 @@ class TranscriptRulesTest {
     fun `another member's voice note follows the rule and the switch`() {
         assertThat(offers(sender = ANNA)).isFalse()
         assertThat(offers(sender = ANNA, familyAllowsOthers = true)).isTrue()
-        assertThat(offers(sender = ANNA, familyAllowsOthers = true, chatKind = "direct")).isFalse()
+        // The other person's in a direct chat: whatever the switch says (2026-10-21).
+        assertThat(offers(sender = ANNA, chatKind = "direct")).isTrue()
     }
 
     // -- Phase 3: what this device supplies --------------------------------------------
@@ -169,7 +190,7 @@ class TranscriptRulesTest {
         assertThat(offers(attachment = clip)).isTrue()
         assertThat(offers(attachment = clip, sender = ANNA)).isFalse()
         assertThat(offers(attachment = clip, sender = ANNA, familyAllowsOthers = true)).isTrue()
-        assertThat(offers(attachment = clip, sender = ANNA, familyAllowsOthers = true, chatKind = "direct")).isFalse()
+        assertThat(offers(attachment = clip, sender = ANNA, chatKind = "direct")).isTrue()
         assertThat(offers(attachment = clip, sender = ASSISTANT)).isFalse()
         assertThat(offers(attachment = clip, serverTranscribes = false)).isFalse()
     }

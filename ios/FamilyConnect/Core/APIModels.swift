@@ -146,6 +146,13 @@ nonisolated struct MemberDTO: Codable, Equatable, Identifiable, Sendable {
     /// exists there for one reason — so a stored message, note or reaction
     /// can still be given a sender. Absent on the wire when false.
     var deleted: Bool = false
+    /// Whether the reader — an owner reading their own family — may reset
+    /// this member's password, which needs them to own EVERY family the
+    /// member is in (docs/protocol.md, "Several families", 2026-10-22).
+    /// Present in the owner's own read only; nil everywhere else, and from
+    /// a server that predates several families, where an owner's reset
+    /// works exactly as it always did (`FamilyRules.offersPasswordReset`).
+    var passwordReset: Bool?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -155,6 +162,7 @@ nonisolated struct MemberDTO: Codable, Equatable, Identifiable, Sendable {
         case avatarVersion = "avatar_version"
         case birthday
         case deleted
+        case passwordReset = "password_reset"
     }
 
     init(
@@ -164,7 +172,8 @@ nonisolated struct MemberDTO: Codable, Equatable, Identifiable, Sendable {
         role: String?,
         avatarVersion: Int64 = 0,
         birthday: BirthdayDTO? = nil,
-        deleted: Bool = false
+        deleted: Bool = false,
+        passwordReset: Bool? = nil
     ) {
         self.id = id
         self.username = username
@@ -173,6 +182,7 @@ nonisolated struct MemberDTO: Codable, Equatable, Identifiable, Sendable {
         self.avatarVersion = avatarVersion
         self.birthday = birthday
         self.deleted = deleted
+        self.passwordReset = passwordReset
     }
 
     /// See UserDTO.init(from:) — a defaulted property is not a decoding
@@ -186,6 +196,7 @@ nonisolated struct MemberDTO: Codable, Equatable, Identifiable, Sendable {
         avatarVersion = try container.decodeIfPresent(Int64.self, forKey: .avatarVersion) ?? 0
         birthday = try container.decodeIfPresent(BirthdayDTO.self, forKey: .birthday)
         deleted = try container.decodeIfPresent(Bool.self, forKey: .deleted) ?? false
+        passwordReset = try container.decodeIfPresent(Bool.self, forKey: .passwordReset)
     }
 
     /// The same member wearing a different birthday. The roster screens
@@ -201,7 +212,8 @@ nonisolated struct MemberDTO: Codable, Equatable, Identifiable, Sendable {
             role: role,
             avatarVersion: avatarVersion,
             birthday: birthday,
-            deleted: deleted)
+            deleted: deleted,
+            passwordReset: passwordReset)
     }
 }
 
@@ -330,10 +342,34 @@ nonisolated struct FamilyDTO: Codable, Equatable, Sendable {
     /// of strings, rather than failing the whole family — the Family object
     /// rides on `/me`, which the app bootstraps from.
     let greetingPlaces: [String]
+    /// "owner" | "member" — the CALLER's role in this family, carried by
+    /// each entry of `GET /me`'s `families` (docs/protocol.md, "Several
+    /// families", 2026-10-22). Nil on every other read of a family, where
+    /// the role arrives beside it rather than inside it.
+    var role: String?
+    /// "free" | "paid", present only while the server's subscriptions are
+    /// on (docs/protocol.md, "Paid families", 2026-10-30). Nil is a server
+    /// where payment does not apply, which is every family on one that has
+    /// them off.
+    var plan: String?
+    /// The most members this family may have whatever its owner sets — the
+    /// operator's ceiling, or a paid family's lower limit. Nil from a server
+    /// that predates it, where the cap picker falls back to
+    /// `MeResponse.maxFamilyMembers` (`MemberCap.ceiling`).
+    let memberCeiling: Int?
+    /// When the server will delete this family, present only while it is a
+    /// PAID family its owner's subscription does not cover. Every member's
+    /// chat list shows it as a banner; a `family_plan` frame without it
+    /// clears it.
+    var deleteAt: Date?
 
     enum CodingKeys: String, CodingKey {
         case id
         case name
+        case role
+        case plan
+        case memberCeiling = "member_ceiling"
+        case deleteAt = "delete_at"
         case joinPolicy = "join_policy"
         case createdAt = "created_at"
         case inviteCode = "invite_code"
@@ -398,10 +434,22 @@ nonisolated struct FamilyDTO: Codable, Equatable, Sendable {
         // empty list, and the owner's next added place would replace the
         // ones the server holds.
         greetingPlaces: [String],
-        maxMembers: Int?
+        maxMembers: Int?,
+        // And the three paid-family fields, undefaulted for the reason the
+        // switches are: a field-by-field rebuild that dropped `deleteAt`
+        // would take the deletion banner away after an owner changed the
+        // cap, while the server still meant to delete the family.
+        plan: String?,
+        memberCeiling: Int?,
+        deleteAt: Date?,
+        role: String? = nil
     ) {
         self.id = id
         self.name = name
+        self.role = role
+        self.plan = plan
+        self.memberCeiling = memberCeiling
+        self.deleteAt = deleteAt
         self.joinPolicy = joinPolicy
         self.createdAt = createdAt
         self.inviteCode = inviteCode
@@ -459,6 +507,30 @@ nonisolated struct FamilyDTO: Codable, Equatable, Sendable {
         // field sends no place anywhere. Tolerant of a malformed value for
         // the same reason, so a bad list costs the editor, not the family.
         greetingPlaces = ((try? container.decodeIfPresent([String].self, forKey: .greetingPlaces)) ?? nil) ?? []
+        role = try container.decodeIfPresent(String.self, forKey: .role)
+        // Paid families (2026-10-30). All three absent on a server from
+        // before them, or with subscriptions off — the old behaviour.
+        plan = try container.decodeIfPresent(String.self, forKey: .plan)
+        memberCeiling = try container.decodeIfPresent(Int.self, forKey: .memberCeiling)
+        deleteAt = try container.decodeIfPresent(Date.self, forKey: .deleteAt)
+    }
+
+    /// The same family, as the caller now holds it in a different role —
+    /// what a `family_owner` frame does to one entry of the family list.
+    func withRole(_ role: String?) -> FamilyDTO {
+        var copy = self
+        copy.role = role
+        return copy
+    }
+
+    /// The same family after a `family_plan` frame: its plan, and its
+    /// deletion date — which the frame CLEARS by leaving it out
+    /// (docs/protocol.md, "Paid families").
+    func withPlan(_ plan: String?, deleteAt: Date?) -> FamilyDTO {
+        var copy = self
+        copy.plan = plan
+        copy.deleteAt = deleteAt
+        return copy
     }
 }
 
@@ -626,16 +698,35 @@ nonisolated struct AssistantReportResponse: Codable, Equatable, Sendable {
 
 nonisolated struct ChatDTO: Codable, Equatable, Sendable {
     let id: Int64
-    /// "family" | "direct"
+    /// "family" | "direct" | "ai" | "group"
     let kind: String
+    /// The family's name, the peer's display name, the assistant's name —
+    /// or, for a group, the name its admin last gave it.
     let title: String
     let peerUserID: Int64?
+    /// A GROUP's members, the caller included, in the order they joined
+    /// (docs/protocol.md, "Groups", 2026-10-22). Absent on every other
+    /// kind, and so nil — never an empty list, which would be a group of
+    /// nobody.
+    var memberIDs: [Int64]? = nil
+    /// A GROUP's admin: the one member who may rename it, add and remove
+    /// members, and delete it. Absent on every other kind.
+    var adminUserID: Int64? = nil
+    /// The families this chat is listed in (docs/protocol.md, "Several
+    /// families", 2026-10-22): exactly one for a family chat, a group and
+    /// an `ai` chat, and every family the two people share for a direct
+    /// chat. Nil from a server that predates it, where it means the one
+    /// family the account has.
+    var familyIDs: [Int64]? = nil
 
     enum CodingKeys: String, CodingKey {
         case id
         case kind
         case title
         case peerUserID = "peer_user_id"
+        case memberIDs = "member_ids"
+        case adminUserID = "admin_user_id"
+        case familyIDs = "family_ids"
     }
 }
 
@@ -826,6 +917,13 @@ nonisolated struct AttachmentDTO: Codable, Hashable, Identifiable, Sendable {
     /// `isRound`, with the coding key `round`, so nothing here shadows
     /// Swift's own `round(_:)`.
     let isRound: Bool
+    /// True when (and only when) the message that carries this was sent as
+    /// an ANIMATION (docs/protocol.md, "Animations", #96): an animated
+    /// picture the sender made into a silent looping MP4 — still a
+    /// `kind=video` in every other respect, drawn as a picture that moves.
+    /// Absent on the wire when false — never `false` — and never beside
+    /// `sticker` or `round`. Drawn only through `isAnimation`.
+    let animation: Bool
     /// A voice note's shape (docs/protocol.md, "A voice note's waveform",
     /// #79): exactly 48 lowercase hex digits, levels 0–15 in time order,
     /// computed by the sender from its meter. Audio only, and only when the
@@ -850,6 +948,7 @@ nonisolated struct AttachmentDTO: Codable, Hashable, Identifiable, Sendable {
         case accuracyM = "accuracy_m"
         case sticker
         case isRound = "round"
+        case animation
         case waveform
     }
 
@@ -868,6 +967,7 @@ nonisolated struct AttachmentDTO: Codable, Hashable, Identifiable, Sendable {
         accuracyM: Int?,
         sticker: Bool = false,
         isRound: Bool = false,
+        animation: Bool = false,
         waveform: String? = nil
     ) {
         self.id = id
@@ -884,6 +984,7 @@ nonisolated struct AttachmentDTO: Codable, Hashable, Identifiable, Sendable {
         self.accuracyM = accuracyM
         self.sticker = sticker
         self.isRound = isRound
+        self.animation = animation
         self.waveform = waveform
     }
 
@@ -908,6 +1009,7 @@ nonisolated struct AttachmentDTO: Codable, Hashable, Identifiable, Sendable {
         accuracyM = try container.decodeIfPresent(Int.self, forKey: .accuracyM)
         sticker = try container.decodeIfPresent(Bool.self, forKey: .sticker) ?? false
         isRound = try container.decodeIfPresent(Bool.self, forKey: .isRound) ?? false
+        animation = try container.decodeIfPresent(Bool.self, forKey: .animation) ?? false
         // `try?`: a malformed value (a number, an object) must not cost the
         // whole message — it draws as the placeholder, like an unparseable
         // string does.
@@ -933,10 +1035,17 @@ nonisolated struct AttachmentDTO: Codable, Hashable, Identifiable, Sendable {
         try container.encodeIfPresent(accuracyM, forKey: .accuracyM)
         if sticker { try container.encode(true, forKey: .sticker) }
         if isRound { try container.encode(true, forKey: .isRound) }
+        if animation { try container.encode(true, forKey: .animation) }
         try container.encodeIfPresent(waveform, forKey: .waveform)
     }
 
     var isVideo: Bool { kind == Kind.video }
+    /// Drawn as an ANIMATION (docs/protocol.md, "How it is drawn"): a video
+    /// carrying the flag. The flag on anything else draws as what it is.
+    /// The protocol's test is a MESSAGE's — exactly one attachment — and
+    /// the server refuses the flag on any other send, so the attachment's
+    /// own answer is the message's.
+    var isAnimation: Bool { animation && isVideo }
     var isFile: Bool { kind == Kind.file }
     var isAudio: Bool { kind == Kind.audio }
     var isLocation: Bool { kind == Kind.location }
@@ -976,6 +1085,7 @@ nonisolated struct AttachmentDTO: Codable, Hashable, Identifiable, Sendable {
             accuracyM: accuracyM,
             sticker: sticker,
             isRound: isRound,
+            animation: animation,
             waveform: waveform)
     }
 
@@ -1310,12 +1420,61 @@ nonisolated struct MeResponse: Codable, Equatable, Sendable {
     /// Null both when they have not agreed and when the server has no
     /// lookup source; absent — nil — on a server that predates it.
     var assistantLookupConsentAt: Date?
+    /// Every family the caller is in, home family first, each with its own
+    /// `role` (docs/protocol.md, "Several families", 2026-10-22). NIL — not
+    /// empty — from a server that predates several families: that is how
+    /// this client knows to speak to it about `family` alone, by the old
+    /// paths (`FamilyRules.families(from:)`). `[]` is an account in none.
+    var families: [FamilyDTO]?
+    /// The caller's pending join requests, to any number of families.
+    /// Always present beside `families`; `[]` from an older server, which
+    /// carries its one request in `pendingJoinRequest`.
+    var pendingJoinRequests: [PendingJoinRequestDTO] = []
+    /// Invitations waiting on the caller, oldest first.
+    var invitations: [InvitationDTO] = []
+    /// `[families] member_families`: whether a member may start another
+    /// family in the app. False from a server that predates it, which has
+    /// no such door.
+    var memberFamiliesEnabled: Bool = false
+    /// The most families one account may be in; 1 from a server that
+    /// predates several families, which is the truth there.
+    var maxFamiliesPerAccount: Int = 1
+    /// `[subscriptions] enabled`: whether a NEW family on this server needs
+    /// its owner's App Store subscription (docs/protocol.md, "Paid
+    /// families", 2026-10-30). ALWAYS present on a current server; false
+    /// for one that predates it, which is also the truth there. Everything
+    /// below is meaningful only while this is true.
+    var subscriptionsEnabled: Bool = false
+    /// The operator's product ids, in the order given — what the
+    /// subscription screen sells.
+    var subscriptionProducts: [String] = []
+    /// The random UUID this server keeps for the account, which a purchase
+    /// carries as `appAccountToken` so Apple learns nothing about who it is.
+    var appAccountToken: String?
+    /// Days an unpaid family has before it is deleted.
+    var unpaidDays: Int?
+    /// What a paid family gets, each limit present only while it is on.
+    var paidFamilyLimits: PaidFamilyLimitsDTO?
+    /// The caller's own subscription — the active one, else the one that
+    /// ended last — or nil when they never had one.
+    var subscription: SubscriptionDTO?
 
     enum CodingKeys: String, CodingKey {
         case user
         case family
         case role
+        case subscriptionsEnabled = "subscriptions_enabled"
+        case subscriptionProducts = "subscription_products"
+        case appAccountToken = "app_account_token"
+        case unpaidDays = "unpaid_days"
+        case paidFamilyLimits = "paid_family_limits"
+        case subscription
         case pendingJoinRequest = "pending_join_request"
+        case families
+        case pendingJoinRequests = "pending_join_requests"
+        case invitations
+        case memberFamiliesEnabled = "member_families_enabled"
+        case maxFamiliesPerAccount = "max_families_per_account"
         case callsEnabled = "calls_enabled"
         case videoCallsEnabled = "video_calls_enabled"
         case blockedUserIDs = "blocked_user_ids"
@@ -1342,8 +1501,30 @@ nonisolated struct MeResponse: Codable, Equatable, Sendable {
         familylessAccountTTLDays: Int = 0,
         greetingsEnabled: Bool = false,
         assistantConsentAt: Date? = nil,
-        assistantLookupConsentAt: Date? = nil
+        assistantLookupConsentAt: Date? = nil,
+        families: [FamilyDTO]? = nil,
+        pendingJoinRequests: [PendingJoinRequestDTO] = [],
+        invitations: [InvitationDTO] = [],
+        memberFamiliesEnabled: Bool = false,
+        maxFamiliesPerAccount: Int = 1,
+        subscriptionsEnabled: Bool = false,
+        subscriptionProducts: [String] = [],
+        appAccountToken: String? = nil,
+        unpaidDays: Int? = nil,
+        paidFamilyLimits: PaidFamilyLimitsDTO? = nil,
+        subscription: SubscriptionDTO? = nil
     ) {
+        self.subscriptionsEnabled = subscriptionsEnabled
+        self.subscriptionProducts = subscriptionProducts
+        self.appAccountToken = appAccountToken
+        self.unpaidDays = unpaidDays
+        self.paidFamilyLimits = paidFamilyLimits
+        self.subscription = subscription
+        self.families = families
+        self.pendingJoinRequests = pendingJoinRequests
+        self.invitations = invitations
+        self.memberFamiliesEnabled = memberFamiliesEnabled
+        self.maxFamiliesPerAccount = maxFamiliesPerAccount
         self.user = user
         self.family = family
         self.role = role
@@ -1388,7 +1569,109 @@ nonisolated struct MeResponse: Codable, Equatable, Sendable {
         // the same answer as null.
         assistantLookupConsentAt = try container.decodeIfPresent(
             Date.self, forKey: .assistantLookupConsentAt)
+        // Several families (2026-10-22). Absent on a server from before
+        // them — `families` stays nil, which is the one signal that this
+        // server must be spoken to about the home family alone.
+        families = try container.decodeIfPresent([FamilyDTO].self, forKey: .families)
+        pendingJoinRequests = try container.decodeIfPresent(
+            [PendingJoinRequestDTO].self, forKey: .pendingJoinRequests) ?? []
+        invitations = try container.decodeIfPresent([InvitationDTO].self, forKey: .invitations) ?? []
+        memberFamiliesEnabled = try container.decodeIfPresent(Bool.self, forKey: .memberFamiliesEnabled) ?? false
+        maxFamiliesPerAccount = try container.decodeIfPresent(Int.self, forKey: .maxFamiliesPerAccount) ?? 1
+        // Paid families (2026-10-30). Absent on a server from before them,
+        // which charges for nothing — so absence reads as off, and the rest
+        // is read only for a server that says on.
+        subscriptionsEnabled = try container.decodeIfPresent(Bool.self, forKey: .subscriptionsEnabled) ?? false
+        subscriptionProducts = try container.decodeIfPresent([String].self, forKey: .subscriptionProducts) ?? []
+        appAccountToken = try container.decodeIfPresent(String.self, forKey: .appAccountToken)
+        unpaidDays = try container.decodeIfPresent(Int.self, forKey: .unpaidDays)
+        paidFamilyLimits = try container.decodeIfPresent(PaidFamilyLimitsDTO.self, forKey: .paidFamilyLimits)
+        subscription = try container.decodeIfPresent(SubscriptionDTO.self, forKey: .subscription)
     }
+}
+
+/// An App Store subscription as the server holds it (docs/protocol.md,
+/// "Paid families", 2026-10-30) — the caller's own, on `GET /me` and as the
+/// answer to `PUT /me/subscription`.
+nonisolated struct SubscriptionDTO: Codable, Equatable, Sendable {
+    let productID: String
+    /// "Production" | "Sandbox"
+    let environment: String
+    /// When it stops covering anything: the expiry, or Apple's grace-period
+    /// end when that is later.
+    let expiresAt: Date
+    /// Not revoked or refunded, and `expiresAt` still ahead.
+    let active: Bool
+    /// Whether it will renew, when the server knows; nil when it does not.
+    var renews: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case productID = "product_id"
+        case environment
+        case expiresAt = "expires_at"
+        case active
+        case renews
+    }
+}
+
+/// What a paid family gets (`paid_family_limits` on `GET /me`). Each limit
+/// is present only while the operator has it on, so the subscription screen
+/// says only what is true on this server.
+nonisolated struct PaidFamilyLimitsDTO: Codable, Equatable, Sendable {
+    var members: Int?
+    var storageBytes: Int64?
+    var aiTokens: Int64?
+    var images: Int?
+    var transcriptMS: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case members
+        case storageBytes = "storage_bytes"
+        case aiTokens = "ai_tokens"
+        case images
+        case transcriptMS = "transcript_ms"
+    }
+
+    /// Any of the assistant's three monthly limits.
+    var limitsAssistant: Bool {
+        aiTokens != nil || images != nil || transcriptMS != nil
+    }
+}
+
+/// `PUT /me/subscription` reply — the caller's resulting subscription,
+/// which is not necessarily the one just sent.
+nonisolated struct SubscriptionResponse: Codable, Equatable, Sendable {
+    let subscription: SubscriptionDTO?
+}
+
+/// An owner's invitation into their family, pending until the invited
+/// person accepts or declines (docs/protocol.md, "Several families",
+/// 2026-10-22). `user` is the invited person; the owner's own list and the
+/// invited person's list carry the same object.
+nonisolated struct InvitationDTO: Codable, Equatable, Identifiable, Sendable {
+    let id: Int64
+    let familyID: Int64
+    let familyName: String
+    let invitedBy: UserDTO
+    let user: UserDTO
+    let createdAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case familyID = "family_id"
+        case familyName = "family_name"
+        case invitedBy = "invited_by"
+        case user
+        case createdAt = "created_at"
+    }
+}
+
+nonisolated struct InvitationResponse: Codable, Equatable, Sendable {
+    let invitation: InvitationDTO
+}
+
+nonisolated struct InvitationsResponse: Codable, Equatable, Sendable {
+    let invitations: [InvitationDTO]
 }
 
 /// The body of a `POST /families/leave` that handed the family on. Absent
@@ -1409,6 +1692,15 @@ nonisolated struct FamilyResponse: Codable, Equatable, Sendable {
 nonisolated struct JoinResponse: Codable, Equatable, Sendable {
     /// "joined" | "pending"
     let status: String
+    /// The family the code belongs to — the one joined, or waited on
+    /// (docs/protocol.md, `POST /families/join`, 2026-10-22). Nil from a
+    /// server that predates it.
+    var familyID: Int64? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case familyID = "family_id"
+    }
 }
 
 /// The assistant, as `GET /families/mine` reports it.
@@ -1747,6 +2039,10 @@ nonisolated struct NoteDTO: Codable, Equatable, Sendable {
     /// makes it, and not `boardSeq`, the number a badge may count.
     let contentSeq: Int64?
     let deleted: Bool?
+    /// The family whose board the note is on (docs/protocol.md, "Several
+    /// families", 2026-10-22). Nil from a server that predates it, where
+    /// the board is the one family's.
+    var familyID: Int64? = nil
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -1770,6 +2066,7 @@ nonisolated struct NoteDTO: Codable, Equatable, Sendable {
         case boardSeq = "board_seq"
         case contentSeq = "content_seq"
         case deleted
+        case familyID = "family_id"
     }
 
     var isTombstone: Bool { deleted == true }
@@ -1849,6 +2146,9 @@ nonisolated struct PackItemDTO: Codable, Equatable, Sendable {
     let createdAt: Date?
     let packSeq: Int64
     let deleted: Bool?
+    /// Whose pack it is in (docs/protocol.md, "Several families",
+    /// 2026-10-22). Nil from a server that predates it.
+    var familyID: Int64?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -1858,6 +2158,7 @@ nonisolated struct PackItemDTO: Codable, Equatable, Sendable {
         case createdAt = "created_at"
         case packSeq = "pack_seq"
         case deleted
+        case familyID = "family_id"
     }
 
     var isTombstone: Bool { deleted == true }
@@ -1869,7 +2170,8 @@ nonisolated struct PackItemDTO: Codable, Equatable, Sendable {
         label: String? = nil,
         createdAt: Date? = nil,
         packSeq: Int64,
-        deleted: Bool? = nil
+        deleted: Bool? = nil,
+        familyID: Int64? = nil
     ) {
         self.id = id
         self.addedBy = addedBy
@@ -1878,6 +2180,7 @@ nonisolated struct PackItemDTO: Codable, Equatable, Sendable {
         self.createdAt = createdAt
         self.packSeq = packSeq
         self.deleted = deleted
+        self.familyID = familyID
     }
 }
 
@@ -2063,6 +2366,35 @@ nonisolated struct APIErrorBody: Codable, Equatable, Sendable {
 nonisolated struct FamilyStatsDTO: Codable, Equatable, Sendable {
     let totals: StatsTotalsDTO
     let members: [MemberStatsDTO]
+    /// What a PAID family has used of its limits, and when the monthly ones
+    /// start again (docs/protocol.md, "Family statistics", amended
+    /// 2026-10-30). Absent for a free family and on a server with
+    /// subscriptions off — and then no section is drawn.
+    var allowance: AllowanceDTO?
+}
+
+/// A paid family's allowance. Each limit is absent when the operator turned
+/// that one off.
+nonisolated struct AllowanceDTO: Codable, Equatable, Sendable {
+    /// The start of the next UTC month, when the monthly limits renew.
+    let renewsAt: Date
+    var storageBytes: AllowanceUsageDTO?
+    var aiTokens: AllowanceUsageDTO?
+    var images: AllowanceUsageDTO?
+    var transcriptMS: AllowanceUsageDTO?
+
+    enum CodingKeys: String, CodingKey {
+        case renewsAt = "renews_at"
+        case storageBytes = "storage_bytes"
+        case aiTokens = "ai_tokens"
+        case images
+        case transcriptMS = "transcript_ms"
+    }
+}
+
+nonisolated struct AllowanceUsageDTO: Codable, Equatable, Sendable {
+    let used: Int64
+    let limit: Int64
 }
 
 nonisolated struct StatsTotalsDTO: Codable, Equatable, Sendable {

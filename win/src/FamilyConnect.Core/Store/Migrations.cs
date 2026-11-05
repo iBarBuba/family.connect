@@ -334,8 +334,66 @@ public static class Migrations
     ];
 
     /// <summary>
+    /// Step 9: ANIMATIONS (docs/protocol.md, "Animations"; issue #96). The one bit a queued send needs to stay an animation
+    /// across a relaunch — step 6's round column, one over. Its default is what every row already in the outbox means.
+    /// </summary>
+    private static readonly string[] Nine =
+    [
+        // A queued send that is an ANIMATION: without it a GIF queued offline would land as an ordinary video.
+        "ALTER TABLE outbox ADD COLUMN animation INTEGER NOT NULL DEFAULT 0",
+    ];
+
+    /// <summary>
+    /// Step 10: GROUPS (docs/protocol.md, "Groups"; issue #107). A group's members and its admin, kept on its chat row so a
+    /// window can draw its info, offer its mentions and decide who may manage it without asking first. Both are the server's
+    /// and are written whole by every list read and every <c>chat_updated</c>; NULL on every other kind. Nothing held is read
+    /// again: a group an older build cached as a plain chat gains its members with the next list read.
+    /// </summary>
+    private static readonly string[] Ten =
+    [
+        // The wire's own array, verbatim and in join order: a list the server owns whole and replaces whole.
+        "ALTER TABLE chats ADD COLUMN member_ids_json TEXT",
+        "ALTER TABLE chats ADD COLUMN admin_user_id INTEGER",
+    ];
+
+    /// <summary>
+    /// Step 11: SEVERAL FAMILIES (docs/protocol.md, "Several families"; issue #88). Which family each held thing belongs to: a
+    /// chat's <c>family_ids</c> (the wire's array, verbatim — a direct chat is listed in every family the two share), a note's
+    /// and a pack item's family, and the roster PER FAMILY — a person is one row of <c>members</c> (their name, picture and
+    /// birthday are the account's) and one row here for each family this device holds them in, with that family's role.
+    /// </summary>
+    /// <remarks>
+    /// NOTHING HELD IS READ AGAIN OR DELETED. Every row an older build cached was the HOME family's — an app from before
+    /// several families saw nothing else — but the home family's id is not in this file, so the new columns start NULL and
+    /// <see cref="Database.AdoptLegacy"/> stamps them with it once the first <c>GET /me</c> names it. A chat whose
+    /// <c>family_ids</c> is NULL is shown in the home family alone until the next list read writes it.
+    /// </remarks>
+    private static readonly string[] Eleven =
+    [
+        "ALTER TABLE chats ADD COLUMN family_ids_json TEXT",
+        "ALTER TABLE notes ADD COLUMN family_id INTEGER",
+        "ALTER TABLE pack_items ADD COLUMN family_id INTEGER",
+        """
+        -- One row per person per family this device holds a roster for. The person's own fields stay on `members`; what is
+        -- the FAMILY's — the role, whether they have left it, whether its owner may reset their password — is here.
+        CREATE TABLE family_members (
+            family_id      INTEGER NOT NULL,
+            user_id        INTEGER NOT NULL,
+            -- "owner" or "member", and NULL for a former member, as on `members`.
+            role           TEXT,
+            has_left       INTEGER NOT NULL DEFAULT 0,
+            -- The owner's own read only: 1 may reset, 0 may not, NULL not said (anybody else's read, an older server).
+            password_reset INTEGER,
+            PRIMARY KEY (family_id, user_id)
+        )
+        """,
+        "CREATE INDEX notes_by_family ON notes(family_id)",
+        "CREATE INDEX pack_items_by_family ON pack_items(family_id)",
+    ];
+
+    /// <summary>
     /// Every step, in order. The index is the version it upgrades FROM, so
     /// <c>All.Count</c> is the schema this build expects.
     /// </summary>
-    public static readonly IReadOnlyList<string[]> All = [One, Two, Three, Four, Five, Six, Seven, Eight];
+    public static readonly IReadOnlyList<string[]> All = [One, Two, Three, Four, Five, Six, Seven, Eight, Nine, Ten, Eleven];
 }

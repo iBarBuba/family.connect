@@ -26,6 +26,10 @@
  *    (`VideoCapture.targetRotation`, S3.5) and kept until Stop.
  *  - The microphone opens with the recording (`withAudioEnabled` at Record),
  *    never in PREVIEW, so no indicator contradicts "Not recording" (S3.4).
+ *  - Every event's audio state is read (issue #98): CameraX does NOT stop a
+ *    take whose microphone is taken or silenced — it records the picture
+ *    alone, or zeros — so the recorder is told (`microphoneTaken`) and
+ *    stops into REVIEW with the sentence (S4).
  *
  * Nothing here can run on the JVM; VideoMessageRecorderTest drives the
  * recorder with a fake [CameraSession]. What it needs a device for —
@@ -68,6 +72,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.Observer
 import java.io.File
+import androidx.core.graphics.get
 
 /**
  * The lifecycle CameraX is bound to: the recorder's, not any activity's.
@@ -102,6 +107,9 @@ class CameraXSession(context: Context) : CameraSession {
     private var previewView: PreviewView? = null
     private var front = true
     private var open = false
+
+    /** The take's lost microphone has been reported: once per take is enough. */
+    private var microphoneReported = false
 
     /** Whether the stream reached the PreviewView: the first frame (S3.4). */
     private val streamObserver = Observer<PreviewView.StreamState> { stream ->
@@ -140,7 +148,7 @@ class CameraXSession(context: Context) : CameraSession {
             while (y < frame.height) {
                 var x = 0
                 while (x < frame.width) {
-                    sum += RoundRecorderRules.luma(frame.getPixel(x, y))
+                    sum += RoundRecorderRules.luma(frame[x, y])
                     count++
                     x += stepX
                 }
@@ -260,6 +268,7 @@ class CameraXSession(context: Context) : CameraSession {
         // The capture angle, fixed at Record (S3.5).
         output.targetRotation = rotation
         val options = FileOutputOptions.Builder(file).setDurationLimitMillis(limitMs).build()
+        microphoneReported = false
         recording = runCatching {
             output.output.prepareRecording(context, options)
                 .withAudioEnabled()
@@ -272,8 +281,18 @@ class CameraXSession(context: Context) : CameraSession {
     }
 
     private fun onEvent(file: File, event: VideoRecordEvent) {
+        // Before the microphone is reported, so the stop it leads to finds
+        // no live Recording to stop a second time.
+        if (event is VideoRecordEvent.Finalize) recording = null
+        // Status arrives all through a take, and Finalize carries the last
+        // stats — what a take stopped before any Status still has to say.
+        val audio = event.recordingStats.audioStats.audioState
+        if (!microphoneReported && RoundRecorderRules.microphoneLost(audio)) {
+            microphoneReported = true
+            Log.w(TAG, "the microphone went mid-take: audio state $audio")
+            listener?.microphoneTaken()
+        }
         if (event !is VideoRecordEvent.Finalize) return
-        recording = null
         val error = event.error
         val durationMs = event.recordingStats.recordedDurationNanos / 1_000_000L
         val capReached = error == VideoRecordEvent.Finalize.ERROR_DURATION_LIMIT_REACHED

@@ -40,8 +40,84 @@ registration = true
 # they last left a family; an account with a join request still waiting is
 # never removed, and the removal is the same scrub POST /me/delete performs
 # (the username is freed, their words in a family chat stay under "Deleted
-# account"). Checked hourly. 0 turns it off.
+# account"). Checked hourly. 0 turns it off. An account is "without a family"
+# only once it has left its LAST one.
 familyless_account_ttl_days = 7
+# Whether a member who is already in a family may start ANOTHER one from
+# inside the app — somebody in their parents' family who marries and starts
+# their own, staying in both with one login. This is NOT `registration`:
+# that one is about a stranger's first family, so a server closed to
+# strangers can still let its members start theirs by setting this to true.
+# LEFT UNSET it follows `registration`, so a server closed with
+# `registration = false` is not reopened by an upgrade. An account may
+# create a family only while it owns none.
+# member_families = true
+# The most families one account may belong to, however it got into them —
+# creating one, an owner's invitation, or an invite code. At least 1.
+max_families_per_account = 5
+
+[subscriptions]
+# Whether a NEW family on this server needs its owner's App Store
+# subscription (docs/protocol.md, "Paid families"). Off by default, and off
+# means none of this section is read: no plans, no limits, no deadlines.
+#
+# Only the Family Connect app on iPhone, iPad and Mac can sell it, so with
+# this on a family is started from there — the other apps say so and still
+# JOIN families as before. Members never pay; one owner's subscription covers
+# every family they own.
+#
+# It narrows the doors above and never opens one: with `registration` or
+# `member_families` shut, that door stays shut whatever this says.
+#
+# Every family that exists when you first turn this on stays FREE, your own
+# included, and so does every family created while it is off. Move one with
+#     family-connect families plan <id> paid      (or free)
+# and see them all with `family-connect families list`.
+#
+# The subscription is sold by the app's publisher, so this is meant for the
+# publisher's own server. It needs App Store Connect set up to match (the
+# products below, and the notification URL
+# https://<this server>/api/v1/appstore/notifications) — docs/operations.md,
+# "Paid families", has the steps.
+enabled = false
+# The app whose purchases count. A signed transaction for any other bundle is
+# refused.
+bundle_id = "me.nettrash.FamilyConnect"
+# The auto-renewable subscriptions that host a family, in the order the app
+# shows them. All in one subscription group in App Store Connect.
+product_ids = [
+    "me.nettrash.FamilyConnect.family.monthly",
+    "me.nettrash.FamilyConnect.family.yearly",
+]
+# Which App Store environments to believe. App Review and TestFlight buy in
+# "Sandbox" against your production server, so leave it in unless you never
+# want a reviewer to be able to start a family. A Sandbox subscription stops
+# renewing within hours (TestFlight within days), so its family is deleted
+# unpaid_days later on its own.
+environments = ["Production", "Sandbox"]
+# How many days a paid family stays after its owner's subscription ends,
+# counted from when the server notices (within the hour). Every member is
+# told at the start and the day before; then the family is deleted with its
+# chats, board and files. Renewing at any point before that cancels it.
+# Everything keeps working until then. 1 to 365.
+unpaid_days = 14
+# The limits of a PAID family. Free families have none of these. 0 turns
+# one off. Lowering one removes nothing: a family past it just cannot add
+# more until it is back under.
+#
+# Members: the family's ceiling is the lowest of this, [limits]
+# max_family_members and the owner's own cap.
+max_members = 25
+# Bytes on your disk: every file uploaded for the family — messages, board
+# pictures, stickers, uploads not sent yet — each distinct file once.
+# Previews are small and not counted. 10 GiB.
+storage_bytes = 10737418240
+# The assistant, per UTC calendar month: tokens (prompt plus completion, as
+# Family Statistics counts them), pictures, and minutes of transcripts.
+# Checked before a call, so one answer may overshoot by its own size.
+ai_tokens_per_month = 2000000
+images_per_month = 30
+transcript_minutes_per_month = 120
 
 [greetings]
 # The assistant's one unprompted message a day (protocol.md, "The daily
@@ -288,6 +364,16 @@ include_message_body = true
 #
 # The default matches the systemd unit's StateDirectory=family-connect.
 attachments_dir = "/var/lib/family-connect/attachments"
+
+# The server key: everything people wrote, said, showed or are is sealed
+# before it reaches PostgreSQL or the disk, and this file is what opens it
+# (docs/operations.md, "Encryption at rest"). Required — the server refuses to
+# start without it, and with the wrong one. Make it once with
+#   sudo family-connect storage-key new /etc/family-connect/storage.key
+# (owner family-connect, mode 0400), and copy it off the box by hand
+# (`family-connect storage-key show`). It is in no backup, deliberately:
+# LOSING IT LOSES EVERY FAMILY ON THIS SERVER.
+key_file = "/etc/family-connect/storage.key"
 
 # ---------------------------------------------------------------------------
 # Voice calls

@@ -12,7 +12,7 @@
 //  something, not having said it.
 //
 //  The list is every chat a file may land in: the family chat pinned
-//  first, direct chats by recency — the chat list's own order — and
+//  first, direct chats and groups by recency — the chat list's own order — and
 //  never the assistant's chat, which takes no attachments
 //  (ShareImport.isEligible; the server would refuse the send).
 //
@@ -29,14 +29,21 @@ struct ShareTargetPicker: View {
     var onChoose: (Int64) -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(AppSession.self) private var session
     @Query private var chats: [ChatEntity]
     @Query private var members: [MemberEntity]
 
     /// Eligible chats in the chat list's order: family first (pinRank),
-    /// then recency, then stable id.
+    /// then recency, then stable id — the CURRENT family's chats, as the
+    /// list beneath shows them, so "the family chat" here is that family's
+    /// (docs/protocol.md, "Several families").
     private var eligibleChats: [ChatEntity] {
         chats
             .filter { ShareImport.isEligible(chatKind: $0.kind) }
+            .filter {
+                FamilyRules.isListed(
+                    chatFamilyIDs: $0.familyIDs, in: session.currentFamilyID, home: session.homeFamilyID)
+            }
             .sorted { a, b in
                 if a.pinRank != b.pinRank { return a.pinRank < b.pinRank }
                 let dateA = a.lastMessageDate ?? .distantPast
@@ -60,6 +67,7 @@ struct ShareTargetPicker: View {
                         InitialsAvatar(
                             title: chat.title,
                             isFamily: chat.kind == "family",
+                            isGroup: chat.kind == ChatRules.group,
                             userID: chat.peerUserID,
                             avatarVersion: chat.peerUserID
                                 .flatMap { avatarVersions[$0] } ?? 0)

@@ -180,6 +180,7 @@
     <string name="s_your_other_devices_will_be_signed_out_this_one_stays_signe">Ostali tvoji uređaji biće odjavljeni. Ovaj ostaje prijavljen.</string>
     <string name="e_action_failed">Radnja nije uspela</string>
     <string name="e_already_in_family">Već si u porodici — povuci da osvežiš</string>
+    <string name="e_already_in_that_family">Već si u toj porodici.</string>
     <string name="e_change_password_failed">Lozinka nije promenjena.</string>
     <string name="e_change_policy_failed">Pravilo nije promenjeno</string>
     <string name="e_create_family_failed">Porodica nije napravljena</string>
@@ -199,7 +200,11 @@
     <string name="e_nothing_to_paste">Nema šta da se nalepi.</string>
     <string name="e_open_chat_failed">Razgovor ne može da se otvori</string>
     <string name="e_password_too_short">Najmanje 8 znakova</string>
-    <string name="e_paste_truncated">Poruka može imati najviše %1$d znakova. Ostatak nije nalepljen.</string>
+    <plurals name="e_paste_truncated">
+        <item quantity="one">Poruka može imati najviše %1$d znak. Ostatak nije nalepljen.</item>
+        <item quantity="few">Poruka može imati najviše %1$d znaka. Ostatak nije nalepljen.</item>
+        <item quantity="other">Poruka može imati najviše %1$d znakova. Ostatak nije nalepljen.</item>
+    </plurals>
     <string name="e_prepare_failed">Ta stavka nije pripremljena.</string>
     <string name="e_read_file_failed">Ta datoteka ne može da se pročita.</string>
     <string name="e_rotate_failed">Promena koda nije uspela</string>
@@ -223,10 +228,10 @@
     <string name="s_request_declined_explanation">Vlasnik porodice je odbio tvoj zahtev. Možeš da probaš drugi pozivni kod ili da napraviš svoju porodicu.</string>
     <string name="s_waiting_explanation">Odavde nema šta da se otkaže — vlasnik će te ili pustiti unutra ili odbiti zahtev.</string>
     <string name="s_family_language">Jezik porodice</string>
-    <string name="s_family_language_explanation">Jezik na kom asistent odgovara kada ga pitaš u porodičnom razgovoru. Jezik same aplikacije se time ne menja. Ako ništa nije izabrano, odgovor stiže na jeziku pitanja.</string>
+    <string name="s_family_language_explanation">Jezik na kom asistent odgovara kada ga pitaš u porodičnom razgovoru ili grupi. Jezik same aplikacije se time ne menja. Ako ništa nije izabrano, odgovor stiže na jeziku pitanja.</string>
     <string name="s_not_set">Nije podešeno</string>
     <string name="s_assistant_history">Asistent vidi nedavnu istoriju</string>
-    <string name="s_assistant_history_explanation">Kada neko pomene asistenta u porodičnom razgovoru, uz pitanje se šalje i prepiska iz poslednjih mesec dana, pa može da odgovori i na ono što je ranije rečeno. Kada je isključeno, šalje se samo poruka u kojoj se pominje.</string>
+    <string name="s_assistant_history_explanation">Kada neko pomene asistenta u porodičnom razgovoru ili grupi, uz pitanje se šalje i prepiska iz poslednjih mesec dana, pa može da odgovori i na ono što je ranije rečeno. Kada je isključeno, šalje se samo poruka u kojoj se pominje.</string>
     <string name="s_birthday">Rođendan</string>
     <string name="s_birthday_for">Rođendan za %1$s</string>
     <string name="s_day_and_month_no_year">Dan i mesec. Nema godine, pa ni uzrasta.</string>
@@ -289,10 +294,18 @@
     <string name="s_flip_camera">Promeni kameru</string>
     <string name="e_camera_permission">Family treba dozvolu za korišćenje kamere.</string>
     <string name="s_video_calls_are_off_on_this_server">Video pozivi su isključeni na ovom serveru</string>
-    <string name="e_attachment_limit">Poruka može da nosi najviše %1$d priloga.</string>
+    <plurals name="e_attachment_limit">
+        <item quantity="one">Poruka može da nosi najviše %1$d prilog.</item>
+        <item quantity="few">Poruka može da nosi najviše %1$d priloga.</item>
+        <item quantity="other">Poruka može da nosi najviše %1$d priloga.</item>
+    </plurals>
     <string name="s_share_choose_chat">Podeli u…</string>
     <string name="s_shared_with_family">Podeljeno sa Family</string>
-    <string name="e_share_too_many">Zadržano je samo prvih %1$d stavki.</string>
+    <plurals name="e_share_too_many">
+        <item quantity="one">Zadržana je samo prva %1$d stavka.</item>
+        <item quantity="few">Zadržane su samo prve %1$d stavke.</item>
+        <item quantity="other">Zadržano je samo prvih %1$d stavki.</item>
+    </plurals>
     <string name="e_share_unavailable">Prvo se pridruži porodici, pa podeli ovde.</string>
     <string name="e_share_failed">Ono što je podeljeno nije moglo da se pročita.</string>
     <string name="s_no_connection">Nema veze</string>
@@ -396,9 +409,21 @@
     <string name="s_member_limit">Ograničenje članova</string>
     <string name="s_limit_members">Ograniči članove</string>
     <string name="s_most_members">Najviše članova</string>
-    <string name="s_member_limit_none">Nemate sopstveno ograničenje. Ovaj server dozvoljava najviše %1$d članova u porodici.</string>
-    <string name="s_member_limit_frozen">Trenutno ima %1$d članova. Niko nov ne može da se pridruži dok neko ne ode; niko se ne uklanja.</string>
-    <string name="s_member_limit_room">Zauzeto %1$d od %2$d mesta.</string>
+    <plurals name="s_member_limit_none">
+        <item quantity="one">Nemate sopstveno ograničenje. Ovaj server dozvoljava najviše %1$d člana u porodici.</item>
+        <item quantity="few">Nemate sopstveno ograničenje. Ovaj server dozvoljava najviše %1$d člana u porodici.</item>
+        <item quantity="other">Nemate sopstveno ograničenje. Ovaj server dozvoljava najviše %1$d članova u porodici.</item>
+    </plurals>
+    <plurals name="s_member_limit_frozen">
+        <item quantity="one">Trenutno ima %1$d član. Niko nov ne može da se pridruži dok neko ne ode; niko se ne uklanja.</item>
+        <item quantity="few">Trenutno ima %1$d člana. Niko nov ne može da se pridruži dok neko ne ode; niko se ne uklanja.</item>
+        <item quantity="other">Trenutno ima %1$d članova. Niko nov ne može da se pridruži dok neko ne ode; niko se ne uklanja.</item>
+    </plurals>
+    <plurals name="s_member_limit_room">
+        <item quantity="one">Zauzeto %1$d od %2$d mesta.</item>
+        <item quantity="few">Zauzeto %1$d od %2$d mesta.</item>
+        <item quantity="other">Zauzeto %1$d od %2$d mesta.</item>
+    </plurals>
     <string name="s_decrease">Smanji</string>
     <string name="s_increase">Povećaj</string>
     <string name="e_member_limit_failed">Nije uspelo menjanje ograničenja članova. Pokušajte ponovo.</string>
@@ -438,10 +463,10 @@
     <string name="s_assistant_answer_failed">Asistent nije uspeo da završi ovaj odgovor. Pitajte ponovo.</string>
     <string name="s_assistant_provider_refused">Dobavljač asistenta je to odbio. Pokušaj da to kažeš drugačije.</string>
     <string name="s_assistant_vision">Asistent sme da gleda fotografije</string>
-    <string name="s_assistant_vision_explanation">Kada neko u svom četu s asistentom priloži fotografiju uz pitanje, priloži je uz poruku koja pominje asistenta u porodičnom četu, ili odgovori na fotografiju pominjući ga, ta fotografija ide modelu zajedno s pitanjem — najviše 4 po pitanju. Fotografija na koju asistentu niko nije ukazao ne šalje se nikada, ni iz ranije poruke osim ako je uključeno „Asistent vidi nedavne fotografije“, kao ni video, fajlovi, audio i lokacije. Isključeno dok ga ne uključite; kad je isključeno, nijedna fotografija se ne šalje.</string>
+    <string name="s_assistant_vision_explanation">Kada neko u svom četu s asistentom priloži fotografiju uz pitanje, priloži je uz poruku koja pominje asistenta u porodičnom četu ili grupi, ili odgovori na fotografiju pominjući ga, ta fotografija ide modelu zajedno s pitanjem — najviše 4 po pitanju. Fotografija na koju asistentu niko nije ukazao ne šalje se nikada, ni iz ranije poruke osim ako je uključeno „Asistent vidi nedavne fotografije“, kao ni video, fajlovi, audio i lokacije. Isključeno dok ga ne uključite; kad je isključeno, nijedna fotografija se ne šalje.</string>
     <string name="e_change_assistant_vision_failed">Nije uspela promena podešavanja</string>
     <string name="s_assistant_history_photos">Asistent vidi nedavne fotografije</string>
-    <string name="s_assistant_history_photos_explanation">Kada neko pomene asistenta u porodičnom četu, uz pitanje modelu idu i najnovije fotografije iz tog četa — do 4, od bilo koga, na koje asistentu niko nije ukazao — posle fotografija uz samu poruku ili uz onu na koju odgovara. Skoro svako pominjanje tada šalje slike, a to košta više. Potrebni su „Asistent sme da gleda fotografije“ i „Asistent vidi nedavnu istoriju“; isključeno dok ga ne uključite.</string>
+    <string name="s_assistant_history_photos_explanation">Kada neko pomene asistenta u porodičnom četu ili grupi, uz pitanje modelu idu i najnovije fotografije iz tog četa — do 4, od bilo koga, na koje asistentu niko nije ukazao — posle fotografija uz samu poruku ili uz onu na koju odgovara. Skoro svako pominjanje tada šalje slike, a to košta više. Potrebni su „Asistent sme da gleda fotografije“ i „Asistent vidi nedavnu istoriju“; isključeno dok ga ne uključite.</string>
     <string name="s_assistant_history_photos_no_deployment">Ovde nije dostupno: asistent na ovom serveru ne može da gleda slike.</string>
     <string name="s_assistant_history_photos_needs_vision">Prvo uključite „Asistent sme da gleda fotografije“ — dok je to isključeno, server ovo odbija.</string>
     <string name="s_assistant_history_photos_needs_history">Dok je „Asistent vidi nedavnu istoriju“ isključeno, ovo ne radi ništa: istorija četa se ne šalje, pa ni jedna fotografija iz nje.</string>
@@ -451,7 +476,7 @@
     <string name="s_assistant_greeting_no_server">Ovde nije dostupno: ovaj server ne šalje dnevne pozdrave.</string>
     <string name="e_change_assistant_greeting_failed">Nije uspela promena podešavanja</string>
     <string name="s_assistant_faces">Asistent vidi lica članova</string>
-    <string name="s_assistant_faces_explanation">Kada neko pomene asistenta u porodičnom četu, uz pitanje modelu idu i slike profila članova koji se pominju u nedavnoj istoriji tog četa — do 4 — da bi znao ko je ko. To su slike koje su članovi sami izabrali, a ne priložene fotografije; nikada član koji je otišao i nikada niko van ove porodice. Većina pominjanja tada šalje slike, što košta više. Zahteva „Asistent sme da gleda fotografije“ i „Asistent vidi nedavnu istoriju“; isključeno dok ga ne uključite, a dok je isključeno nijedno lice se ne šalje.</string>
+    <string name="s_assistant_faces_explanation">Kada neko pomene asistenta u porodičnom četu ili grupi, uz pitanje modelu idu i slike profila članova koji se pominju u nedavnoj istoriji tog četa — do 4 — da bi znao ko je ko. To su slike koje su članovi sami izabrali, a ne priložene fotografije; nikada član koji je otišao i nikada niko van ove porodice. Većina pominjanja tada šalje slike, što košta više. Zahteva „Asistent sme da gleda fotografije“ i „Asistent vidi nedavnu istoriju“; isključeno dok ga ne uključite, a dok je isključeno nijedno lice se ne šalje.</string>
     <string name="s_assistant_faces_needs_history">Dok je „Asistent vidi nedavnu istoriju“ isključeno, ovo ništa ne radi: imena se ne šalju, pa ni lica.</string>
     <string name="e_change_assistant_faces_failed">Nije uspela promena podešavanja</string>
     <string name="s_open_polls">Otvorene ankete</string>
@@ -525,7 +550,11 @@
     </plurals>
     <string name="s_mentions_you">Pominje te</string>
     <string name="s_mention_member">Pomeni %1$s</string>
-    <string name="s_note_characters_left">Još %1$d karaktera</string>
+    <plurals name="s_note_characters_left">
+        <item quantity="one">Još %1$d karakter</item>
+        <item quantity="few">Još %1$d karaktera</item>
+        <item quantity="other">Još %1$d karaktera</item>
+    </plurals>
     <string name="s_your_note">Tvoja beleška</string>
     <string name="s_note_preview">Pregled</string>
     <string name="s_font">Font</string>
@@ -538,12 +567,23 @@
     <string name="s_rsvp_going">Dolazim</string>
     <string name="s_rsvp_maybe">Možda</string>
     <string name="s_rsvp_no">Ne mogu</string>
-    <string name="s_rsvp_going_count">Dolazi: %1$d</string>
-    <string name="s_rsvp_maybe_count">Možda: %1$d</string>
-    <string name="s_rsvp_going_maybe_count">Dolazi: %1$d, možda: %2$d</string>
+    <plurals name="s_rsvp_going_count">
+        <item quantity="one">Dolazi: %1$d</item>
+        <item quantity="few">Dolazi: %1$d</item>
+        <item quantity="other">Dolazi: %1$d</item>
+    </plurals>
+    <plurals name="s_rsvp_maybe_count">
+        <item quantity="one">Možda: %1$d</item>
+        <item quantity="few">Možda: %1$d</item>
+        <item quantity="other">Možda: %1$d</item>
+    </plurals>
+    <plurals name="s_rsvp_going_maybe_count">
+        <item quantity="one">Dolazi: %1$d, možda: %2$d</item>
+        <item quantity="few">Dolazi: %1$d, možda: %2$d</item>
+        <item quantity="other">Dolazi: %1$d, možda: %2$d</item>
+    </plurals>
     <string name="s_add_event">Dodaj događaj</string>
     <string name="s_event_when">Kada</string>
-    <string name="s_event_where">Gde</string>
     <string name="s_event_place">Mesto</string>
     <string name="s_event_has_end">Ima kraj</string>
     <string name="s_event_starts">Počinje</string>
@@ -553,14 +593,16 @@
     <string name="s_event">Događaj</string>
     <string name="s_list">Spisak</string>
     <string name="s_new_list">Novi spisak</string>
-    <string name="s_add_list">Dodaj spisak</string>
     <string name="s_add_task_list">Dodaj spisak zadataka</string>
     <string name="s_things_to_do">Stvari za uraditi</string>
     <string name="s_thing_to_do">Stvar za uraditi</string>
     <string name="s_add_a_thing">Dodaj stvar</string>
     <string name="s_nothing_on_this_list">Na ovom spisku još nema ničega.</string>
-    <string name="s_your_list">Vaš spisak</string>
-    <string name="s_tasks_done_of">%1$d od %2$d završeno</string>
+    <plurals name="s_tasks_done_of">
+        <item quantity="one">%1$d od %2$d završeno</item>
+        <item quantity="few">%1$d od %2$d završeno</item>
+        <item quantity="other">%1$d od %2$d završeno</item>
+    </plurals>
     <string name="s_done">Gotovo</string>
     <plurals name="s_more_things">
         <item quantity="one">+%1$d još</item>
@@ -579,8 +621,8 @@
     <string name="s_the_assistant">Asistent</string>
     <string name="s_before_the_assistant_answers">Pre nego što asistent odgovori</string>
     <string name="s_consent_words_leave_for_processor">Ono što napišeš asistentu napušta server ove porodice i ide ka %1$s.</string>
-    <string name="s_consent_family_history_travels">U porodičnom razgovoru šalje se samo poruka u kojoj piše @ai — a s njom i poslednjih 30 dana tog razgovora, do 200 poruka, uključujući ono što su drugi napisali, njihova imena i vreme.</string>
-    <string name="s_consent_family_mention_alone">U porodičnom razgovoru šalje se samo poruka u kojoj piše @ai, i ništa drugo iz tog razgovora ne ide s njom.</string>
+    <string name="s_consent_family_history_travels">U porodičnom razgovoru ili grupi šalje se samo poruka u kojoj piše @ai — a s njom i poslednjih 30 dana tog razgovora, do 200 poruka, uključujući ono što su drugi napisali, njihova imena i vreme.</string>
+    <string name="s_consent_family_mention_alone">U porodičnom razgovoru ili grupi šalje se samo poruka u kojoj piše @ai, i ništa drugo iz tog razgovora ne ide s njom.</string>
     <string name="s_consent_photo_only_when_attached">Fotografija se šalje samo kada je sam zakačiš uz poruku za asistenta, i samo dok tvoja porodica to dozvoljava.</string>
     <string name="s_consent_answer_lands_in_the_chat">Odgovor stiže kao poruka u tom razgovoru, gde mogu da ga pročitaju svi koji su u njemu.</string>
     <string name="s_consent_can_stop_in_settings">Ovo možeš da zaustaviš bilo kada u podešavanjima. Ono što je već poslato ne može da se vrati.</string>
@@ -618,7 +660,11 @@
     <string name="s_sticker_add_failed">Stiker nije dodat. Pokušaj ponovo.</string>
     <string name="s_sticker_unreadable">Ta slika ne može da se pročita.</string>
     <string name="s_sticker_animated_must_be_webp">Animirani stikeri moraju biti WebP. Ovaj se ne može dodati.</string>
-    <string name="s_sticker_label_too_long">Opis može imati najviše %1$d znakova.</string>
+    <plurals name="s_sticker_label_too_long">
+        <item quantity="one">Opis može imati najviše %1$d znak.</item>
+        <item quantity="few">Opis može imati najviše %1$d znaka.</item>
+        <item quantity="other">Opis može imati najviše %1$d znakova.</item>
+    </plurals>
     <string name="s_sticker_remove_not_allowed">Stiker može da ukloni samo onaj ko ga je dodao ili vlasnik porodice.</string>
     <string name="s_sticker_remove_failed">Stiker nije uklonjen. Pokušaj ponovo.</string>
     <string name="s_sticker_not_available_offline">Taj stiker još nije na ovom telefonu. Pokušaj ponovo kad budeš na mreži.</string>
@@ -638,12 +684,13 @@
     <string name="s_assistant_transcripts_explanation">Kada je ovo uključeno, članovi mogu da zatraže tekst glasovnih poruka, audio snimaka i video snimaka drugih članova u porodičnom četu, i tada se zvuk tog snimka šalje ka %1$s. Šalje se samo kada neko zatraži, i samo ako je član koji ga je poslao prihvatio asistenta. Svako može da dobije tekst svojih snimaka i bez ovoga. Isključeno je dok ga ne uključiš.</string>
     <string name="s_assistant_transcripts_no_server">Ovde nije dostupno: ovaj server ne može da pretvori snimke u tekst.</string>
     <string name="s_consent_transcript_sound_sent">Ako zatražiš tekst glasovne poruke, audio datoteke ili videa, zvuk se šalje ka %1$s.</string>
+    <string name="s_consent_transcript_direct_chat">U ličnom razgovoru ili grupi ostali u njemu mogu da zatraže tekst tvojih glasovnih poruka, audio datoteka i videa, i tada se njihov zvuk šalje ka %1$s.</string>
     <string name="e_change_assistant_transcripts_failed">Nije uspela promena podešavanja</string>
     <!-- Looking things up (#72): docs/protocol.md, "Looking things up" -->
     <string name="s_looking_things_up">Traženje podataka</string>
     <string name="s_assistant_lookups">Može da traži podatke</string>
     <string name="s_assistant_lookups_explanation">Kada je ovo uključeno, asistent može da potraži podatke kada pitanje to zahteva — vremensku prognozu, vesti, činjenicu u koju nije siguran — u %1$s. Tamo se šalje samo kratak upit za pretragu ili naziv mesta koji asistent sastavi iz pitanja, nikada sam razgovor, i samo ako je član koji pita to prihvatio. Odgovori tada navode svoje izvore. Isključeno je dok ga ne uključiš.</string>
-    <string name="s_consent_lookups_with_history">Ako vlasnik porodice uključi traženje podataka, asistent može da pošalje ka %1$s kratak upit za pretragu ili naziv mesta koji sastavi iz tvog pitanja — u porodičnom razgovoru možda i iz nedavnih poruka — a njegov odgovor onda navodi izvore.</string>
+    <string name="s_consent_lookups_with_history">Ako vlasnik porodice uključi traženje podataka, asistent može da pošalje ka %1$s kratak upit za pretragu ili naziv mesta koji sastavi iz tvog pitanja — u porodičnom razgovoru ili grupi možda i iz nedavnih poruka — a njegov odgovor onda navodi izvore.</string>
     <string name="s_consent_lookups_alone">Ako vlasnik porodice uključi traženje podataka, asistent može da pošalje ka %1$s kratak upit za pretragu ili naziv mesta koji sastavi iz tvog pitanja, a njegov odgovor onda navodi izvore.</string>
     <string name="s_agree_with_lookups">Prihvati i traženje</string>
     <string name="s_agree_without_lookups">Prihvati bez traženja</string>
@@ -734,4 +781,64 @@
     <string name="s_not_sent">Nije poslato</string>
     <string name="s_switch">Promeni</string>
     <string name="s_stop">Zaustavi</string>
+    <!-- Groups (#107; docs/protocol.md, "Groups") -->
+    <string name="s_new_group">Nova grupa</string>
+    <string name="s_group_name">Naziv grupe</string>
+    <string name="s_create_group">Napravi grupu</string>
+    <string name="s_group_info">O grupi</string>
+    <string name="s_add_members">Dodaj članove</string>
+    <string name="s_rename_group">Preimenuj grupu</string>
+    <string name="s_remove_from_group">Ukloni iz grupe</string>
+    <string name="s_leave_group">Napusti grupu</string>
+    <string name="s_delete_group">Obriši grupu</string>
+    <string name="s_group_admin">Administrator</string>
+    <string name="s_group">Grupa</string>
+    <string name="s_group_members_count">Članova: %1$d</string>
+    <string name="s_delete_group_confirm">Obrisati „%1$s“? Njene poruke se brišu za sve.</string>
+    <string name="s_leave_group_confirm">Napustiti „%1$s“? Možeš da se vratiš samo ako te administrator ponovo doda.</string>
+    <string name="e_group_choose_member">Izaberi bar jednog člana.</string>
+    <string name="e_group_name_length">Naziv grupe može da ima od 1 do 64 znaka.</string>
+    <string name="e_too_many_groups">Tvoja porodica već ima 50 grupa.</string>
+    <string name="e_not_group_admin">Ovo može samo administrator grupe.</string>
+    <string name="e_create_group_failed">Grupa nije napravljena.</string>
+    <string name="e_change_group_failed">Grupa nije promenjena.</string>
+    <string name="s_everyone_already_in_group">Svi iz porodice su već u ovoj grupi.</string>
+    <!-- Several families (#88; docs/protocol.md, "Several families"). -->
+    <string name="s_families">Porodice</string>
+    <string name="s_new_family">Nova porodica…</string>
+    <string name="s_join_another_family">Pridruži se drugoj porodici…</string>
+    <string name="s_switch_family">Promeni porodicu</string>
+    <string name="s_family_unread">%1$s, nepročitano: %2$d</string>
+    <string name="s_invited_you_to">%1$s te poziva u „%2$s“</string>
+    <string name="s_invitations">Pozivnice</string>
+    <string name="s_invite">Pozovi…</string>
+    <string name="s_invite_to">Pozovi u „%s“</string>
+    <string name="s_invite_empty">Ovde se prikazuju članovi tvojih drugih porodica koji nisu u ovoj.</string>
+    <string name="s_invited">Poziv poslat</string>
+    <string name="s_pending_invitations">Pozivnice na čekanju</string>
+    <string name="s_withdraw_invitation">Povuci pozivnicu</string>
+    <string name="e_invitation_gone">Ova pozivnica više nije dostupna.</string>
+    <string name="e_too_many_families">Već si u najvećem broju porodica za jedan nalog (%d).</string>
+    <string name="e_already_own_a_family">Već imaš svoju porodicu, pa ne možeš da napraviš drugu.</string>
+    <string name="e_member_families_disabled">Ovaj server ne dozvoljava članovima da prave nove porodice.</string>
+    <string name="e_member_in_other_families">Ovaj član je i u porodici koja nije tvoja, pa lozinku može da promeni samo ta osoba.</string>
+    <string name="s_leave_named_family">Napustiti „%s“?</string>
+    <string name="s_leave_one_of_families_explanation">Izgubićeš pristup razgovorima ove porodice. Lični razgovori sa onima sa kojima deliš drugu porodicu ostaju.</string>
+    <string name="s_new_family_explanation">Napravi svoju porodicu. Biće tvoja i moći ćeš da pozoveš članove svojih drugih porodica.</string>
+    <!-- Paid families (#89; docs/protocol.md, "Paid families"). -->
+    <string name="s_gate_cannot_start_here">Na ovom serveru nova porodica ne može da se napravi iz ove aplikacije.</string>
+    <string name="e_subscription_required">Za novu porodicu na ovom serveru potrebna je pretplata.</string>
+    <string name="s_banner_member">„%1$s“ će biti obrisana %2$s jer joj je istekla pretplata. Samo vlasnik, %3$s, može da je obnovi.</string>
+    <string name="s_banner_owner_not_here">„%1$s“ će biti obrisana %2$s jer vam je istekla pretplata. Ne može da se obnovi iz ove aplikacije.</string>
+    <string name="s_allowance_title">Kvota za ovaj mesec</string>
+    <string name="s_allowance_storage">Prostor</string>
+    <string name="s_allowance_assistant">Asistent</string>
+    <string name="s_allowance_pictures">Slike</string>
+    <string name="s_allowance_transcripts">Transkripti</string>
+    <string name="s_allowance_of">%1$s od %2$s</string>
+    <string name="s_allowance_percent">Iskorišćeno %1$d%%</string>
+    <string name="s_allowance_minutes">%1$d od %2$d min</string>
+    <string name="s_allowance_renews_on">Obnavlja se %1$s</string>
+    <string name="e_storage_allowance_used">Ova porodica je iskoristila svoju kvotu prostora.</string>
+    <string name="e_ai_allowance_used">Ova porodica je iskoristila kvotu asistenta za ovaj mesec. Obnavlja se %1$s.</string>
 </resources>

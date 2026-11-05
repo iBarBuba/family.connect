@@ -2,7 +2,7 @@
  * AppDatabase.kt
  * Family Connect (Android)
  *
- * Room database, version 32.
+ * Room database, version 36.
  *
  * MIGRATION POLICY: fallbackToDestructiveMigration is FORBIDDEN on this
  * database. It holds the family's message history — the only local copy
@@ -47,7 +47,7 @@ fun interface LocalDataWiper {
         GonePackItemEntity::class,
         TranscriptEntity::class,
     ],
-    version = 32,
+    version = 36,
     exportSchema = false,
 )
 @TypeConverters(Converters::class)
@@ -561,6 +561,114 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v33: whether a message's stored attachment set knows the ANIMATION
+         * flag (#96; docs/protocol.md, "Animations"). MIGRATION_30_31's shape
+         * exactly: one column, NOT NULL DEFAULT 0, because 0 is the truth for
+         * every row already here — this build's predecessors wrote each
+         * received set back without `animation`, so an animation another
+         * client sent reads as a plain video. The flag itself rides inside
+         * `attachmentsJson`; this column only says which rows to read again
+         * (`MessageRepository.repairUnknownAnimationFlags`). Byte-matches the
+         * entity's @ColumnInfo default, which Room validates on launch.
+         */
+        val MIGRATION_32_33: Migration = object : Migration(32, 33) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN attachmentsKnowAnimation INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /**
+         * v34: groups (#107; docs/protocol.md, "Groups"). Two nullable
+         * columns with no DEFAULT — MIGRATION_3_4's shape — because every
+         * row already here is a family, direct or assistant chat, and for
+         * those "no member list" and "no admin" are the truth, not a
+         * placeholder. The entity declares both without @ColumnInfo, so a
+         * migrated and a fresh schema validate identically.
+         */
+        val MIGRATION_33_34: Migration = object : Migration(33, 34) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE chats ADD COLUMN memberIdsJson TEXT")
+                db.execSQL("ALTER TABLE chats ADD COLUMN adminUserId INTEGER")
+            }
+        }
+
+        /**
+         * v35: several families (#88; docs/protocol.md, "Several families").
+         * Never destructive — every row survives:
+         *
+         * - `chats.familyIdsJson`, nullable with no default (MIGRATION_33_34's
+         *   shape): a cached chat has not been told its families, and null is
+         *   that truth until the next `GET /chats` says them.
+         * - `notes.familyId` and `packItems.familyId`, NOT NULL DEFAULT 0:
+         *   zero is "cached before several families", which can only mean the
+         *   home family — the one family an app from before ever saw — and
+         *   the first `GET /me` claims those rows for it.
+         * - `members` is REBUILT, because its primary key changes from the
+         *   user alone to (family, user): a person in two of this account's
+         *   families has a row in each. SQLite cannot alter a primary key, so
+         *   the rows are copied across with family 0 (claimed like the notes)
+         *   and the old table dropped. Column types and defaults byte-match
+         *   the entity, which is what Room validates on open.
+         */
+        val MIGRATION_34_35: Migration = object : Migration(34, 35) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE chats ADD COLUMN familyIdsJson TEXT")
+                db.execSQL("ALTER TABLE notes ADD COLUMN familyId INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE packItems ADD COLUMN familyId INTEGER NOT NULL DEFAULT 0")
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS members_new (
+                        userId INTEGER NOT NULL,
+                        username TEXT NOT NULL,
+                        displayName TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        avatarVersion INTEGER NOT NULL DEFAULT 0,
+                        hasLeft INTEGER NOT NULL DEFAULT 0,
+                        deleted INTEGER NOT NULL DEFAULT 0,
+                        birthdayMonth INTEGER,
+                        birthdayDay INTEGER,
+                        familyId INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(familyId, userId)
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    INSERT INTO members_new (
+                        userId, username, displayName, role, avatarVersion,
+                        hasLeft, deleted, birthdayMonth, birthdayDay, familyId
+                    )
+                    SELECT userId, username, displayName, role, avatarVersion,
+                        hasLeft, deleted, birthdayMonth, birthdayDay, 0
+                    FROM members
+                    """.trimIndent(),
+                )
+                db.execSQL("DROP TABLE members")
+                db.execSQL("ALTER TABLE members_new RENAME TO members")
+            }
+        }
+
+        /**
+         * v36: whether the owner may reset a member's password
+         * (`Member.password_reset`, docs/protocol.md, "Several families"),
+         * stored per (family, member) so a newcomer announced by
+         * `member_joined` — or answered by an approval — is drawn with the
+         * answer the server gave, rather than offered a reset it refuses
+         * (`member_in_other_families`). Nullable with no default, the
+         * MIGRATION_33_34 shape: every row already here was "not told",
+         * which is the old rule, and the next roster read says.
+         *
+         * Its own step rather than folded into MIGRATION_34_35: an install
+         * already at 35 would never run the change, and Room refuses to open
+         * a schema that does not match what it was promised.
+         */
+        val MIGRATION_35_36: Migration = object : Migration(35, 36) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE members ADD COLUMN passwordReset INTEGER")
+            }
+        }
+
         val MIGRATION_26_27: Migration = object : Migration(26, 27) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE notes ADD COLUMN mentionsJson TEXT")
@@ -660,6 +768,10 @@ abstract class AppDatabase : RoomDatabase() {
                 MIGRATION_29_30,
                 MIGRATION_30_31,
                 MIGRATION_31_32,
+                MIGRATION_32_33,
+                MIGRATION_33_34,
+                MIGRATION_34_35,
+                MIGRATION_35_36,
             )
         }
     }

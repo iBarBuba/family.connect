@@ -45,12 +45,17 @@
 
 package me.nettrash.familyconnect.ui.chat
 
+import me.nettrash.familyconnect.ui.components.ProseKeyboard
+import me.nettrash.familyconnect.ui.components.EmojiTypingInput
+import me.nettrash.familyconnect.ui.components.proseValue
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.onClick as onSemanticsClick
 import me.nettrash.familyconnect.ui.components.VoiceBubbleRules
 import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.automirrored.outlined.Subject
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.graphics.lerp
 import me.nettrash.familyconnect.ui.components.WaveformBars
 import me.nettrash.familyconnect.ui.components.VoicePlayDisc
@@ -65,6 +70,7 @@ import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.Animatable
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.Spring
@@ -97,6 +103,8 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -132,12 +140,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.foundation.text.input.then
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import me.nettrash.familyconnect.util.MemberMention
 import me.nettrash.familyconnect.data.net.dto.MentionsCodec
-import me.nettrash.familyconnect.data.net.dto.MentionDto
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -168,7 +177,6 @@ import androidx.compose.material.icons.automirrored.outlined.Reply
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Edit
-import androidx.compose.material.icons.outlined.EmojiEmotions
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.Block
@@ -196,7 +204,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
-import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.ripple
@@ -239,6 +246,8 @@ import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
+import me.nettrash.familyconnect.ui.components.LocalMotionHold
+import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -272,6 +281,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
@@ -316,8 +326,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import me.nettrash.familyconnect.R
-import me.nettrash.familyconnect.ui.components.readableColumn
-import me.nettrash.familyconnect.ui.components.READABLE_COLUMN
+import me.nettrash.familyconnect.ui.components.ConversationColumn
+import me.nettrash.familyconnect.ui.components.conversationComposerColumn
 import me.nettrash.familyconnect.data.db.ChatEntity
 import me.nettrash.familyconnect.data.db.MessageEntity
 import me.nettrash.familyconnect.data.db.MessageStatus
@@ -343,6 +353,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import me.nettrash.familyconnect.data.repo.MediaPrep
 import androidx.core.content.FileProvider
 import java.io.File
+import java.time.ZoneOffset
 import me.nettrash.familyconnect.ui.components.AssistantConsentDialog
 import me.nettrash.familyconnect.ui.components.AttachmentAlbum
 import me.nettrash.familyconnect.ui.components.AttachmentGroup
@@ -351,6 +362,7 @@ import me.nettrash.familyconnect.ui.components.DestructiveTextButton
 import me.nettrash.familyconnect.ui.components.EmptyState
 import me.nettrash.familyconnect.ui.components.OfflineBanner
 import me.nettrash.familyconnect.util.TimeFormat
+import me.nettrash.familyconnect.util.GroupRules
 import kotlin.math.roundToInt
 import androidx.annotation.StringRes
 import androidx.compose.foundation.selection.selectable
@@ -361,6 +373,7 @@ import me.nettrash.familyconnect.ui.components.ReportSheet
 import androidx.compose.runtime.mutableStateSetOf
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.ui.platform.LocalWindowInfo
 
 /**
  * The long-pressed message plus its bubble's window bounds — the
@@ -398,6 +411,8 @@ fun ChatScreen(
     onOpenThread: (Long, Long) -> Unit = { _, _ -> },
     /** Open another chat — the one-to-one a tapped mention leads to (docs/protocol.md, "Mentioning a member"). */
     onOpenChat: (Long) -> Unit = {},
+    /** A group's info — its name, members and admin actions (docs/protocol.md, "Groups"). */
+    onOpenGroupInfo: (Long) -> Unit = {},
     viewModel: ChatViewModel = hiltViewModel(),
     /**
      * The family's chat stickers: the panel, and the larger view a tap
@@ -431,6 +446,7 @@ fun ChatScreen(
     // says so (docs/protocol.md, "Pictures"). Each remembers HOW it failed,
     // which picks the sentence (docs/protocol.md, "The assistant").
     val failedAssistantAnswers by viewModel.failedAssistantAnswers.collectAsStateWithLifecycle()
+    val sendRefusals by viewModel.sendRefusals.collectAsStateWithLifecycle()
     // The two picture affordances, each behind its own capability check —
     // no surface at all where the server cannot do the thing, rather than
     // a disabled one that lies about what would happen.
@@ -458,7 +474,11 @@ fun ChatScreen(
     // there is anything to settle on.
     val openAnchor by viewModel.openAnchor.collectAsStateWithLifecycle()
     val settled by viewModel.settled.collectAsStateWithLifecycle()
-    val linkPreviews by viewModel.linkPreviews.collectAsStateWithLifecycle()
+    // The State itself, not its value: each bubble looks up its own link in
+    // it (see MessageBubble's `linkPreviews`), so a preview landing for one
+    // message recomposes that message — not this whole screen and every
+    // bubble in the thread, which is what reading the map here did.
+    val linkPreviews = viewModel.linkPreviews.collectAsStateWithLifecycle()
     val linkPreviewsEnabled by viewModel.linkPreviewsEnabled.collectAsStateWithLifecycle()
     val mapPreviewsEnabled by viewModel.mapPreviewsEnabled.collectAsStateWithLifecycle()
 
@@ -468,7 +488,12 @@ fun ChatScreen(
     // #79, Phase 0: today's recorder made safe. Nothing records during a
     // call; a recording something else stopped waits in its own "Voice
     // message not sent" row until it is sent or deleted (S2.8).
-    val isRecording = recordingMs != null
+    //
+    // Derived, so this screen's body reads a Boolean that changes twice per
+    // recording — not the elapsed time, which ticks for as long as one runs
+    // and used to recompose the whole screen (thread included) on every
+    // tick. The composer, which draws the time, reads it in its own scope.
+    val isRecording by remember { derivedStateOf { recordingMs != null } }
     val callLive by viewModel.callLive.collectAsStateWithLifecycle()
     val notSent by viewModel.notSent.collectAsStateWithLifecycle()
     val notSentInFlight by viewModel.notSentInFlight.collectAsStateWithLifecycle()
@@ -536,6 +561,13 @@ fun ChatScreen(
     val supportContact by viewModel.supportContact.collectAsStateWithLifecycle()
     var fullPickerTarget by remember { mutableStateOf<ChatListItem.MessageItem?>(null) }
     val listState = rememberLazyListState()
+    // Whether the thread's moving pictures hold still: while it scrolls,
+    // and while a full-screen viewer is over it (LocalMotionHold says why,
+    // and why this is a State handed down rather than a Boolean). Derived,
+    // so it changes only at the edges, never per scrolled pixel.
+    val motionHold = remember {
+        derivedStateOf { listState.isScrollInProgress || viewingAlbum != null || viewingSticker != null }
+    }
     // Set by tapping a quote, or by the opening anchor; cleared once the
     // target is found (or given up on). Held here rather than in the
     // ViewModel because it is purely a scroll intent — nothing about it
@@ -547,9 +579,7 @@ fun ChatScreen(
     var scrollToJump by remember { mutableStateOf<JumpRequest?>(null) }
     // Half the viewport, so animateScrollToItem's top-edge alignment lands
     // the target in the middle instead.
-    val centreOffsetPx = with(LocalDensity.current) {
-        (LocalConfiguration.current.screenHeightDp.dp / 2).roundToPx()
-    }
+    val centreOffsetPx = LocalWindowInfo.current.containerSize.height / 2
     // How far below the top edge an anchored open lands the divider. The
     // margin is not decoration: land the target flush against the top and
     // the near-old-end band fires load-older, whose own window growth
@@ -760,7 +790,11 @@ fun ChatScreen(
     val hasCamera = remember(context) {
         context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)
     }
-    val replyingToRound = stringResource(R.string.s_video_message)
+    // What a quote names in place of an empty excerpt (#79, #96), resolved
+    // here: the recorder's session is built outside composition.
+    val quotedVideoMessage = stringResource(R.string.s_video_message)
+    val quotedGif = stringResource(R.string.s_gif)
+    val quotedSticker = stringResource(R.string.s_sticker)
     val openVideoRecorder: () -> Unit = open@{
         val recorder = videoRecorder ?: return@open
         if (!viewModel.mayOpenVideoRecorder()) return@open
@@ -776,7 +810,16 @@ fun ChatScreen(
                     if (sender == myUserId) memberYou else memberNames[sender] ?: memberFallbackName
                 }.orEmpty(),
                 replyExcerpt = reply?.let { draft ->
-                    if (draft.excerpt.isEmpty() && quotesRound(items, draft.messageId)) replyingToRound else draft.excerpt
+                    if (draft.excerpt.isEmpty()) {
+                        when (quotedMedia(items, draft.messageId)) {
+                            QuotedMedia.VIDEO_MESSAGE -> quotedVideoMessage
+                            QuotedMedia.GIF -> quotedGif
+                            QuotedMedia.STICKER -> quotedSticker
+                            null -> draft.excerpt
+                        }
+                    } else {
+                        draft.excerpt
+                    }
                 }.orEmpty(),
                 voiceBlocked = viewModel.notSent.value.isNotEmpty(),
             ),
@@ -1039,6 +1082,7 @@ fun ChatScreen(
     // again with its next Enter.
     val slotFocus = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
+    val softwareKeyboard = LocalSoftwareKeyboardController.current
     val configuration = LocalConfiguration.current
     val hapticsOnThisDevice by rememberUpdatedState(voiceHapticsOn(configuration.smallestScreenWidthDp))
     val keyboardAttached by rememberUpdatedState(
@@ -1057,7 +1101,20 @@ fun ChatScreen(
                     runCatching { slotFocus.requestFocus() }
                 }
                 ChatViewModel.VoiceEffect.Ended ->
-                    if (keyboardAttached) runCatching { focusRequester.requestFocus() }
+                    if (keyboardAttached) {
+                        runCatching { focusRequester.requestFocus() }
+                        // ...WITHOUT the on-screen keyboard (#106, section 3):
+                        // focusing a text field raises the IME on any device
+                        // set to show it beside a physical keyboard, so a
+                        // Delete tapped on the recording row used to open the
+                        // keyboard by itself, over the conversation, though
+                        // nobody had asked to type. The field takes focus for
+                        // the physical keyboard's sake alone (S2.4); the IME
+                        // comes when the field is tapped. A frame later, once
+                        // the field's own show request has gone out.
+                        withFrameNanos { }
+                        softwareKeyboard?.hide()
+                    }
             }
         }
     }
@@ -1305,7 +1362,19 @@ fun ChatScreen(
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
+                    // A group's name is the way into its info, as on the
+                    // other clients — the Info button beside it is the same
+                    // door for whoever does not think to tap a title.
+                    val groupId = chat?.takeIf { GroupRules.isGroup(it.kind) }?.id
+                    Column(
+                        modifier = if (groupId != null) {
+                            Modifier.clickable(onClickLabel = stringResource(R.string.s_group_info)) {
+                                onOpenGroupInfo(groupId)
+                            }
+                        } else {
+                            Modifier
+                        },
+                    ) {
                         Text(
                             text = chat?.title ?: "",
                             style = MaterialTheme.typography.titleMedium,
@@ -1354,7 +1423,7 @@ fun ChatScreen(
                     // a call lives in a direct chat (docs/protocol.md,
                     // "Voice calls"). Hidden, not disabled, on a server
                     // that has calls off.
-                    if (callsEnabled && chat?.kind == "direct") {
+                    if (callsEnabled && GroupRules.offersCalls(chat?.kind)) {
                         // The KIND is chosen here, at placement, and fixed
                         // for the call's life (docs/protocol.md, "Video")
                         // — hence two buttons, never a mid-call switch.
@@ -1372,18 +1441,18 @@ fun ChatScreen(
                         }
                     }
                     // The way back to a decision the family has scrolled past
-                    // (docs/protocol.md, "Finding the open ones"). Family chat
-                    // only, because polls exist nowhere else — which is also
-                    // why this slot was empty there: the whole block above is
-                    // gated on a DIRECT chat, so the family chat carried no
-                    // action at all.
+                    // (docs/protocol.md, "Finding the open ones"). The family
+                    // chat and groups only, because polls exist nowhere else
+                    // — which is also why this slot was empty there: the
+                    // whole block above is gated on a DIRECT chat, so the
+                    // family chat carried no action at all.
                     //
                     // The badge counts open polls THIS READER has not voted in
                     // (util/OpenPollsBadge.kt, mirrored on iOS), not all open
                     // polls: a count that stays lit after you have answered
                     // everything, until somebody else closes them, stops
                     // meaning anything within a day.
-                    if (chat?.kind == "family") {
+                    if (GroupRules.offersPolls(chat?.kind)) {
                         BadgedBox(
                             badge = {
                                 if (openPollsToAnswer > 0) {
@@ -1399,6 +1468,15 @@ fun ChatScreen(
                             }
                         }
                     }
+                    // A group's info (docs/protocol.md, "Groups").
+                    chat?.takeIf { GroupRules.isGroup(it.kind) }?.let { group ->
+                        IconButton(onClick = { onOpenGroupInfo(group.id) }) {
+                            Icon(
+                                Icons.Outlined.Info,
+                                contentDescription = stringResource(R.string.s_group_info),
+                            )
+                        }
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = barColor),
             )
@@ -1408,6 +1486,15 @@ fun ChatScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
+                // What the Scaffold's padding already covers — the system
+                // bars, the navigation bar at the bottom among them — is
+                // consumed here, so the two below add only the REST: the
+                // navigation bar used to be added twice (an empty 24dp band
+                // under the composer), and with the keyboard up the IME's
+                // whole height went on top of the Scaffold's share of it,
+                // which on a phone lying down was the composer's last 24dp
+                // (#106, section 3, fix 4).
+                .consumeWindowInsets(padding)
                 .imePadding()
                 .navigationBarsPadding()
                 // A hardware keyboard (S1.6, S2.4): Ctrl+Shift+R records a voice
@@ -1439,192 +1526,231 @@ fun ChatScreen(
                     .weight(1f)
                     .fillMaxWidth(),
             ) {
-                // The readable column (iOS: threadMaxWidth = 560): on a
-                // window wider than it the thread is padded in from BOTH
-                // sides so bubbles, polls and cards keep a phone's measure
-                // instead of running 1,000dp across a tablet. Padding
-                // rather than a narrower list, so a drag anywhere in the
-                // window still scrolls the thread and the empty state's
-                // fillParentMaxSize still means the whole pane.
-                val columnInset = ((maxWidth - READABLE_COLUMN) / 2).coerceAtLeast(0.dp)
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxSize(),
-                    reverseLayout = true,
-                    contentPadding = PaddingValues(
-                        horizontal = 12.dp + columnInset,
-                        vertical = 8.dp,
-                    ),
+                // The conversation's column (#106, ConversationColumn —
+                // `min(pane − 2 × gutter, 1024)`, centred), replacing #44's
+                // 560dp readable column: bubbles keep a readable measure by
+                // their OWN cap (bubbleMaxWidth, 560dp), so the column can
+                // use a tablet's width instead of leaving 40% of it empty.
+                // Padding rather than a narrower list, so a drag anywhere in
+                // the window still scrolls the thread and the empty state's
+                // fillParentMaxSize still means the whole pane. On a phone
+                // the padding is the 12dp it always was.
+                val listPadding = ConversationColumn.listPadding(maxWidth)
+                // How far the column stands in from where a phone's would:
+                // zero until the 1024dp cap binds. What the jump-to-newest
+                // button adds to its own margin, to stay at the column's edge.
+                val columnInset = ConversationColumn.composerInset(maxWidth)
+                // The width every row is laid out at, said once for all of
+                // them (LocalBubbleRowWidth says why): the list's width less
+                // its horizontal content padding, in whole pixels, each side
+                // rounded the way LazyColumn rounds its own padding — so it
+                // is the very number each row's BoxWithConstraints used to
+                // report.
+                val density = LocalDensity.current
+                val rowWidth = with(density) {
+                    val sidePx = listPadding.roundToPx()
+                    (constraints.maxWidth - 2 * sidePx).coerceAtLeast(0).toDp()
+                }
+                CompositionLocalProvider(
+                    LocalBubbleRowWidth provides rowWidth,
+                    LocalMotionHold provides motionHold,
                 ) {
-                    if (items.isEmpty() && initialLoadSettled) {
-                        item(key = "chat-empty") {
-                            Box(
-                                modifier = Modifier.fillParentMaxSize(),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                EmptyState(
-                                    icon = Icons.Outlined.Forum,
-                                    title = stringResource(R.string.s_no_messages_yet),
-                                    // kind is "family" | "direct" (ChatEntity)
-                                    // — a 1:1 chat is not "your family chat".
-                                    subtitle = stringResource(
-                                        if (chat?.kind == "direct") {
-                                            R.string.s_say_hi_direct
-                                        } else {
-                                            R.string.s_say_hi_family
-                                        },
-                                    ),
-                                )
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        reverseLayout = true,
+                        contentPadding = PaddingValues(
+                            horizontal = listPadding,
+                            vertical = 8.dp,
+                        ),
+                    ) {
+                        if (items.isEmpty() && initialLoadSettled) {
+                            item(key = "chat-empty") {
+                                Box(
+                                    modifier = Modifier.fillParentMaxSize(),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    EmptyState(
+                                        icon = Icons.Outlined.Forum,
+                                        title = stringResource(R.string.s_no_messages_yet),
+                                        // A 1:1 chat is not "your family chat",
+                                        // and neither is a group.
+                                        subtitle = stringResource(
+                                            if (chat?.kind == GroupRules.DIRECT || GroupRules.isGroup(chat?.kind)) {
+                                                R.string.s_say_hi_direct
+                                            } else {
+                                                R.string.s_say_hi_family
+                                            },
+                                        ),
+                                    )
+                                }
                             }
                         }
-                    }
-                    items(items, key = { it.key }) { item ->
-                        // A jumped-to bubble is briefly tinted, so the eye
-                        // lands on the right one in a wall of text.
-                        val jumped = item is ChatListItem.MessageItem &&
-                            item.entity.serverId != null &&
-                            item.entity.serverId == highlightedMessageId
-                        val highlight by animateColorAsState(
-                            targetValue = if (jumped) {
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
-                            } else {
-                                Color.Transparent
-                            },
-                            animationSpec = tween(250),
-                            label = "jumpHighlight",
-                        )
-                        Box(
-                            modifier = Modifier
-                                .animateItem(
-                                    fadeInSpec = tween(200),
-                                    placementSpec = spring(stiffness = Spring.StiffnessMediumLow),
-                                )
-                                .background(highlight, RoundedCornerShape(12.dp)),
-                        ) {
-                            when (item) {
-                                is ChatListItem.DateSeparator -> DateSeparatorPill(item.label)
-                                is ChatListItem.NewMessagesDivider ->
-                                    NewMessagesDividerRow(item.count)
-                                is ChatListItem.MessageItem -> MessageBubble(
-                                    blockedUserIds = blockedUserIds,
-                                    revealedMessages = revealedMessages,
-                                    item = item,
-                                    chat = chat,
-                                    isMine = item.entity.senderId == myUserId,
-                                    fromAssistant = assistantUserId != null &&
-                                        item.entity.senderId == assistantUserId,
-                                    // Asked of the ROW, not only of the
-                                    // live set: a picture answer produces
-                                    // no deltas to put an id in it, and a
-                                    // relaunch mid-answer starts with it
-                                    // empty (AssistantAnswer).
-                                    isStreaming = AssistantAnswer.isWorking(
-                                        entity = item.entity,
-                                        isAssistantChat = chat?.kind == "ai",
-                                        assistantUserId = assistantUserId,
-                                        myUserId = myUserId,
-                                        streamingIds = streamingIds,
-                                        failedIds = failedAssistantAnswers.keys,
-                                    ),
-                                    answerFailure = item.entity.serverId
-                                        ?.let { failedAssistantAnswers[it] },
-                                    myUserId = myUserId,
-                                    memberNames = memberNames,
-                                    memberAvatars = memberAvatars,
-                                    linkPreviews = linkPreviews,
-                                    previewsEnabled = linkPreviewsEnabled,
-                                    mapPreviewsEnabled = mapPreviewsEnabled,
-                                    onRequestPreview = viewModel::requestLinkPreview,
-                                    streamUrl = viewModel::attachmentStreamUrl,
-                                    onFailedTap = { failedActionTarget = it },
-                                    onToggleReaction = applyToggle,
-                                    onVote = { serverId, optionId ->
-                                        haptics.performHapticFeedback(HapticFeedbackType.Confirm)
-                                        viewModel.vote(serverId, optionId)
-                                    },
-                                    // Not while recording, like the toolbar's (#79, S1.7).
-                                    onCallBack = if (callsEnabled && chat?.kind == "direct" && !isRecording) {
-                                        startCall
-                                    } else {
-                                        null
-                                    },
-                                    onTapQuote = {
-                                        pendingJump = JumpRequest(serverId = it, anchor = false)
-                                    },
-                                    onOpenThread = { rootId -> chat?.id?.let { openOwnThread(it, rootId) } },
-                                    onTapMention = { userId -> viewModel.openDirectChat(userId, onOpenChat) },
-                                    onOpenAttachment = { attachment ->
-                                        if (attachment.isSticker) {
-                                            // Shown larger, with "Add to
-                                            // family stickers" — not the
-                                            // photo viewer, which zooms a
-                                            // photograph and would draw
-                                            // frame zero on black.
-                                            viewingSticker = attachment
-                                        } else if (attachment.isFile) {
-                                            openFile(attachment)
-                                        } else {
-                                            // Built here, the one place the
-                                            // whole message is in scope: the
-                                            // viewer pages through all of its
-                                            // media, starting on the tapped
-                                            // one, and the per-attachment
-                                            // callbacks below stay as they are.
-                                            viewingAlbum = AttachmentAlbum.opening(
-                                                item.entity.attachmentList,
-                                                attachment,
-                                            )
-                                        }
-                                    },
-                                    onLongPress = { pressed, bounds ->
-                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        pickerTarget = ReactionPickerTarget(pressed, bounds)
-                                    },
-                                    // While the capsule is open its anchor
-                                    // tracks the bubble's live bounds — the
-                                    // focusable popup closes the keyboard and
-                                    // the list shifts under it, so a one-shot
-                                    // snapshot would go stale. No-op (no
-                                    // state write) while no capsule is open.
-                                    onPositioned = { positioned, rect ->
-                                        val current = pickerTarget
-                                        if (current != null &&
-                                            current.item.key == positioned.key &&
-                                            current.anchorBounds != rect
-                                        ) {
-                                            pickerTarget = current.copy(anchorBounds = rect)
-                                        }
-                                    },
-                                )
-                            }
-                        }
-                    }
-                    if (items.isNotEmpty()) {
-                        // Last index = the visually-top (oldest) end. The 32dp
-                        // box is always composed so the item's height truly
-                        // never changes; only the spinner inside fades, so
-                        // appearing never shifts the oldest messages and the
-                        // exit animation can actually play. Gated on a
-                        // non-empty list so this extra item never renders in
-                        // an empty chat; the chat-empty item is likewise
-                        // excluded from the nearOldEnd trigger by its
-                        // items.isNotEmpty() guard.
-                        item(key = "chat-older-loading") {
+                        items(
+                            items,
+                            key = { it.key },
+                            // Per row KIND, so a row scrolling in reuses the
+                            // slot of one of its own kind rather than whatever
+                            // left last — a day pill's slot is no start for a
+                            // bubble.
+                            contentType = { it.contentType },
+                        ) { item ->
+                            // A jumped-to bubble is briefly tinted, so the eye
+                            // lands on the right one in a wall of text.
+                            val jumped = item is ChatListItem.MessageItem &&
+                                item.entity.serverId != null &&
+                                item.entity.serverId == highlightedMessageId
+                            val highlight = jumpTint(
+                                jumped = jumped,
+                                tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                            )
                             Box(
                                 modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(32.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                androidx.compose.animation.AnimatedVisibility(
-                                    visible = loadingOlder,
-                                    enter = fadeIn(tween(150)),
-                                    exit = fadeOut(tween(150)),
-                                ) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(20.dp),
-                                        strokeWidth = 2.dp,
+                                    // Fading in and sliding are for a chat that
+                                    // is OPEN. While it is still opening (the
+                                    // anchor scroll, the first pages of a
+                                    // catch-up landing) every row would animate
+                                    // into a position the reader has not been
+                                    // shown yet — work for frames nobody sees.
+                                    .animateItem(
+                                        fadeInSpec = if (settled) tween(200) else null,
+                                        placementSpec = if (settled) {
+                                            spring(stiffness = Spring.StiffnessMediumLow)
+                                        } else {
+                                            null
+                                        },
                                     )
+                                    .background(highlight, RoundedCornerShape(12.dp)),
+                            ) {
+                                when (item) {
+                                    is ChatListItem.DateSeparator -> DateSeparatorPill(item.label)
+                                    is ChatListItem.NewMessagesDivider ->
+                                        NewMessagesDividerRow(item.count)
+                                    is ChatListItem.MessageItem -> MessageBubble(
+                                        blockedUserIds = blockedUserIds,
+                                        revealedMessages = revealedMessages,
+                                        item = item,
+                                        chat = chat,
+                                        isMine = item.entity.senderId == myUserId,
+                                        fromAssistant = assistantUserId != null &&
+                                            item.entity.senderId == assistantUserId,
+                                        // Asked of the ROW, not only of the
+                                        // live set: a picture answer produces
+                                        // no deltas to put an id in it, and a
+                                        // relaunch mid-answer starts with it
+                                        // empty (AssistantAnswer).
+                                        isStreaming = AssistantAnswer.isWorking(
+                                            entity = item.entity,
+                                            isAssistantChat = chat?.kind == "ai",
+                                            assistantUserId = assistantUserId,
+                                            myUserId = myUserId,
+                                            streamingIds = streamingIds,
+                                            failedIds = failedAssistantAnswers.keys,
+                                        ),
+                                        answerFailure = item.entity.serverId
+                                            ?.let { failedAssistantAnswers[it] },
+                                        myUserId = myUserId,
+                                        memberNames = memberNames,
+                                        memberAvatars = memberAvatars,
+                                        linkPreviews = linkPreviews,
+                                        previewsEnabled = linkPreviewsEnabled,
+                                        mapPreviewsEnabled = mapPreviewsEnabled,
+                                        onRequestPreview = viewModel::requestLinkPreview,
+                                        streamUrl = viewModel::attachmentStreamUrl,
+                                        onFailedTap = { failedActionTarget = it },
+                                        onToggleReaction = applyToggle,
+                                        onVote = { serverId, optionId ->
+                                            haptics.performHapticFeedback(HapticFeedbackType.Confirm)
+                                            viewModel.vote(serverId, optionId)
+                                        },
+                                        // Not while recording, like the toolbar's (#79, S1.7).
+                                        onCallBack = if (callsEnabled && GroupRules.offersCalls(chat?.kind) && !isRecording) {
+                                            startCall
+                                        } else {
+                                            null
+                                        },
+                                        onTapQuote = {
+                                            pendingJump = JumpRequest(serverId = it, anchor = false)
+                                        },
+                                        onOpenThread = { rootId -> chat?.id?.let { openOwnThread(it, rootId) } },
+                                        onTapMention = { userId -> viewModel.openDirectChat(userId, onOpenChat) },
+                                        onOpenAttachment = { attachment ->
+                                            if (attachment.isSticker) {
+                                                // Shown larger, with "Add to
+                                                // family stickers" — not the
+                                                // photo viewer, which zooms a
+                                                // photograph and would draw
+                                                // frame zero on black.
+                                                viewingSticker = attachment
+                                            } else if (attachment.isFile) {
+                                                openFile(attachment)
+                                            } else {
+                                                // Built here, the one place the
+                                                // whole message is in scope: the
+                                                // viewer pages through all of its
+                                                // media, starting on the tapped
+                                                // one, and the per-attachment
+                                                // callbacks below stay as they are.
+                                                viewingAlbum = AttachmentAlbum.opening(
+                                                    item.entity.attachmentList,
+                                                    attachment,
+                                                )
+                                            }
+                                        },
+                                        onLongPress = { pressed, bounds ->
+                                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            pickerTarget = ReactionPickerTarget(pressed, bounds)
+                                        },
+                                        // While the capsule is open its anchor
+                                        // tracks the bubble's live bounds — the
+                                        // focusable popup closes the keyboard and
+                                        // the list shifts under it, so a one-shot
+                                        // snapshot would go stale. No-op (no
+                                        // state write) while no capsule is open.
+                                        //
+                                        // The bounds are worked out only for
+                                        // that one bubble: every other row's
+                                        // placement costs a key comparison.
+                                        onPositioned = { positioned, coordinates ->
+                                            val current = pickerTarget
+                                            if (current != null && current.item.key == positioned.key) {
+                                                val rect = coordinates.boundsInWindow()
+                                                if (current.anchorBounds != rect) {
+                                                    pickerTarget = current.copy(anchorBounds = rect)
+                                                }
+                                            }
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                        if (items.isNotEmpty()) {
+                            // Last index = the visually-top (oldest) end. The 32dp
+                            // box is always composed so the item's height truly
+                            // never changes; only the spinner inside fades, so
+                            // appearing never shifts the oldest messages and the
+                            // exit animation can actually play. Gated on a
+                            // non-empty list so this extra item never renders in
+                            // an empty chat; the chat-empty item is likewise
+                            // excluded from the nearOldEnd trigger by its
+                            // items.isNotEmpty() guard.
+                            item(key = "chat-older-loading") {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(32.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    androidx.compose.animation.AnimatedVisibility(
+                                        visible = loadingOlder,
+                                        enter = fadeIn(tween(150)),
+                                        exit = fadeOut(tween(150)),
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(20.dp),
+                                            strokeWidth = 2.dp,
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1688,19 +1814,31 @@ fun ChatScreen(
             // While the video recorder is open the composer row is not drawn
             // and takes no hits: the recorder's own bar is where it was
             // (#79, decision 41).
+            //
+            // The composer keeps its full height whatever is left for it
+            // (#106, section 3, fix 4): a phone lying down with the keyboard
+            // up leaves about 60dp under the top bar, and the row used to
+            // take what the Column could still give it — squeezed to a
+            // sliver, the field and the slot cut in half. Measured at its
+            // own height and anchored to the bottom, it wins over the list
+            // (which collapses, as it must) and any overflow rises under the
+            // top bar instead of out of the row.
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .wrapContentHeight(align = Alignment.Bottom, unbounded = true),
+            ) {
             ComposerUnderRecorder(recorderOpen = recorderOpen) {
             InputBar(
                 state = viewModel.inputState,
                 onSend = viewModel::send,
-                // Shown, not sent: answering a video message, the banner
-                // names it — its excerpt is its empty body (#79, S5.7). The
-                // draft the send carries stays the server's cut.
+                // Shown, not sent: answering a video message, an animation or
+                // a sticker, the banner names it — its excerpt is its empty
+                // body (#79, S5.7; #96). The draft the send carries stays the
+                // server's cut.
                 replyDraft = replyDraft?.let { draft ->
-                    if (draft.excerpt.isEmpty() && quotesRound(items, draft.messageId)) {
-                        draft.copy(excerpt = stringResource(R.string.s_video_message))
-                    } else {
-                        draft
-                    }
+                    val named = if (draft.excerpt.isEmpty()) quotedMedia(items, draft.messageId) else null
+                    if (named != null) draft.copy(excerpt = quotedMediaLabel(named)) else draft
                 },
                 replyAuthorName = replyDraft?.senderId?.let { sender ->
                     if (sender == myUserId) {
@@ -1750,7 +1888,9 @@ fun ChatScreen(
                         busy = mediaState.isBusy,
                         notSent = notSent.isNotEmpty(),
                     ),
-                    familyOrDirectChat = chat?.kind == "family" || chat?.kind == "direct",
+                    // Any chat of people — the family chat, a direct chat or
+                    // a group (GroupRules.offersVideoMessages).
+                    familyOrDirectChat = GroupRules.offersVideoMessages(chat?.kind),
                     serverOffersRound = roundVideoOffered,
                     hasCamera = hasCamera,
                     encoderProbePasses = true,
@@ -1806,7 +1946,13 @@ fun ChatScreen(
                 onDeleteNotSent = viewModel::deleteNotSent,
                 onDiscardStaged = viewModel::discardStaged,
                 onDismissMediaError = viewModel::clearMediaState,
-                showsAssistantMention = chat?.kind == "family" && assistantUserId != null,
+                // The family chat, on a server with an assistant that names
+                // its processor — the rule iOS has always used (#106).
+                showsAssistantMention = AssistantConsent.offersMention(
+                    chatKind = chat?.kind,
+                    hasAssistant = assistantUserId != null,
+                    processor = assistantProcessor,
+                ),
                 onShareLocation = shareLocation,
                 // The picture affordances. Each is absent, not disabled,
                 // wherever the server cannot do the thing — an affordance
@@ -1832,6 +1978,7 @@ fun ChatScreen(
                 assistantIsUnnamed = assistantIsUnnamed,
                 onReviewAssistantConsent = viewModel::send,
             )
+            }
             }
         }
     }
@@ -2120,10 +2267,14 @@ fun ChatScreen(
     }
 
     failedActionTarget?.let { clientMsgId ->
+        // Why, when the server said so in words this app has — a paid
+        // family past its storage, above all (docs/protocol.md, "Paid
+        // families"); otherwise the usual line.
+        val refusal = SendRefusals.sentence(sendRefusals[clientMsgId])
         AlertDialog(
             onDismissRequest = { failedActionTarget = null },
             title = { Text(stringResource(R.string.s_message_not_sent)) },
-            text = { Text(stringResource(R.string.s_try_sending_it_again_or_delete_the_draft)) },
+            text = { Text(stringResource(refusal ?: R.string.s_try_sending_it_again_or_delete_the_draft)) },
             confirmButton = {
                 TextButton(onClick = {
                     viewModel.retry(clientMsgId)
@@ -2519,14 +2670,14 @@ private fun EditBanner(onCancel: () -> Unit) {
 internal fun MessageContextMenu(
     onReply: () -> Unit,
     onEdit: () -> Unit,
-    onViewThread: () -> Unit = {},
-    /** A video message's "Open full screen" (#79, S5.4); null — no row — on anything else. */
-    onOpenFullScreen: (() -> Unit)? = null,
     onClosePoll: () -> Unit,
     onCopy: () -> Unit,
     onShare: () -> Unit,
     onSave: () -> Unit,
     modifier: Modifier = Modifier,
+    onViewThread: () -> Unit = {},
+    /** A video message's "Open full screen" (#79, S5.4); null — no row — on anything else. */
+    onOpenFullScreen: (() -> Unit)? = null,
     /**
      * Reply needs a server id to quote, so it is hidden — not disabled —
      * on a message that has not been acked yet.
@@ -2667,12 +2818,12 @@ internal fun MessageContextMenu(
 @Composable
 private fun MessageSafetyMenu(
     isSenderBlocked: Boolean,
-    /** An assistant reply: one row, and it is the assistant's report. */
-    isAssistantReply: Boolean = false,
     onBack: () -> Unit,
     onReport: () -> Unit,
     onToggleBlock: () -> Unit,
     modifier: Modifier = Modifier,
+    /** An assistant reply: one row, and it is the assistant's report. */
+    isAssistantReply: Boolean = false,
 ) {
     Surface(
         shape = RoundedCornerShape(16.dp),
@@ -2977,6 +3128,55 @@ private fun NewMessagesDividerRow(count: Int) {
     }
 }
 
+/**
+ * The width a bubble's ROW is laid out at, when the list that holds it
+ * already knows it — null where it does not, and the bubble then measures
+ * for itself.
+ *
+ * A bubble needs the row's width during COMPOSITION (its balloon is capped
+ * at 80% of it, and an inline formula at that less the inset), and finding
+ * it out there used to mean a BoxWithConstraints in every row: a
+ * subcomposition per bubble, the costliest layout there is to put in a
+ * LazyColumn, paid again by every row that scrolled in. The chat list
+ * knows the number already — it is its own width less its content padding —
+ * so it says it once, here, and works it out in pixels exactly the way the
+ * list's own measuring does, so the cap is the very value BoxWithConstraints
+ * reported.
+ */
+internal val LocalBubbleRowWidth = compositionLocalOf<Dp?> { null }
+
+/** No link previews, for a list that does without them (the thread screen). */
+internal val NoLinkPreviews: State<Map<String, LinkPreviewState>> = object : State<Map<String, LinkPreviewState>> {
+    override val value: Map<String, LinkPreviewState> get() = emptyMap()
+}
+
+/**
+ * The row's box: a plain one when [rowWidth] is known, a BoxWithConstraints
+ * that measures it otherwise (a list that does not provide
+ * [LocalBubbleRowWidth]). Either way [content] is handed the row's width.
+ */
+@Composable
+private fun BubbleRowBox(rowWidth: Dp?, content: @Composable (Dp) -> Unit) {
+    if (rowWidth != null) {
+        Box(modifier = Modifier.fillMaxWidth()) { content(rowWidth) }
+    } else {
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) { content(maxWidth) }
+    }
+}
+
+/**
+ * Where a bubble was last placed, held WITHOUT snapshot state: nothing
+ * draws from it, so nothing should be invalidated when it moves — and it
+ * moves on every frame of a scroll. The window bounds are worked out on
+ * demand, from the live coordinates, which is the same rectangle the last
+ * placement would have reported.
+ */
+private class PlacedCoordinates {
+    var coordinates: LayoutCoordinates? = null
+
+    fun windowBounds(): Rect = coordinates?.takeIf { it.isAttached }?.boundsInWindow() ?: Rect.Zero
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun MessageBubble(
@@ -3001,7 +3201,13 @@ internal fun MessageBubble(
     myUserId: Long?,
     memberNames: Map<Long, String>,
     memberAvatars: Map<Long, Long>,
-    linkPreviews: Map<String, LinkPreviewState>,
+    /**
+     * Preview state for every link the app has looked at, keyed by URL — as
+     * the State that holds the map, so only a bubble whose own link changed
+     * redraws when a preview lands (BubbleContent reads its one entry
+     * through derivedStateOf).
+     */
+    linkPreviews: State<Map<String, LinkPreviewState>>,
     previewsEnabled: Boolean,
     /** Whether a shared location draws a map — the reader's own setting. */
     mapPreviewsEnabled: Boolean,
@@ -3012,7 +3218,12 @@ internal fun MessageBubble(
     /** (message server id, option id) — a tap on a poll option. */
     onVote: (Long, Long) -> Unit,
     onLongPress: (ChatListItem.MessageItem, Rect) -> Unit,
-    onPositioned: (ChatListItem.MessageItem, Rect) -> Unit,
+    /**
+     * Every placement of the balloon, with its coordinates rather than its
+     * bounds: the caller turns them into window bounds only for the one
+     * bubble an open capsule is anchored to (see [PlacedCoordinates]).
+     */
+    onPositioned: (ChatListItem.MessageItem, LayoutCoordinates) -> Unit,
     onTapQuote: (Long) -> Unit,
     onOpenAttachment: (AttachmentDto) -> Unit,
     /** Tapping a call record calls back; null where calling is not possible. */
@@ -3052,17 +3263,20 @@ internal fun MessageBubble(
         )
     }
     // Long-press opens the floating capsule — acked messages only: a
-    // pending row has no server id to react to yet. The bubble's window
-    // bounds are captured on every placement so the capsule anchors to
-    // where the bubble actually is (nothing reads the state during
-    // composition, so scroll churn does not recompose); each placement
-    // also forwards the bounds via onPositioned so an already-open
-    // capsule can re-anchor when the list shifts. clip keeps
+    // pending row has no server id to react to yet. The bubble's layout
+    // coordinates are kept on every placement so the capsule anchors to
+    // where the bubble actually is, and its window bounds are worked out
+    // from them only when somebody asks — the long-press, or an open
+    // capsule re-anchoring. They used to be computed, and written into a
+    // snapshot state, on every placement of every bubble: every frame of
+    // every scroll, for a value read once in a while. Each placement still
+    // forwards the coordinates via onPositioned so an already-open capsule
+    // can re-anchor when the list shifts. clip keeps
     // pressed content inside the bubble's rounded shape; indication is
     // null because the onClick is empty (kept only so combinedClickable
     // preserves the long-press semantics) — a casual tap should not
     // ripple, the capsule's spring-out is the long-press feedback.
-    var bubbleBounds by remember { mutableStateOf(Rect.Zero) }
+    val bubbleCoordinates = remember { PlacedCoordinates() }
     // Detected links are resolved once here because two places need
     // them: BubbleContent draws and hit-tests them, and the bubble's
     // semantics below turns each into a custom action — the tap
@@ -3096,73 +3310,27 @@ internal fun MessageBubble(
     // of placeholder text in an ordinary balloon, whatever the message
     // underneath it turns out to be.
     val surfaceShape = if (bareMedia && !isHidden) RectangleShape else bubbleShape
-    // MARKDOWN FIRST, and the order is load-bearing. Markdown DELETES
-    // characters (`**`, backticks, `](url)`), so detecting links over the
-    // raw body and drawing the rendered one would leave every link after
-    // the first markup token pointing at the wrong glyphs — silently, with
-    // nothing failing. Everything below indexes the block's own
-    // `rendered.text`.
-    //
-    // Almost always ONE block: only a table splits a body, and each block
-    // is then a whole offset space of its own — its links index its own
-    // string, and the hit test below gets one layout result per block. A
-    // span from one block resolved against another's layout would point at
-    // whatever glyphs happened to sit at those offsets.
-    //
-    // Emoji-only bodies branch around it: the ladder's whole subject is
-    // that the message is nothing but glyphs, so a markup pass could only
-    // take something away, and there is nothing in one to detect. Same rule
-    // as iOS and macOS.
+    // Markdown, then the links and member names inside each block —
+    // BubbleBodies says why the order is load-bearing, and why the answer
+    // is kept there rather than only here: a row that scrolls away and
+    // back used to redo the markdown pass and Linkify in the frame it
+    // reappeared in. Remembered here as well, so a recomposition of a row
+    // that stays on screen does not even ask.
     val bodyBlocks = remember(entity.body, entity.mentionsJson, emojiFontSize) {
-        if (emojiFontSize != null) {
-            listOf(BodyBlock(MessageMarkdown.Block.Text(MessageMarkdown.plain(entity.body))))
-        } else {
-            MessageMarkdown.blocks(entity.body).map { block ->
-                when (block) {
-                    // The markup's own links first, then whatever the
-                    // detector finds in the text NOT already covered by
-                    // one. Both index this block's rendered text, and both
-                    // feed one hit test.
-                    //
-                    // The overlap rule is not tidiness. `[https://www.paypal.com](https://evil.example)`
-                    // renders the label "https://www.paypal.com", which Linkify then
-                    // detects as a link to PayPal — two spans over the same glyphs,
-                    // one going somewhere else. Whichever the hit test picked, a tap
-                    // could open a destination the reader had every reason to think
-                    // was the one they could see. Dropping the detector's overlap
-                    // leaves exactly one answer: the destination the author wrote.
-                    is MessageMarkdown.Block.Text -> BodyBlock(
-                        block = block,
-                        // The members named ride the same list and the
-                        // same hit test as links, under the same overlap
-                        // rule — a link over a name is still the link.
-                        links = MessageLinks.mergeSpans(
-                            MessageLinks.mergeSpans(
-                                block.rendered.links,
-                                MessageLinks.linkSpans(block.rendered.text),
-                            ),
-                            MessageLinks.memberMentionSpans(
-                                block.rendered.text,
-                                MentionsCodec.decode(entity.mentionsJson),
-                            ),
-                        ),
-                    )
-                    // A table's cells carry no links by construction
-                    // (MessageMarkdown.cell says why), so there is nothing
-                    // inside one to hit-test.
-                    is MessageMarkdown.Block.Table -> BodyBlock(block)
-                }
-            }
-        }
+        BubbleBodies.blocks(entity.body, entity.mentionsJson, emojiOnly = emojiFontSize != null)
     }
     val uriHandler = LocalUriHandler.current
-    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-        val bubbleMaxWidth = maxWidth * 0.8f
+    BubbleRowBox(LocalBubbleRowWidth.current) { rowWidth ->
+        // Four fifths of the row on a phone, as always; at most 560dp on a
+        // wide pane (#106) — the column grew to use the pane, the balloon
+        // did not, so a line of text stays readable and a photo's balloon
+        // stays photo-sized.
+        val bubbleMaxWidth = ConversationColumn.bubbleMaxWidth(rowWidth)
         val bubbleModifier = Modifier
             .widthIn(max = bubbleMaxWidth)
             .onGloballyPositioned {
-                bubbleBounds = it.boundsInWindow()
-                onPositioned(item, bubbleBounds)
+                bubbleCoordinates.coordinates = it
+                onPositioned(item, it)
             }
             .clip(surfaceShape)
             .then(
@@ -3216,7 +3384,7 @@ internal fun MessageBubble(
                                 onToggleReaction(entity.serverId, DOUBLE_TAP_REACTION)
                             }
                         },
-                        onLongClick = { onLongPress(item, bubbleBounds) },
+                        onLongClick = { onLongPress(item, bubbleCoordinates.windowBounds()) },
                     )
                 } else {
                     Modifier
@@ -3280,47 +3448,51 @@ internal fun MessageBubble(
                 },
                 modifier = bubbleModifier,
             ) {
-                BubbleContent(
-                    fromAssistant = fromAssistant,
-                    entity = entity,
-                    item = item,
-                    isHidden = isHidden,
-                    blockedUserIds = blockedUserIds,
-                    chat = chat,
-                    isMine = isMine,
-                    isStreaming = isStreaming,
-                    answerFailure = answerFailure,
-                    mediaOnly = bareMedia,
-                    sticker = sticker,
-                    round = round,
-                    emojiFontSize = emojiFontSize,
-                    blocks = bodyBlocks,
-                    memberNames = memberNames,
-                    memberAvatars = memberAvatars,
-                    myUserId = myUserId,
-                    linkPreviews = linkPreviews,
-                    previewsEnabled = previewsEnabled,
-                    mapPreviewsEnabled = mapPreviewsEnabled,
-                    onRequestPreview = onRequestPreview,
-                    streamUrl = streamUrl,
-                    onOpenLink = { runCatching { uriHandler.openUri(it) } },
-                    onFailedTap = onFailedTap,
-                    onToggleReaction = { emoji ->
-                        entity.serverId?.let { onToggleReaction(it, emoji) }
-                    },
-                    onVote = { optionId ->
-                        entity.serverId?.let { onVote(it, optionId) }
-                    },
-                    onCallBack = onCallBack,
-                    onDoubleTap = {
-                        entity.serverId?.let { onToggleReaction(it, DOUBLE_TAP_REACTION) }
-                    },
-                    onTextLongPress = { onLongPress(item, bubbleBounds) },
-                    onTapQuote = onTapQuote,
-                    onOpenAttachment = onOpenAttachment,
-                    onOpenThread = onOpenThread,
-                    onTapMention = onTapMention,
-                )
+                // The widest an inline formula may be drawn: the balloon's
+                // cap less its 12dp inset on either side.
+                CompositionLocalProvider(LocalRichMaxWidth provides bubbleMaxWidth - 24.dp) {
+                    BubbleContent(
+                        fromAssistant = fromAssistant,
+                        entity = entity,
+                        item = item,
+                        isHidden = isHidden,
+                        blockedUserIds = blockedUserIds,
+                        chat = chat,
+                        isMine = isMine,
+                        isStreaming = isStreaming,
+                        answerFailure = answerFailure,
+                        mediaOnly = bareMedia,
+                        sticker = sticker,
+                        round = round,
+                        emojiFontSize = emojiFontSize,
+                        blocks = bodyBlocks,
+                        memberNames = memberNames,
+                        memberAvatars = memberAvatars,
+                        myUserId = myUserId,
+                        linkPreviews = linkPreviews,
+                        previewsEnabled = previewsEnabled,
+                        mapPreviewsEnabled = mapPreviewsEnabled,
+                        onRequestPreview = onRequestPreview,
+                        streamUrl = streamUrl,
+                        onOpenLink = { runCatching { uriHandler.openUri(it) } },
+                        onFailedTap = onFailedTap,
+                        onToggleReaction = { emoji ->
+                            entity.serverId?.let { onToggleReaction(it, emoji) }
+                        },
+                        onVote = { optionId ->
+                            entity.serverId?.let { onVote(it, optionId) }
+                        },
+                        onCallBack = onCallBack,
+                        onDoubleTap = {
+                            entity.serverId?.let { onToggleReaction(it, DOUBLE_TAP_REACTION) }
+                        },
+                        onTextLongPress = { onLongPress(item, bubbleCoordinates.windowBounds()) },
+                        onTapQuote = onTapQuote,
+                        onOpenAttachment = onOpenAttachment,
+                        onOpenThread = onOpenThread,
+                        onTapMention = onTapMention,
+                    )
+                }
             }
         }
     }
@@ -3388,6 +3560,38 @@ private const val ANCHOR_VIEWPORT_TIMEOUT_MS = 1_000L
 
 /** How long a jumped-to bubble stays tinted. Same as iOS. */
 private const val HIGHLIGHT_MS = 1_600L
+
+/** The list slot kind a row reuses — see the `contentType` at the call site. */
+private val ChatListItem.contentType: String
+    get() = when (this) {
+        is ChatListItem.MessageItem -> "message"
+        is ChatListItem.DateSeparator -> "date"
+        is ChatListItem.NewMessagesDivider -> "unread"
+    }
+
+/**
+ * The tint under a jumped-to row: [tint] while [jumped], fading in and out
+ * over 250ms — what `animateColorAsState(tween(250))` drew, made cheap for
+ * the rows that are NOT jumped to, which is all of them but one.
+ *
+ * animateColorAsState starts an effect in every row it is called in, and
+ * this was called in every row of the thread: one coroutine per row that
+ * scrolled in, each waiting for a highlight that almost never comes. Here a
+ * row holds only an idle Animatable, and the effect exists only while the
+ * colour is somewhere other than transparent or headed somewhere else —
+ * the jumped row, for its tint and its fade back out.
+ */
+@Composable
+private fun jumpTint(jumped: Boolean, tint: Color): Color {
+    val target = if (jumped) tint else Color.Transparent
+    // Starts AT the target, as animateColorAsState's does: a row composed
+    // while already jumped to shows its tint at once rather than fading in.
+    val colour = remember { Animatable(target) }
+    if (colour.targetValue != target || colour.value != Color.Transparent) {
+        LaunchedEffect(target) { colour.animateTo(target, tween(250)) }
+    }
+    return colour.value
+}
 
 @Composable
 private fun QuoteBlock(
@@ -3748,19 +3952,6 @@ private fun ReactionChipView(
         }
     }
 }
-
-/**
- * One block of a rendered body with the links that live INSIDE it.
- *
- * The pairing is the point: [links] index `block`'s own rendered string
- * and are meaningless against any other, so the two travel together from
- * the one place that resolves them down to the one layout result they are
- * hit-tested against. A table block carries none — its cells hold no links.
- */
-private data class BodyBlock(
-    val block: MessageMarkdown.Block,
-    val links: List<LinkSpan> = emptyList(),
-)
 
 /**
  * The line a call record draws: an outbound / inbound / missed glyph and
@@ -4144,11 +4335,14 @@ private fun PollComposerSheet(
                 text = stringResource(R.string.s_new_poll),
                 style = MaterialTheme.typography.titleLarge,
             )
+            // Emoji as you type (#101), like every prose field.
+            val (questionValue, onQuestionValue) = proseValue(draft.question, onQuestionChange)
             OutlinedTextField(
-                value = draft.question,
-                onValueChange = onQuestionChange,
+                value = questionValue,
+                onValueChange = onQuestionValue,
                 label = { Text(stringResource(R.string.s_question)) },
                 singleLine = false,
+                keyboardOptions = ProseKeyboard.Sentences,
                 modifier = Modifier.fillMaxWidth(),
             )
             draft.options.forEachIndexed { index, option ->
@@ -4156,11 +4350,13 @@ private fun PollComposerSheet(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
+                    val (optionValue, onOptionValue) = proseValue(option) { onOptionChange(index, it) }
                     OutlinedTextField(
-                        value = option,
-                        onValueChange = { onOptionChange(index, it) },
+                        value = optionValue,
+                        onValueChange = onOptionValue,
                         placeholder = { Text(stringResource(R.string.s_option)) },
                         singleLine = true,
+                        keyboardOptions = ProseKeyboard.Sentences,
                         modifier = Modifier.weight(1f),
                     )
                     // Never below two: one option is not a question.
@@ -4248,8 +4444,8 @@ private fun BubbleContent(
     memberNames: Map<Long, String>,
     memberAvatars: Map<Long, Long>,
     myUserId: Long?,
-    /** Preview state for every link the app has looked at, keyed by URL. */
-    linkPreviews: Map<String, LinkPreviewState>,
+    /** Preview state for every link the app has looked at, keyed by URL (see MessageBubble). */
+    linkPreviews: State<Map<String, LinkPreviewState>>,
     /** False = this device never requests a linked page (Settings). */
     previewsEnabled: Boolean,
     /** Whether a shared location draws a map — the reader's own setting. */
@@ -4393,10 +4589,10 @@ private fun BubbleContent(
                 },
                 excerpt = when {
                     replyHidden -> ""
-                    // The quoted message is a circle this list holds: its
-                    // excerpt is its (empty) body, so the quote names it
-                    // (#79, S5.7).
-                    item.quotesRound && quotedExcerpt.isEmpty() -> stringResource(R.string.s_video_message)
+                    // The quoted message is a circle, an animation or a sticker
+                    // this list holds: its excerpt is its (empty) body, so the
+                    // quote names it (#79, S5.7; #96).
+                    quotedExcerpt.isEmpty() && item.quotedMedia != null -> quotedMediaLabel(item.quotedMedia)
                     else -> quotedExcerpt
                 },
                 isMine = isMine,
@@ -4451,7 +4647,10 @@ private fun BubbleContent(
         // The attachments sit above the caption, inside the balloon — one
         // exactly as before, an album as a stack of cards, files and audio
         // as rows (see AttachmentGroup).
-        val bubbleAttachments = entity.attachmentList
+        // Remembered with the row, like the sticker and circle decisions in
+        // MessageBubble: attachmentList is a getter over a JSON column, and
+        // this body recomposes far more often than the row's data changes.
+        val bubbleAttachments = remember(entity) { entity.attachmentList }
         if (round != null) {
             // Before the sticker's branch, and not an AttachmentGroup: a
             // video tile opens the viewer, and a circle plays where it is.
@@ -4534,9 +4733,19 @@ private fun BubbleContent(
             // its half instead, and says nothing extra. A refusal by the
             // provider's own filter says so instead of "ask again", which
             // would only earn the same refusal (docs/protocol.md, "The
-            // assistant").
+            // assistant"). A paid family's used-up allowance names the day
+            // it starts again — the 1st of a UTC month, named in UTC
+            // (docs/protocol.md, "Paid families").
+            val failureDate = AssistantAnswer.failureDate(answerFailure)
             Text(
-                text = stringResource(AssistantAnswer.failureSentence(answerFailure)),
+                text = if (failureDate != null) {
+                    stringResource(
+                        AssistantAnswer.failureSentence(answerFailure),
+                        TimeFormat.calendarDay(failureDate, zone = ZoneOffset.UTC),
+                    )
+                } else {
+                    stringResource(AssistantAnswer.failureSentence(answerFailure))
+                },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontStyle = FontStyle.Italic,
@@ -4604,12 +4813,22 @@ private fun BubbleContent(
                         table = block,
                         modifier = measureBlock.fillMaxWidth(),
                     )
+                    // A formula, a diagram or a graph (#97): its natural
+                    // width at most, the balloon's at least as a cap — and
+                    // measured, so the text blocks wrap against a wide
+                    // diagram rather than floating narrow beside it.
+                    is MessageMarkdown.Block.Rich -> RichBlockView(
+                        block = block,
+                        onDoubleTap = if (acked) ({ currentDoubleTap() }) else null,
+                        onLongPress = { currentLongPress() },
+                        modifier = measureBlock,
+                    )
                 }
             }
             // The assistant is still writing and the last thing rendered is
-            // a grid: the cursor becomes a block of its own rather than
-            // landing inside a cell.
-            if (isStreaming && blocks.lastOrNull()?.block is MessageMarkdown.Block.Table) {
+            // a grid or a drawing: the cursor becomes a block of its own
+            // rather than landing inside a cell or on a picture.
+            if (isStreaming && blocks.isNotEmpty() && blocks.last().block !is MessageMarkdown.Block.Text) {
                 Spacer(Modifier.height(6.dp))
                 StreamingCursor()
             }
@@ -4655,7 +4874,12 @@ private fun BubbleContent(
         }
         if (previewUrl != null && previewsEnabled) {
             LaunchedEffect(previewUrl) { onRequestPreview(previewUrl) }
-            val state = linkPreviews[previewUrl]
+            // This link's entry alone: derived, so the bubble is invalidated
+            // only when THIS entry changes, not whenever any preview in the
+            // chat does.
+            val state = remember(previewUrl, linkPreviews) {
+                derivedStateOf { linkPreviews.value[previewUrl] }
+            }.value
             if (state is LinkPreviewState.Loaded) {
                 LinkPreviewCard(
                     preview = state.preview,
@@ -4789,11 +5013,15 @@ private fun ThreadChip(count: Long, onClick: () -> Unit, modifier: Modifier = Mo
  * a member"): a row of names above the composer, narrowed as the name is
  * typed; picking one rewrites the trailing `@prefix` into `@Name `. iOS:
  * MentionSuggestions.
+ *
+ * Since #106 the assistant leads it in the family chat — its own button
+ * left the composer row — drawn with the assistant's sparkle and its own
+ * name, and picked as `@ai ` (MemberMention.accept), never as that name.
  */
 @Composable
 internal fun MentionSuggestionsRow(
-    candidates: List<MentionDto>,
-    onPick: (String) -> Unit,
+    candidates: List<MemberMention.Suggestion>,
+    onPick: (MemberMention.Suggestion) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     LazyRow(
@@ -4801,13 +5029,38 @@ internal fun MentionSuggestionsRow(
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        items(candidates, key = { it.userId }) { member ->
-            val label = stringResource(R.string.s_mention_member, member.name)
-            AssistChip(
-                onClick = { onPick(member.name) },
-                label = { Text("@" + member.name, maxLines = 1) },
-                modifier = Modifier.semantics { contentDescription = label },
-            )
+        items(candidates, key = { it.key }) { suggestion ->
+            when (suggestion) {
+                is MemberMention.Suggestion.Assistant -> {
+                    // What it does, for TalkBack: the chip reads its name,
+                    // and picking it asks the assistant rather than naming
+                    // a member.
+                    val label = stringResource(R.string.s_ask_the_assistant)
+                    AssistChip(
+                        onClick = { onPick(suggestion) },
+                        label = { Text("@" + suggestion.displayName, maxLines = 1) },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Filled.AutoAwesome,
+                                contentDescription = null,
+                                modifier = Modifier.size(AssistChipDefaults.IconSize),
+                            )
+                        },
+                        modifier = Modifier
+                            .testTag("mention-assistant")
+                            .semantics { contentDescription = label },
+                    )
+                }
+                is MemberMention.Suggestion.Member -> {
+                    val member = suggestion.mention
+                    val label = stringResource(R.string.s_mention_member, member.name)
+                    AssistChip(
+                        onClick = { onPick(suggestion) },
+                        label = { Text("@" + member.name, maxLines = 1) },
+                        modifier = Modifier.semantics { contentDescription = label },
+                    )
+                }
+            }
         }
     }
 }
@@ -4898,6 +5151,7 @@ private fun ColumnScope.TextBlock(
             linked,
             SpanStyle(color = mentionColor, fontWeight = FontWeight.Bold),
             rawBody = drawSource,
+            math = rendered.math,
         )
         // While the assistant is writing, the text ends in a cursor
         // rather than just stopping mid-word — the same signal iOS and
@@ -4954,8 +5208,13 @@ private fun ColumnScope.TextBlock(
     // long one lays out once more, which is the cheaper of the two
     // visible corrections.
     val alignsEnd = ReplyBodyAlignment.alignsEnd(endAligned, textLayout?.lineCount ?: 1)
+    // Inline formulas (#97): each drawn one becomes a picture laid over its
+    // own source characters, so no offset moves and the link hit test
+    // above keeps resolving against the same string.
+    val inlineMath = rememberInlineMath(rendered.annotated)
     Text(
         text = body,
+        inlineContent = inlineMath,
         onTextLayout = { textLayout = it },
         // linkSpanAt queries the laid-out result (getLineLeft/Right,
         // getBoundingBox), which already reflects the alignment — no
@@ -5017,6 +5276,8 @@ private fun MarkdownTableRow(
         cells.forEachIndexed { index, cell ->
             Text(
                 text = cell,
+                // A cell may hold an inline formula too (rule 4).
+                inlineContent = rememberInlineMath(cell),
                 style = MaterialTheme.typography.bodyMedium,
                 // Only the base weight: a cell's own `**bold**` spans still
                 // win over it, in the header as well.
@@ -5166,11 +5427,11 @@ private fun StatusGlyph(
     // Neutral glyphs follow the bubble's content color (same reasoning
     // as the timestamp); READ keeps primary and FAILED keeps error.
     val metaColor = LocalContentColor.current.copy(alpha = 0.72f)
-    // ✓✓ only in direct chats: the family chat has many readers
-    // and one peer marker would lie.
-    val read = chat?.kind == "direct" &&
+    // ✓✓ only in direct chats: the family chat and a group have many
+    // readers and one peer marker would lie (docs/protocol.md, "Groups").
+    val read = GroupRules.drawsSeenTicks(chat?.kind) &&
         entity.serverId != null &&
-        entity.serverId <= (chat.peerLastReadId ?: 0L)
+        entity.serverId <= (chat?.peerLastReadId ?: 0L)
     Crossfade(
         targetState = entity.status to read,
         animationSpec = tween(150),
@@ -5926,7 +6187,9 @@ internal fun StagedAttachmentChip(
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            if (staged.kind == AttachmentDto.KIND_VIDEO) {
+            // An animation is a picture that moves (#96): no play glyph on it,
+            // here or in the bubble — the chip's words say "GIF".
+            if (staged.kind == AttachmentDto.KIND_VIDEO && !staged.animation) {
                 // The same 45%-black circle the bubble thumbnails and grid
                 // cells put behind their play glyph (Attachments.kt) — a
                 // bare white glyph disappears on a bright first frame.
@@ -5957,10 +6220,10 @@ internal fun StagedAttachmentChip(
                     )
                 } else {
                     stringResource(
-                        if (staged.kind == AttachmentDto.KIND_VIDEO) {
-                            R.string.s_video
-                        } else {
-                            R.string.s_photo
+                        when {
+                            staged.animation -> R.string.s_gif
+                            staged.kind == AttachmentDto.KIND_VIDEO -> R.string.s_video
+                            else -> R.string.s_photo
                         },
                     )
                 },
@@ -6056,9 +6319,12 @@ internal fun InputBar(
     replyDraft: ReplyToDto?,
     replyAuthorName: String,
     onCancelReply: () -> Unit,
-    /** The roster offered while a member is being named (docs/protocol.md, "Mentioning a member"). */
-    mentionCandidates: List<MentionDto> = emptyList(),
-    onPickMention: (String) -> Unit = {},
+    /**
+     * The roster offered while a member is being named (docs/protocol.md,
+     * "Mentioning a member") — the assistant first, in the family chat (#106).
+     */
+    mentionCandidates: List<MemberMention.Suggestion> = emptyList(),
+    onPickMention: (MemberMention.Suggestion) -> Unit = {},
     focusRequester: FocusRequester,
     isEditing: Boolean,
     onCancelEdit: () -> Unit,
@@ -6174,10 +6440,12 @@ internal fun InputBar(
     /** Share where this device is, once. */
     onShareLocation: () -> Unit,
     /**
-     * Offer the `@ai` mention. Only in the family chat, and only on a
-     * server that has an assistant — an absent `assistant` on
-     * `GET /families/mine` is the whole capability check
-     * (docs/protocol.md, "Mentioning the assistant in the family chat").
+     * Offer the `@ai` mention — since #106 the paperclip's "Ask the
+     * assistant", which appends `@ai ` as the row's button used to (the
+     * `@` strip offers it too, through [mentionCandidates]). Only in the
+     * family chat, and only on a server that has an assistant AND names
+     * its processor ([AssistantConsent.offersMention]; docs/protocol.md,
+     * "Mentioning the assistant in the family chat").
      */
     showsAssistantMention: Boolean,
     /**
@@ -6253,25 +6521,38 @@ internal fun InputBar(
         Column(modifier = Modifier.fillMaxWidth()) {
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             // The bar spans the window; what is IN it is held to the
-            // thread's readable column, centred the same way, so the
-            // attach button and Send sit over the bubbles they act on
-            // rather than at the window's far edges (iOS does the same).
-            Column(modifier = Modifier.readableColumn()) {
-            if (mentionCandidates.isNotEmpty()) {
-                MentionSuggestionsRow(candidates = mentionCandidates, onPick = onPickMention)
-            }
-            if (replyDraft != null) {
-                ReplyBanner(
-                    authorName = replyAuthorName,
-                    excerpt = replyDraft.excerpt,
-                    onCancel = onCancelReply,
+            // conversation's column (#106, ConversationColumn), centred the
+            // same way, so the attach button and Send sit over the bubbles
+            // they act on rather than at the window's far edges — and the
+            // composer is exactly as wide as the messages above it, where
+            // #44's 560dp cap squeezed it to a phone's width under a
+            // pane-wide bar.
+            Column(modifier = Modifier.conversationComposerColumn()) {
+            // What stacks above the row, in one order on every client (#106,
+            // docs/composer-and-wide-layout-2026-10-20.md, 2.4), top to bottom
+            // and nearest the field being what is being written: the notices,
+            // the voice messages not sent, the reply or edit banner, the staged
+            // attachments, the mention suggestions, then the row — with the
+            // busy/failure line directly above the row. The mentions used to
+            // sit on top, far from the `@` that raised them, and the notices
+            // below the banner.
+            //
+            // The consent first of the notices: nothing goes to the model until this
+            // member has said so, and the strip appears as the draft
+            // becomes one that would travel — in the assistant's own chat
+            // from the first character, in the family chat the moment
+            // `@ai` is typed (docs/protocol.md, "Consenting to the
+            // assistant").
+            if (assistantConsentNeeded && assistantProcessor != null) {
+                AssistantConsentStrip(
+                    processor = assistantProcessor,
+                    onReview = onReviewAssistantConsent,
                 )
-            }
-            if (isEditing) {
-                EditBanner(onCancel = onCancelEdit)
-            }
-            if (mediaState != ChatViewModel.MediaSendState.Idle) {
-                MediaStrip(state = mediaState, onDismiss = onDismissMediaError, onOpenSettings = onOpenSettings)
+            } else if (assistantIsUnnamed) {
+                // Nothing to agree TO on such a server, so there is no
+                // screen to raise — only this, and a send that does not
+                // happen.
+                AssistantConsentStrip(processor = null, onReview = null)
             }
             if (pictureNotice != null) {
                 AssistantPictureStrip(notice = pictureNotice)
@@ -6289,23 +6570,6 @@ internal fun InputBar(
                 PictureDescriptionHintText(
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                 )
-            }
-            // Before any of those: nothing goes to the model until this
-            // member has said so, and the strip appears as the draft
-            // becomes one that would travel — in the assistant's own chat
-            // from the first character, in the family chat the moment
-            // `@ai` is typed (docs/protocol.md, "Consenting to the
-            // assistant").
-            if (assistantConsentNeeded && assistantProcessor != null) {
-                AssistantConsentStrip(
-                    processor = assistantProcessor,
-                    onReview = onReviewAssistantConsent,
-                )
-            } else if (assistantIsUnnamed) {
-                // Nothing to agree TO on such a server, so there is no
-                // screen to raise — only this, and a send that does not
-                // happen.
-                AssistantConsentStrip(processor = null, onReview = null)
             }
             // Each in its own row, never carried by the composer's Send: a
             // recording nobody finished deciding about cannot ride out with
@@ -6333,8 +6597,25 @@ internal fun InputBar(
                     )
                 }
             }
+            if (replyDraft != null) {
+                ReplyBanner(
+                    authorName = replyAuthorName,
+                    excerpt = replyDraft.excerpt,
+                    onCancel = onCancelReply,
+                )
+            }
+            if (isEditing) {
+                EditBanner(onCancel = onCancelEdit)
+            }
             if (staged.isNotEmpty()) {
                 StagedAttachmentRow(staged = staged, onDiscard = onDiscardStaged)
+            }
+            if (mentionCandidates.isNotEmpty()) {
+                MentionSuggestionsRow(candidates = mentionCandidates, onPick = onPickMention)
+            }
+            // "Sending…" or what went wrong, against the row it is about (2.4).
+            if (mediaState != ChatViewModel.MediaSendState.Idle) {
+                MediaStrip(state = mediaState, onDismiss = onDismissMediaError, onOpenSettings = onOpenSettings)
             }
             Row(
                 modifier = Modifier
@@ -6353,6 +6634,16 @@ internal fun InputBar(
                 // message, which has no second attachment to add.
                 // One "attach" intent with two sources — the composer is
                 // too narrow for two buttons beside the field.
+                //
+                // THE ROW (#106, docs/composer-and-wide-layout-2026-10-20.md,
+                // 2.1): the paperclip ALONE before the field, the stickers
+                // (and the assistant chat's paintbrush, and the empty
+                // field's video button) INSIDE it at its trailing edge, the
+                // slot after it. Three buttons used to stand before the
+                // field and left it 120dp on a 412dp phone, 35dp in a
+                // 600dp split pane; `@ai` moved into the paperclip's menu
+                // and the `@` strip, and nothing in the row moves under the
+                // thumb when the first character is typed.
                 //
                 // While a voice message is recorded, its row takes the field's
                 // place AND the buttons' (S2.4).
@@ -6385,7 +6676,8 @@ internal fun InputBar(
                             // only be refused is worse than a disabled button.
                             enabled = !isEditing && !mediaState.isBusy &&
                                 staged.size < AttachmentDto.MAX_PER_MESSAGE,
-                            modifier = Modifier.size(44.dp),
+                            // A 48dp target, as every control of the row (#106).
+                            modifier = Modifier.size(ComposerSlot.MIN_TARGET_ANDROID_DP.dp),
                         ) {
                             Icon(
                                 imageVector = Icons.Filled.AttachFile,
@@ -6446,6 +6738,7 @@ internal fun InputBar(
                                     recordVoice = showsRecordVoice,
                                     recordVideo = videoRoundAvailable,
                                     poll = showsPoll,
+                                    askAssistant = showsAssistantMention,
                                 )
                                 groups.forEachIndexed { index, group ->
                                     if (index > 0) HorizontalDivider()
@@ -6546,6 +6839,24 @@ internal fun InputBar(
                                                     onRecordVideo()
                                                 },
                                             )
+                                            // "Ask the assistant" (#106): what the row's
+                                            // sparkle button did, in words, where people
+                                            // look for words — `@ai ` at the end of the
+                                            // draft, and the field focused to write the
+                                            // question.
+                                            AttachMenu.Item.ASK_ASSISTANT -> DropdownMenuItem(
+                                                text = { Text(stringResource(R.string.s_ask_the_assistant)) },
+                                                leadingIcon = {
+                                                    Icon(Icons.Filled.AutoAwesome, contentDescription = null)
+                                                },
+                                                onClick = {
+                                                    closeAttachMenu()
+                                                    AssistantMention.appendedToken(state.text.toString())?.let { token ->
+                                                        state.edit { append(token) }
+                                                    }
+                                                    runCatching { focusRequester.requestFocus() }
+                                                },
+                                            )
                                             AttachMenu.Item.LOCATION -> DropdownMenuItem(
                                                 text = { Text(stringResource(R.string.s_share_your_location)) },
                                                 leadingIcon = { Icon(Icons.Filled.Place, contentDescription = null) },
@@ -6572,79 +6883,6 @@ internal fun InputBar(
                                     }
                                 }
                             }
-                        }
-                    }
-                    if (showsStickers) {
-                        // Its own button rather than a line in the attach menu:
-                        // a sticker is SENT by the tap that picks it, which is a
-                        // different promise from everything in that menu — those
-                        // stage something for Send.
-                        IconButton(
-                            onClick = {
-                                onOtherAction()
-                                onOpenStickers()
-                            },
-                            // An edit borrows the composer to rewrite one
-                            // message; a sticker is a new one.
-                            enabled = !isEditing,
-                            modifier = Modifier.size(44.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.EmojiEmotions,
-                                contentDescription = stringResource(R.string.s_stickers),
-                            )
-                        }
-                    }
-                    if (showsAssistantMention) {
-                        IconButton(
-                            onClick = {
-                                onOtherAction()
-                                // Appended, never inserted at the caret: moving
-                                // somebody's cursor is worse than adding to the
-                                // end of what they were writing, and the phone
-                                // and the Mac do the same.
-                                val current = state.text.toString()
-                                if (!AssistantMention.mentions(current)) {
-                                    val prefix = when {
-                                        current.isEmpty() -> ""
-                                        current.endsWith(" ") -> ""
-                                        else -> " "
-                                    }
-                                    state.edit {
-                                        append(prefix + AssistantMention.TOKEN + " ")
-                                    }
-                                }
-                                focusRequester.requestFocus()
-                            },
-                            enabled = !isEditing,
-                            modifier = Modifier.size(44.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.AutoAwesome,
-                                contentDescription = stringResource(R.string.s_ask_the_assistant),
-                            )
-                        }
-                    }
-                    if (showsDraw) {
-                        // Its own button, out of the attach menu (#78, the
-                        // owner's choice), and the assistant chat's only. It
-                        // attaches nothing — it rewrites the draft into a
-                        // request, because the token has to be FIRST.
-                        IconButton(
-                            onClick = {
-                                onOtherAction()
-                                onAskForPicture()
-                                focusRequester.requestFocus()
-                            },
-                            // An edit borrows the composer to rewrite one
-                            // message, which calls no model.
-                            enabled = !isEditing,
-                            modifier = Modifier.size(44.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.Brush,
-                                contentDescription = stringResource(R.string.s_ask_for_a_picture),
-                            )
                         }
                     }
                 }
@@ -6688,6 +6926,9 @@ internal fun InputBar(
                 // stops in silence. See BodyLengthLimit.
                 val truncated by rememberUpdatedState(onPasteTruncated)
                 val bodyLimit = remember { BodyLengthLimit { truncated() } }
+                // Emoji as you type (#101) runs first, so the length limit
+                // has the last word on what the field holds.
+                val proseInput = remember(bodyLimit) { EmojiTypingInput().then(bodyLimit) }
                 // The row a voice recording takes the field's place with
                 // (S2.4). The field stays composed UNDER it — invisible,
                 // hidden from TalkBack — so words typed before a recording
@@ -6707,63 +6948,104 @@ internal fun InputBar(
                 val videoDoor = videoEntries
                     ?.let { ComposerSlot.videoDoor(it.copy(slot = it.slot.copy(draftBlank = state.text.isBlank()))) }
                     ?: ComposerSlot.Door.Hidden
+                // What sits inside the field, at its trailing edge (#106): the
+                // stickers always — empty or typing, so nothing moves under
+                // the thumb; the assistant chat's paintbrush beside them; and
+                // the empty field's video button. None of them while a
+                // recording row covers the field: they are the field's.
+                val showsVideoDoor = videoDoor != ComposerSlot.Door.Hidden && !covered
+                val fieldStickers = showsStickers && !covered
+                val fieldDraw = showsDraw && !covered
+                val hasTrailing = showsVideoDoor || fieldStickers || fieldDraw
                 Box(modifier = Modifier.weight(1f)) {
+                    ComposerPill(
+                        modifier = Modifier.fillMaxWidth().alpha(fieldAlpha),
+                        trailing = {
+                            if (fieldStickers) {
+                                StickerFieldButton(
+                                    // An edit borrows the composer to rewrite one
+                                    // message; a sticker is a new one.
+                                    enabled = !isEditing,
+                                    onClick = {
+                                        onOtherAction()
+                                        onOpenStickers()
+                                    },
+                                )
+                            }
+                            if (fieldDraw) {
+                                // The assistant chat's "Ask for a picture" stays a
+                                // button (#78, the owner's choice; #106 kept it),
+                                // inside the field beside the stickers: that chat
+                                // has no microphone and no video button, so there
+                                // is room. It attaches nothing — it rewrites the
+                                // draft into a request, because the token has to
+                                // be FIRST.
+                                FieldIconButton(
+                                    // An edit borrows the composer to rewrite one
+                                    // message, which calls no model.
+                                    enabled = !isEditing,
+                                    onClick = {
+                                        onOtherAction()
+                                        onAskForPicture()
+                                        focusRequester.requestFocus()
+                                    },
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Brush,
+                                        contentDescription = stringResource(R.string.s_ask_for_a_picture),
+                                    )
+                                }
+                            }
+                            if (showsVideoDoor) {
+                                VideoDoorButton(door = videoDoor, onOpen = onRecordVideo)
+                            }
+                        },
+                    ) {
                     TextField(
                         state = state,
-                        inputTransformation = bodyLimit,
+                        inputTransformation = proseInput,
+                        // Sentence capitals (#97): the keyboard capitalises
+                        // only a field that asks. Edit reuses this field.
+                        keyboardOptions = ProseKeyboard.Sentences,
                         // heightIn beats the field's 56.dp defaultMinSize, which
                         // only applies when the incoming min constraint is zero.
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 44.dp)
-                            .alpha(fieldAlpha)
+                            .weight(1f)
+                            .heightIn(min = ComposerPillMinHeight)
                             .semantics { if (covered) hideFromAccessibility() }
                             // Hands-free, focus is the slot's: Tab walks Delete,
                             // Stop and the slot, never the hidden field (S2.4).
                             .focusProperties { canFocus = handsFree == null }
                             .focusRequester(focusRequester)
                             .contentReceiver(pasteReceiver)
-                            // Ctrl+Enter (or Cmd+Enter) sends from a hardware
-                            // keyboard; Enter alone keeps inserting a line
-                            // break, as it always has on a phone.
+                            // A hardware keyboard (#106, 2.3): Enter sends and
+                            // Shift+Enter breaks the line, as on the Mac, the
+                            // web and Windows; Ctrl/Cmd+Enter keeps sending.
+                            // The on-screen keyboard's Enter is still a line
+                            // break — ComposerKeys tells the two apart by the
+                            // event, never by the window. Send never records
+                            // (S1.3): Enter in an empty field does nothing.
                             .onPreviewKeyEvent { event ->
-                                if (event.type == KeyEventType.KeyDown &&
-                                    event.key == Key.Enter &&
-                                    (event.isCtrlPressed || event.isMetaPressed)
-                                ) {
-                                    onSend()
-                                    true
-                                } else {
-                                    false
+                                when (event.composerAction()) {
+                                    ComposerKeys.Action.SEND -> {
+                                        onSend()
+                                        true
+                                    }
+                                    ComposerKeys.Action.NEWLINE, ComposerKeys.Action.PASS -> false
                                 }
                             },
-                        // M3's default content padding for an unlabelled field is
-                        // 16.dp top and bottom, which is taller than the 44.dp
-                        // buttons' own centring — so both icons sat visibly below
-                        // the last line of text. 10.dp puts the text's optical
-                        // centre level with them at one line and at five alike.
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+                        contentPadding = composerFieldPadding(hasTrailing),
                         placeholder = {
                             // Truncated, never overlapped, by the video button (S1.4).
                             Text(stringResource(R.string.s_message), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        },
-                        trailingIcon = if (videoDoor != ComposerSlot.Door.Hidden && !covered) {
-                            { VideoDoorButton(door = videoDoor, onOpen = onRecordVideo) }
-                        } else {
-                            null
                         },
                         lineLimits = TextFieldLineLimits.MultiLine(
                             minHeightInLines = 1,
                             maxHeightInLines = 5,
                         ),
-                        shape = RoundedCornerShape(24.dp),
-                        colors = TextFieldDefaults.colors(
-                            focusedIndicatorColor = Color.Transparent,
-                            unfocusedIndicatorColor = Color.Transparent,
-                            focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                            unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                        ),
+                        colors = composerFieldColors(),
                     )
+                    }
                     val rowKind = if (handsFree != null) VoiceRowKind.HANDS_FREE else VoiceRowKind.NONE
                     Crossfade(
                         targetState = rowKind,
@@ -6811,6 +7093,10 @@ internal fun InputBar(
                     onRecordVideo = if (videoRoundAvailable) onRecordVideo else null,
                     focusRequester = slotFocus,
                     pressIgnored = onSlotPressIgnored,
+                    // The 44dp disc in a 48dp box: level with the 48dp pill
+                    // and paperclip, whose centres it would otherwise sit
+                    // 2dp below in a bottom-aligned row.
+                    modifier = Modifier.padding(vertical = SLOT_LEVELLING),
                 )
             }
         }
@@ -6968,3 +7254,13 @@ private object CreateSoundDocument : androidx.activity.result.contract.ActivityR
     override fun parseResult(resultCode: Int, intent: Intent?): Uri? =
         intent?.data?.takeIf { resultCode == android.app.Activity.RESULT_OK }
 }
+
+/** The word a quote shows for a message with no words of its own (#79, #96). */
+@Composable
+private fun quotedMediaLabel(kind: QuotedMedia): String = stringResource(
+    when (kind) {
+        QuotedMedia.VIDEO_MESSAGE -> R.string.s_video_message
+        QuotedMedia.GIF -> R.string.s_gif
+        QuotedMedia.STICKER -> R.string.s_sticker
+    },
+)

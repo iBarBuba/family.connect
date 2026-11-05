@@ -225,10 +225,12 @@ class StickerViewModel @Inject constructor(
                 R.string.s_sticker_too_large,
                 android.text.format.Formatter.formatShortFileSize(appContext, ceiling?.maxItemBytes ?: 0L),
             )
-            PackRepository.AddResult.LABEL_TOO_LONG -> appContext.getString(
-                R.string.s_sticker_label_too_long,
+            PackRepository.AddResult.LABEL_TOO_LONG -> appContext.resources.getQuantityString(
+                R.plurals.s_sticker_label_too_long,
+                PackPicture.MAX_LABEL_CHARS,
                 PackPicture.MAX_LABEL_CHARS,
             )
+            PackRepository.AddResult.STORAGE_ALLOWANCE_USED -> appContext.getString(R.string.e_storage_allowance_used)
             PackRepository.AddResult.FAILED -> appContext.getString(R.string.s_sticker_add_failed)
         }
         _notices.tryEmit(message)

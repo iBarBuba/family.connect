@@ -54,10 +54,12 @@ import me.nettrash.familyconnect.ui.board.BoardScreen
 import me.nettrash.familyconnect.ui.polls.OpenPollsScreen
 import me.nettrash.familyconnect.ui.thread.ThreadScreen
 import me.nettrash.familyconnect.ui.chat.ChatScreen
+import me.nettrash.familyconnect.ui.group.GroupInfoScreen
 import me.nettrash.familyconnect.ui.chatlist.ChatListDetailPane
 import me.nettrash.familyconnect.ui.chatlist.ChatListScreen
 import me.nettrash.familyconnect.ui.components.isTwoPaneWindow
 import me.nettrash.familyconnect.ui.familyadmin.FamilyAdminScreen
+import me.nettrash.familyconnect.ui.familygate.FamilyGateMode
 import me.nettrash.familyconnect.ui.familygate.FamilyGateScreen
 import me.nettrash.familyconnect.MainViewModel
 import me.nettrash.familyconnect.calls.CallState
@@ -72,6 +74,12 @@ object Routes {
     const val SERVER_SETUP = "server_setup"
     const val AUTH = "auth"
     const val FAMILY_GATE = "family_gate"
+
+    /** "New Family…" — the create card, from inside the app (docs/protocol.md, "Several families"). */
+    const val NEW_FAMILY = "new_family"
+
+    /** "Join Another Family…" — the join card, from inside the app. */
+    const val JOIN_FAMILY = "join_family"
     const val WAITING = "waiting"
     const val CHAT_LIST = "chat_list"
     const val CHAT = "chat/{chatId}"
@@ -91,6 +99,11 @@ object Routes {
     const val THREAD = "thread/{chatId}/{rootId}"
 
     fun thread(chatId: Long, rootId: Long) = "thread/$chatId/$rootId"
+
+    /** A group's name, members and admin actions (docs/protocol.md, "Groups"). */
+    const val GROUP_INFO = "group_info/{chatId}"
+
+    fun groupInfo(chatId: Long) = "group_info/$chatId"
 }
 
 // Shared-axis X (M3): forward pushes slide in from the right, pops slide
@@ -229,6 +242,13 @@ fun AppNavHost(
                 SessionEvent.RemovedFromFamily -> navController.navigate(Routes.FAMILY_GATE) {
                     popUpTo(0) { inclusive = true }
                 }
+                // The family shown is gone and others remain: the app
+                // already shows the next one, so whatever screen of the old
+                // family is open makes way for the chat list.
+                SessionEvent.CurrentFamilyGone ->
+                    if (!navController.popBackStack(Routes.CHAT_LIST, inclusive = false)) {
+                        navController.navigate(Routes.CHAT_LIST) { popUpTo(0) { inclusive = true } }
+                    }
                 // Only meaningful while the waiting screen is showing —
                 // WaitingViewModel handles it; no global reroute.
                 SessionEvent.JoinRequestRejected -> Unit
@@ -266,6 +286,18 @@ fun AppNavHost(
                     }
                 PendingRoute.ChatList ->
                     // Already the start destination — just unwind to it.
+                    navController.popBackStack(Routes.CHAT_LIST, inclusive = false)
+                PendingRoute.Invitations ->
+                    // The banner over the chat list (and the switcher) is
+                    // where an invitation is answered.
+                    navController.popBackStack(Routes.CHAT_LIST, inclusive = false)
+                is PendingRoute.FamilyPlan ->
+                    // A paid family's deadline (docs/protocol.md, "Paid
+                    // families"): its chat list, already switched to, where
+                    // the banner says when — or, for one deleted, the chat
+                    // list of what is left, whose switcher lists the
+                    // families. With none left, the session's own teardown
+                    // has already taken the app to the gate.
                     navController.popBackStack(Routes.CHAT_LIST, inclusive = false)
                 is PendingRoute.Call ->
                     // The call state collector above shows the screen; a
@@ -393,14 +425,39 @@ fun AppNavHost(
                 ChatListDetailPane(
                     onOpenSettings = { navController.navigate(Routes.SETTINGS) },
                     onOpenBoard = { navController.navigate(Routes.BOARD) },
+                    onNewFamily = { navController.navigate(Routes.NEW_FAMILY) },
+                    onJoinFamily = { navController.navigate(Routes.JOIN_FAMILY) },
                 )
             } else {
                 ChatListScreen(
                     onOpenChat = { chatId -> navController.navigate(Routes.chat(chatId)) },
                     onOpenSettings = { navController.navigate(Routes.SETTINGS) },
                     onOpenBoard = { navController.navigate(Routes.BOARD) },
+                    onNewFamily = { navController.navigate(Routes.NEW_FAMILY) },
+                    onJoinFamily = { navController.navigate(Routes.JOIN_FAMILY) },
                 )
             }
+        }
+
+        // Another family, from inside the app. Either outcome lands on the
+        // chat list: a family created or joined is already the one shown,
+        // and a request waiting for approval is a row in the switcher.
+        composable(Routes.NEW_FAMILY) {
+            FamilyGateScreen(
+                mode = FamilyGateMode.NEW_FAMILY,
+                onJoined = { navController.popBackStack(Routes.CHAT_LIST, inclusive = false) },
+                onPending = { navController.popBackStack(Routes.CHAT_LIST, inclusive = false) },
+                onBack = { navController.popBackStack() },
+            )
+        }
+
+        composable(Routes.JOIN_FAMILY) {
+            FamilyGateScreen(
+                mode = FamilyGateMode.JOIN_FAMILY,
+                onJoined = { navController.popBackStack(Routes.CHAT_LIST, inclusive = false) },
+                onPending = { navController.popBackStack(Routes.CHAT_LIST, inclusive = false) },
+                onBack = { navController.popBackStack() },
+            )
         }
 
         composable(
@@ -412,6 +469,19 @@ fun AppNavHost(
                 onOpenPolls = { chatId -> navController.navigate(Routes.openPolls(chatId)) },
                 onOpenThread = { chatId, rootId -> navController.navigate(Routes.thread(chatId, rootId)) },
                 onOpenChat = { chatId -> navController.navigate(Routes.chat(chatId)) },
+                onOpenGroupInfo = { chatId -> navController.navigate(Routes.groupInfo(chatId)) },
+            )
+        }
+
+        composable(
+            Routes.GROUP_INFO,
+            arguments = listOf(navArgument("chatId") { type = NavType.LongType }),
+        ) {
+            GroupInfoScreen(
+                onBack = { navController.popBackStack() },
+                // Left or deleted: the chat beneath is gone too, so out to
+                // the list rather than back into an empty conversation.
+                onGroupGone = { navController.popBackStack(Routes.CHAT_LIST, inclusive = false) },
             )
         }
 
@@ -445,6 +515,8 @@ fun AppNavHost(
                 chatId = entry.arguments?.getLong("chatId") ?: 0L,
                 rootId = entry.arguments?.getLong("rootId") ?: 0L,
                 onBack = { navController.popBackStack() },
+                // The chat beneath is gone too: out to the list.
+                onChatGone = { navController.popBackStack(Routes.CHAT_LIST, inclusive = false) },
                 onOpenChat = { chatId -> navController.navigate(Routes.chat(chatId)) },
             )
         }
@@ -462,6 +534,8 @@ fun AppNavHost(
                 onBack = { navController.popBackStack() },
                 onManageFamily = { navController.navigate(Routes.FAMILY_ADMIN) },
                 onOpenStatistics = { navController.navigate(Routes.STATISTICS) },
+                onNewFamily = { navController.navigate(Routes.NEW_FAMILY) },
+                onJoinFamily = { navController.navigate(Routes.JOIN_FAMILY) },
                 onLoggedOut = {
                     navController.navigate(Routes.AUTH) {
                         popUpTo(0) { inclusive = true }

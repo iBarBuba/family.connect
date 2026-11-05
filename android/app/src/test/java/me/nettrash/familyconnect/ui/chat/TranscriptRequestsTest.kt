@@ -13,6 +13,7 @@
 package me.nettrash.familyconnect.ui.chat
 
 import com.google.common.truth.Truth.assertThat
+import java.time.Instant
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
@@ -38,6 +39,7 @@ class TranscriptRequestsTest {
         var hold: CompletableDeferred<Unit>? = null
         var agreeWorks = true
         var agreements = 0
+        var now = 0L
     }
 
     private fun TestScope.requests(world: World) = TranscriptRequests(
@@ -53,6 +55,7 @@ class TranscriptRequestsTest {
             if (world.agreeWorks) world.gate = TranscriptGate.ASK_FOR_TEXT
             world.agreeWorks
         },
+        clock = { world.now },
     )
 
     @Test
@@ -207,6 +210,7 @@ class TranscriptRequestsTest {
             answers += TranscriptOutcome.Failed
             answers += TranscriptOutcome.TooLong
             answers += TranscriptOutcome.Unreadable
+            answers += TranscriptOutcome.AllowanceUsed
         }
         val requests = requests(world)
 
@@ -215,6 +219,7 @@ class TranscriptRequestsTest {
         requests.request(Ask(3, 502, 42))
         requests.request(Ask(3, 503, 43))
         requests.request(Ask(3, 504, 44))
+        requests.request(Ask(3, 505, 45))
         runCurrent()
 
         assertThat(requests.status.value).containsExactly(
@@ -223,7 +228,72 @@ class TranscriptRequestsTest {
             42L, Status.FAILED,
             43L, Status.TOO_LONG,
             44L, Status.UNREADABLE,
+            45L, Status.ALLOWANCE_USED,
         )
+    }
+
+    /**
+     * A paid family's minutes are used up until next month (docs/protocol.md,
+     * "Paid families"): said under the player, and not offered again from
+     * the long-press menu, where asking would only earn it again.
+     */
+    @Test
+    fun `a used-up allowance is not offered again from the menu`() {
+        val action = TranscriptRules.menuAction(
+            held = null,
+            status = Status.ALLOWANCE_USED,
+            offered = true,
+            canAsk = true,
+            reveal = {},
+            hide = {},
+            ask = {},
+        )
+        assertThat(action).isNull()
+    }
+
+    /**
+     * A used-up month lasts until it renews (docs/protocol.md, "Transcripts
+     * on request"): the day is the 1st after the refusal came, a redraw weeks
+     * later still names it, and from it on the line and the menu offer
+     * "Show text" again — which asks again.
+     */
+    @Test
+    fun `a used-up allowance lifts at the renewal it named`() = runTest {
+        val november1 = Instant.parse("2026-11-01T00:00:00Z").toEpochMilli()
+        val world = World().apply {
+            now = Instant.parse("2026-10-31T12:00:00Z").toEpochMilli()
+            answers += TranscriptOutcome.AllowanceUsed
+            answers += TranscriptOutcome.Text("hello", null)
+        }
+        val requests = requests(world)
+
+        requests.request(voiceNote)
+        runCurrent()
+
+        val statuses = requests.status.value
+        assertThat(requests.renewsAt(40)).isEqualTo(november1)
+        assertThat(requests.statusAt(statuses, 40, now = november1 - 1)).isEqualTo(Status.ALLOWANCE_USED)
+
+        world.now = Instant.parse("2026-11-20T09:00:00Z").toEpochMilli()
+        assertThat(requests.renewsAt(40)).isEqualTo(november1)
+        assertThat(requests.statusAt(statuses, 40)).isNull()
+        val action = TranscriptRules.menuAction(
+            held = null,
+            status = requests.statusAt(statuses, 40),
+            offered = true,
+            canAsk = true,
+            reveal = {},
+            hide = {},
+            ask = {},
+        )
+        assertThat(action).isNotNull()
+
+        requests.request(voiceNote)
+        runCurrent()
+
+        assertThat(world.fetched).containsExactly(voiceNote, voiceNote)
+        assertThat(requests.status.value).isEmpty()
+        assertThat(requests.renewsAt(40)).isNull()
     }
 
     @Test

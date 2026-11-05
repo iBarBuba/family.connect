@@ -23,7 +23,7 @@ struct SessionLogicTests {
     private static let family = FamilyDTO(
         id: 3, name: "The Smiths", joinPolicy: "open", createdAt: nil, inviteCode: nil,
         aiVision: false, aiHistoryPhotos: false, aiGreeting: false, aiFaces: false, aiTranscripts: false, aiLookups: false, greetingPlaces: [],
-        maxMembers: nil)
+        maxMembers: nil, plan: nil, memberCeiling: nil, deleteAt: nil)
     private static let pending = PendingJoinRequestDTO(familyID: 3, familyName: "The Smiths", createdAt: nil)
 
     @Test("family present → active (regardless of prior waiting)")
@@ -49,6 +49,16 @@ struct SessionLogicTests {
     func resolveDeclined() {
         let me = MeResponse(user: Self.user, family: nil, role: nil, pendingJoinRequest: nil)
         #expect(SessionLogic.resolve(me: me, wasAwaitingApproval: true) == .needsFamily(declined: true))
+    }
+
+    /// Out of the last family with no `/me` in hand (a leave, a
+    /// `member_left`): the same rule as `resolve(me:)`, from what the
+    /// session holds — since several families a request may be pending
+    /// while the account is still in a family.
+    @Test("out of the last family: a pending request waits, nothing pending is the gate")
+    func afterLastFamily() {
+        #expect(SessionLogic.afterLastFamily(pendingRequests: [Self.pending]) == .pendingApproval)
+        #expect(SessionLogic.afterLastFamily(pendingRequests: []) == .needsFamily(declined: false))
     }
 
     @Test("purge scopes: logout keeps the server URL, wipes the rest")
@@ -98,7 +108,7 @@ struct AppSessionTransitionTests {
     private static let family = FamilyDTO(
         id: 3, name: "The Smiths", joinPolicy: "open", createdAt: nil, inviteCode: nil,
         aiVision: false, aiHistoryPhotos: false, aiGreeting: false, aiFaces: false, aiTranscripts: false, aiLookups: false, greetingPlaces: [],
-        maxMembers: nil)
+        maxMembers: nil, plan: nil, memberCeiling: nil, deleteAt: nil)
 
     /// Spy-instrumented session against a never-hit API client.
     @MainActor
@@ -512,8 +522,8 @@ struct AppSessionTransitionTests {
         // A cursor from the account that is about to stop existing. The
         // board is family-scoped and its seqs mean nothing to the next
         // account signed in on this device.
-        AppSettings.boardCursor = 88
-        AppSettings.boardSeenNoteID = 91
+        AppSettings.setBoardCursor(88, family: Self.family.id)
+        AppSettings.setBoardMarks(.init(seenNoteID: 91, seenContentSeq: 0), family: Self.family.id)
         let api = APIClient(
             serverURL: URL(string: "https://\(host)")!, session: StubURLProtocol.makeSession())
         let (session, spies) = makeSession(api: api)
@@ -544,8 +554,8 @@ struct AppSessionTransitionTests {
         }
         #expect(AppSettings.currentUserID == nil)
         #expect(AppSettings.pushDeviceID == nil)
-        #expect(AppSettings.boardCursor == 0)
-        #expect(AppSettings.boardSeenNoteID == 0)
+        #expect(AppSettings.boardCursor(family: Self.family.id) == 0)
+        #expect(AppSettings.boardMarks(family: Self.family.id).seenNoteID == 0)
         // The server URL is the family's, not the account's.
         #expect(AppSettings.serverURL != nil)
     }

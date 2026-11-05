@@ -54,6 +54,7 @@ public sealed partial class ChatsView : UserControl
     private readonly Action<MessageDto> onArrived;
     private readonly Action<MessageDto> onEdited;
     private readonly Action<long> onChat;
+    private readonly Action<long> onChatRemoved;
     private readonly Action onRoster;
     private readonly Action<long, bool> onBlock;
     private readonly Action<long, long> onTyping;
@@ -67,7 +68,12 @@ public sealed partial class ChatsView : UserControl
     private readonly Dictionary<string, BitmapImage?> previewPictures = new(StringComparer.Ordinal);
     private readonly AvatarFaces faces;
 
-    private readonly Dictionary<string, BitmapImage> pictures = [];
+    /// <summary>
+    /// Photos, posters and tiles decoded once, so a redraw reuses them — the most recently drawn few hundred: kept without a
+    /// ceiling, every picture any chat ever drew stayed decoded for as long as the window lived. Far above what one screen
+    /// draws, so a redraw that builds every row never has to decode again what it has just drawn.
+    /// </summary>
+    private readonly RecentPictures<BitmapImage> pictures = new(512);
 
     /// <summary>
     /// The family's CHAT stickers (docs/protocol.md, "Sticker pack") — not the board's cards, which this code also calls
@@ -76,16 +82,27 @@ public sealed partial class ChatsView : UserControl
     /// handle for one still on its way.
     /// </summary>
     /// <remarks>
-    /// The conversation's are the only ones that MOVE, so they are the only ones with frames to account for: they sit
-    /// on a <see cref="StickerShelf{TPicture}"/>, which holds them to one budget between them, remembers a sticker
-    /// nothing here decodes, and keeps each one's clock across a redraw. The other two are still pictures at a cell's
-    /// size; a null in either is the same remembered "nothing here decodes it".
+    /// The conversation's and the panel's MOVE (the panel's since #96: "Sticker pack", amended 2026-10-19), so they are the
+    /// ones with frames to account for: each sits on a <see cref="StickerShelf{TPicture}"/>, which holds it to a budget,
+    /// remembers a sticker nothing here decodes, and keeps each one's clock across a redraw. A panel cell is kept under its
+    /// pack item's id COMPLEMENTED (<see cref="PanelKey"/>) — negative, where every attachment id is positive — since the same
+    /// picture is decoded at another size for a cell. The staged ones are still pictures; a null is the same remembered
+    /// "nothing here decodes it".
+    /// <para>
+    /// <b>TWO SHELVES, NOT ONE.</b> They shared one until the panel turned out to empty it: a pack bigger than the shelf's
+    /// count, opened once, pushed every sticker of the conversation that was not moving out — the still ones are never
+    /// "showing" to the shelf — and the next redraw that built the rows decoded them all again. A panel cell holds a fifth
+    /// of the pixels a conversation's sticker does, so its own budget holds far more than a pack decodes to.
+    /// </para>
     /// </remarks>
     private readonly PackModel pack;
     private readonly StickerAnimator stickers;
     private readonly StickerShelf<StickerPicture> stickerPictures;
-    private readonly Dictionary<long, StickerPicture?> stickerThumbs = [];
+    private readonly StickerShelf<StickerPicture> panelStickerPictures;
     private readonly Dictionary<string, StickerPicture?> stagedStickers = new(StringComparer.Ordinal);
+
+    /// <summary>A panel cell's key on the shelf: its pack item's id, complemented, so it can never meet an attachment's.</summary>
+    private static long PanelKey(long itemId) => ~itemId;
 
     /// <summary>
     /// One sticker is decoded at a time. Frames are decoded BEFORE the shelf can make room for them, so ten decodes
@@ -230,7 +247,13 @@ public sealed partial class ChatsView : UserControl
     private bool hasCamera;
     private bool askingForCamera;
     private readonly DoorGuard doorGuard = new();
-    private bool fieldPadded;
+
+    /// <summary>The video button is showing in the field (DrawVideoDoor) — one of the glyphs the field makes room for (DrawField).</summary>
+    private bool doorShowing;
+
+    /// <summary>The glyphs each field was last drawn with, so a keystroke that changes none of them lays nothing out again.</summary>
+    private IReadOnlyList<FieldGlyph>? fieldDrawn;
+    private IReadOnlyList<FieldGlyph>? threadFieldDrawn;
     private long? chatAfterRecorder;
     private readonly Action<SessionState> onSession;
 
@@ -328,11 +351,14 @@ public sealed partial class ChatsView : UserControl
     internal event Action<long, long, bool>? CallRequested;
     private bool sendingMedia;
 
-    /// <summary>The names a half-typed @ could mean, and which of them Enter or Tab would take.</summary>
-    private IReadOnlyList<MemberDto> offered = [];
+    /// <summary>The names a half-typed @ could mean — the assistant first where it can be asked — and which of them Enter or Tab would take.</summary>
+    private IReadOnlyList<MentionChoice> offered = [];
     private int activeName;
     private bool gone;
     private ConversationModel? open;
+
+    /// <summary>The open chat was a group when it opened — so its row vanishing means the reader is out of it.</summary>
+    private bool openWasGroup;
 
     /// <summary>The open chat's open polls, when it is the family chat — the only one that holds any.</summary>
     private OpenPollsModel? openPolls;
@@ -347,6 +373,57 @@ public sealed partial class ChatsView : UserControl
     /// <summary>What each row of the list was last drawn from, by position — so an unchanged row keeps its element.</summary>
     private readonly List<string> rowsDrawn = [];
     private string conversationDrawn = string.Empty;
+
+    /// <summary>
+    /// One row of the open conversation as it is on screen: what it was drawn from (<see cref="ConversationRows"/>), its
+    /// elements in the stack — the day pill and the divider above it, then the bubble — and what was registered while it was
+    /// built, so a redraw can keep it, and forget what pointed at it once it goes.
+    /// </summary>
+    /// <remarks>
+    /// WHY ROWS ARE KEPT. The conversation used to be cleared and built whole on every change it noticed — a peer's read
+    /// marker, a link's card landing, each chunk of an assistant answer, each page of a catch-up — and then laid out by force:
+    /// every sticker, animation player, picture and face of a long chat made again for one tick. Now a row is built only when
+    /// something it is drawn from changed; anything that is not one row's (<see cref="DrawnAround"/>) still rebuilds them all.
+    /// </remarks>
+    private sealed class DrawnRow(string key, string signature)
+    {
+        public string Key { get; } = key;
+
+        public string Signature { get; } = signature;
+
+        public List<UIElement> Elements { get; } = [];
+
+        /// <summary>The "N new messages" line above it, where the open chat scrolls to.</summary>
+        public FrameworkElement? Divider { get; set; }
+
+        public long? MessageId { get; set; }
+
+        /// <summary>The balloon a click on a quote scrolls to, as <see cref="balloons"/> had it when this row was built.</summary>
+        public (Border Balloon, Brush Flash)? Balloon { get; set; }
+
+        public List<HyperlinkButton> CallBackLinks { get; } = [];
+
+        /// <summary>What its drawing still waited for when it was built (<see cref="SettlesWhen"/>).</summary>
+        public List<Func<bool>> Settles { get; } = [];
+
+        /// <summary>Built again on every redraw whatever its signature says — a send on its way, a hidden row that fetches.</summary>
+        public bool Volatile { get; set; }
+
+        /// <summary>Whether it may be kept: nothing it was waiting for is still missing.</summary>
+        public bool Settled => !Volatile && Settles.TrueForAll(settled => settled());
+    }
+
+    /// <summary>The open conversation's rows as drawn, the stack's children as this view put them there, and what they were drawn around.</summary>
+    private readonly List<DrawnRow> drawnRows = [];
+    private readonly List<UIElement> stackShown = [];
+    private ConversationModel? drawnFor;
+    private string drawnAround = string.Empty;
+
+    /// <summary>The row being built, which its pictures and stickers report what they wait for to.</summary>
+    private DrawnRow? building;
+
+    /// <summary>The next outright redraw keeps the rows it can: a send changes the rows on their way and nothing above them.</summary>
+    private bool keepRowsOnce;
 
     /// <summary>Where the open chat opens — its first unread message — decided once per open, and what the divider counts.</summary>
     private long? anchor;
@@ -372,6 +449,9 @@ public sealed partial class ChatsView : UserControl
         stickerPictures = new StickerShelf<StickerPicture>(
             StickerAnimation.MaxHeldBytes, StickerAnimation.MaxKept,
             stickers.IsShowing, stickers.MakeStill, stickers.Release);
+        panelStickerPictures = new StickerShelf<StickerPicture>(
+            StickerAnimation.MaxHeldBytes, StickerAnimation.MaxKept,
+            stickers.IsShowing, stickers.MakeStill, stickers.Release);
         var say = services.Say;
         list = new ChatListModel(connection.Chats, () => connection.Session.State.Me?.Id ?? 0, say);
         typing = new TypingRoster(connection.Chats, words: say);
@@ -392,6 +472,8 @@ public sealed partial class ChatsView : UserControl
         ChatsHeading.Text = say.Get("Chats");
         EmptyListText.Text = say.Get("No chats yet");
         ComposerBox.PlaceholderText = say.Get("Message");
+        // A placeholder is not a name: Narrator names the field whatever it holds.
+        AutomationProperties.SetName(ComposerBox, say.Get("Message"));
         ToolTipService.SetToolTip(AttachButton, say.Get("Attach a photo, video or file"));
         AutomationProperties.SetName(AttachButton, say.Get("Attach a photo, video or file"));
         OpenPollsText.Text = say.Get("Open polls");
@@ -402,12 +484,14 @@ public sealed partial class ChatsView : UserControl
         ToolTipService.SetToolTip(VideoDoorButton, say.Get("Record a video message"));
         VideoDoorButton.Click += (_, _) => OnVideoDoorClick();
         // The server's video-message limits arrive with the family's own document, after the chats are drawn.
+        // And the session is where another family being shown arrives (docs/protocol.md, "Several families").
         onSession = _ => DispatcherQueue.TryEnqueue(() =>
         {
             if (!gone)
             {
                 LearnCamera();
                 DrawSlot();
+                FamilyMoved();
             }
         });
         connection.Session.Changed += onSession;
@@ -427,13 +511,10 @@ public sealed partial class ChatsView : UserControl
         };
         ViewerAddSticker.Content = say.Get("Add to family stickers");
         ViewerAddSticker.Click += (_, _) => _ = AddViewedStickerAsync();
-        AskAssistantButton.Content = "✨";
-        AskPictureButton.Content = "🎨";
-        ToolTipService.SetToolTip(AskAssistantButton, say.Get("Ask the assistant"));
-        AutomationProperties.SetName(AskAssistantButton, say.Get("Ask the assistant"));
+        // The paintbrush, a Segoe Fluent glyph inside the assistant chat's field. @ai has no button any more (#106): the
+        // paperclip's "Ask the Assistant" and the first line of the @ strip write it.
         ToolTipService.SetToolTip(AskPictureButton, say.Get("Ask for a picture"));
         AutomationProperties.SetName(AskPictureButton, say.Get("Ask for a picture"));
-        AskAssistantButton.Click += (_, _) => PutInComposer(AssistantText.WithAssistantMention(ComposerBox.Text));
         AskPictureButton.Click += (_, _) => PutInComposer(AssistantText.WithDrawToken(ComposerBox.Text));
         PictureHintText.Text = PictureHint.Sentence(say);
 
@@ -520,6 +601,9 @@ public sealed partial class ChatsView : UserControl
         ComposerPanel.Drop += OnDrop;
         BannerCancel.Click += (_, _) => EndComposerMode(clear: editing is not null);
         ComposerBox.PreviewKeyDown += OnComposerKey;
+        // Capital letters at a sentence's start (issue #97) and emoji as you type (#101): the composer is a multi-line prose
+        // field, editing included.
+        CapitalLetters.Attach(ComposerBox);
         ComposerBox.Paste += OnComposerPaste;
         ComposerBox.TextChanged += (_, _) =>
         {
@@ -559,13 +643,34 @@ public sealed partial class ChatsView : UserControl
             }
         };
         ThreadTitle.Text = say.Get("Thread");
-        ThreadSend.Content = say.Get("Send");
+        ToolTipService.SetToolTip(ThreadSend, say.Get("Send"));
+        AutomationProperties.SetName(ThreadSend, say.Get("Send"));
         ThreadComposer.PlaceholderText = say.Get("Reply in thread");
+        AutomationProperties.SetName(ThreadComposer, say.Get("Reply in thread"));
         AutomationProperties.SetName(ThreadClose, say.Get("Close"));
         ToolTipService.SetToolTip(ThreadClose, say.Get("Close"));
         ThreadClose.Click += (_, _) => CloseThread();
         ThreadSend.Click += (_, _) => SendInThread();
         ThreadComposer.PreviewKeyDown += OnThreadComposerKey;
+        // The second Esc (#106, doc 2.3): the first left a drafted reply for the panel, and this one, anywhere in the panel,
+        // closes it. The field's own Esc never reaches here — its preview handler has taken it.
+        ThreadPanel.KeyDown += (_, e) =>
+        {
+            if (e.Key == Windows.System.VirtualKey.Escape)
+            {
+                e.Handled = true;
+                CloseThread();
+            }
+        };
+        CapitalLetters.Attach(ThreadComposer);
+        ToolTipService.SetToolTip(NewGroupButton, say.Get("New Group"));
+        AutomationProperties.SetName(NewGroupButton, say.Get("New Group"));
+        NewGroupButton.Click += (_, _) => _ = NewGroupAsync();
+        WireFamilies();
+        familyDrawn = connection.Session.State.CurrentFamilyId;
+        ToolTipService.SetToolTip(GroupInfoButton, say.Get("Group Info"));
+        AutomationProperties.SetName(GroupInfoButton, say.Get("Group Info"));
+        GroupInfoButton.Click += (_, _) => _ = ShowGroupInfoAsync();
         ToolTipService.SetToolTip(CallButton, say.Get("Call"));
         AutomationProperties.SetName(CallButton, say.Get("Call"));
         ToolTipService.SetToolTip(VideoCallButton, say.Get("Video Call"));
@@ -578,7 +683,13 @@ public sealed partial class ChatsView : UserControl
             {
                 _ = typed.TypingAsync();
             }
+            DrawThreadSend();
         };
+        // The list, the conversation and the thread share the width (ConversationColumn.Arrange): again whenever the view is
+        // resized or the thread opens or closes; and the column follows the pane it is left with.
+        ChatsRoot.SizeChanged += (_, _) => Arrange();
+        ThreadPanel.RegisterPropertyChangedCallback(VisibilityProperty, (_, _) => Arrange());
+        ConversationPane.SizeChanged += (_, _) => FitColumn();
         // The player's events arrive on its own thread and may still be queued when the view is let go.
         audio.PlaybackSession.PositionChanged += (_, _) => DispatcherQueue.TryEnqueue(() =>
         {
@@ -670,6 +781,20 @@ public sealed partial class ChatsView : UserControl
         };
         onEdited = _ => QueueRedraw();
         onChat = _ => QueueRedraw();
+        // A group the reader is out of (docs/protocol.md, "Groups", chat_removed): if it is the one open, it closes.
+        onChatRemoved = chatId => DispatcherQueue.TryEnqueue(() =>
+        {
+            if (gone)
+            {
+                return;
+            }
+            // Open or not, its notifications go: one clicked would open a chat that is not there.
+            Toasts.Clear(NotificationRules.ChatTag(chatId));
+            if (open?.ChatId == chatId)
+            {
+                CloseConversation();
+            }
+        });
         onRoster = QueueRedraw;
         onBlock = (_, _) => QueueRedraw();
         onTyping = (chatId, userId) =>
@@ -703,7 +828,7 @@ public sealed partial class ChatsView : UserControl
             }
             if (item.Deleted)
             {
-                stickerThumbs.Remove(item.Id);
+                panelStickerPictures.Remove(PanelKey(item.Id));
             }
             ShowStickerButton();
         });
@@ -724,6 +849,7 @@ public sealed partial class ChatsView : UserControl
         connection.Router.Arrived += onArrived;
         connection.Router.Edited += onEdited;
         connection.Router.ChatChanged += onChat;
+        connection.Router.ChatRemoved += onChatRemoved;
         connection.Router.RosterChanged += onRoster;
         connection.Router.BlockChanged += onBlock;
         connection.Router.Typing += onTyping;
@@ -755,13 +881,15 @@ public sealed partial class ChatsView : UserControl
         // After the stop, so nothing is "showing" and every frame is given back rather than left to a finalizer.
         ForgetViewerSticker();
         stickerPictures.Clear();
-        stickerThumbs.Clear();
+        panelStickerPictures.Clear();
         stagedStickers.Clear();
+        ReleaseAnimations();
         connection.Session.Changed -= onSession;
         connection.Router.PackChanged -= onPack;
         connection.Router.Arrived -= onArrived;
         connection.Router.Edited -= onEdited;
         connection.Router.ChatChanged -= onChat;
+        connection.Router.ChatRemoved -= onChatRemoved;
         connection.Router.RosterChanged -= onRoster;
         connection.Router.BlockChanged -= onBlock;
         connection.Router.Typing -= onTyping;
@@ -890,7 +1018,11 @@ public sealed partial class ChatsView : UserControl
         {
             return;
         }
+        // First: a group the reader is out of closes before anything is drawn from it, and a renamed one shows its new name.
+        DrawHeader();
         DrawList();
+        // After the list, whose read of every family's chats the switcher counts from.
+        DrawFamilies();
         DrawConversation(keepFromBottom: null);
         DrawThread();
         ShowPollsBadge();
@@ -900,13 +1032,12 @@ public sealed partial class ChatsView : UserControl
         _ = ReportReadAsync();
     }
 
-    /// <summary>The composer's assistant doors, for this chat, this server's assistant, and whether an edit is open.</summary>
+    /// <summary>
+    /// The composer's assistant door — the paintbrush, inside the assistant chat's field (DrawField) — for this chat, this
+    /// server's assistant, and whether an edit is open; and the line under a picture request.
+    /// </summary>
     private void ShowAssistantButtons()
     {
-        var kind = open is { } chat ? connection.Chats.Chat(chat.ChatId)?.Chat.Kind : null;
-        var (ask, picture) = AssistantButtons.Offered(kind, connection.Session.State.Assistant, editing is not null);
-        AskAssistantButton.Visibility = ask ? Visibility.Visible : Visibility.Collapsed;
-        AskPictureButton.Visibility = picture ? Visibility.Visible : Visibility.Collapsed;
         ShowStickerButton();
         DrawPictureHint();
     }
@@ -918,7 +1049,7 @@ public sealed partial class ChatsView : UserControl
     /// </summary>
     private void DrawPictureHint()
     {
-        var kind = open is { } chat ? connection.Chats.Chat(chat.ChatId)?.Chat.Kind : null;
+        var kind = open is { } chat ? connection.Chats.Kind(chat.ChatId) : null;
         var shown = PictureHint.ForComposer(kind, ComposerBox.Text, connection.Session.State.Assistant, editing is not null);
         var appearing = shown && PictureHintText.Visibility != Visibility.Visible;
         PictureHintText.Visibility = shown ? Visibility.Visible : Visibility.Collapsed;
@@ -951,12 +1082,128 @@ public sealed partial class ChatsView : UserControl
     /// </remarks>
     private void ShowStickerButton()
     {
-        var kind = open is { } chat ? connection.Chats.Chat(chat.ChatId)?.Chat.Kind : null;
-        var offered = PackSending.Offered(kind, editing is not null, pack.Offered);
-        StickerButton.Visibility = offered ? Visibility.Visible : Visibility.Collapsed;
+        DrawField();
         // The thread's composer is enabled exactly when there is a root to answer (DrawThread).
-        var inThread = PackSending.OfferedInThread(thread is not null && ThreadComposer.IsEnabled, pack.Offered);
-        ThreadStickerButton.Visibility = inThread ? Visibility.Visible : Visibility.Collapsed;
+        var inThread = ComposerRow.InThreadField(thread is not null && ThreadComposer.IsEnabled, pack.Offered);
+        if (threadFieldDrawn is null || !threadFieldDrawn.SequenceEqual(inThread))
+        {
+            threadFieldDrawn = inThread;
+            ThreadStickerButton.Visibility = inThread.Contains(FieldGlyph.Sticker) ? Visibility.Visible : Visibility.Collapsed;
+            FitField(ThreadComposer, inThread);
+        }
+    }
+
+    /// <summary>
+    /// The glyphs inside the conversation's field (docs/composer-and-wide-layout-2026-10-20.md, 2.1; <see cref="ComposerRow.InField"/>):
+    /// the stickers in every chat a message can be sent in, empty or typing — they never move under the pointer — the
+    /// paintbrush beside them in the assistant's chat, the video button where S1.4 shows it; and the field padded for them.
+    /// </summary>
+    private void DrawField()
+    {
+        var kind = open is { } chat ? connection.Chats.Kind(chat.ChatId) : null;
+        var glyphs = ComposerRow.InField(kind, editing is not null, pack.Offered, connection.Session.State.Assistant, doorShowing);
+        if (fieldDrawn is not null && fieldDrawn.SequenceEqual(glyphs))
+        {
+            return;
+        }
+        fieldDrawn = glyphs;
+        StickerButton.Visibility = glyphs.Contains(FieldGlyph.Sticker) ? Visibility.Visible : Visibility.Collapsed;
+        AskPictureButton.Visibility = glyphs.Contains(FieldGlyph.Picture) ? Visibility.Visible : Visibility.Collapsed;
+        VideoDoorButton.Visibility = glyphs.Contains(FieldGlyph.VideoDoor) ? Visibility.Visible : Visibility.Collapsed;
+        FitField(ComposerBox, glyphs);
+    }
+
+    /// <summary>
+    /// A field's padding: its style's own, lifted so one line stands as tall as the 44-epx targets beside it and centred on
+    /// them, and one target of trailing room per glyph drawn over it — so text never runs under a button.
+    /// </summary>
+    private static void FitField(TextBox field, IReadOnlyList<FieldGlyph> glyphs)
+    {
+        var style = FieldStylePadding.Value;
+        field.Padding = new Thickness(
+            style.Left,
+            style.Top + ComposerRow.FieldLiftEpx,
+            style.Right + ComposerRow.TrailingRoom(glyphs),
+            style.Bottom + ComposerRow.FieldLiftEpx);
+    }
+
+    /// <summary>The padding a TextBox's own style gives it (TextControlThemePadding), read once.</summary>
+    private static readonly Lazy<Thickness> FieldStylePadding = new(() =>
+    {
+        try
+        {
+            return (Thickness)Application.Current.Resources["TextControlThemePadding"];
+        }
+        catch (Exception e)
+        {
+            // WinUI's own value since the Fluent styles: a missing key costs a pixel or two, never the field.
+            Diagnostics.Write($"reading the field's padding: {e.GetType().Name}");
+            return new Thickness(10, 5, 6, 6);
+        }
+    });
+
+    /// <summary>The thread's Send disc: lit with a root to answer and something to say; drawn dim, not ringed, when it is not.</summary>
+    private void DrawThreadSend()
+    {
+        var enabled = ComposerRow.ThreadSendEnabled(thread is not null && ThreadComposer.IsEnabled, ThreadComposer.Text);
+        if (ThreadSend.IsEnabled != enabled)
+        {
+            ThreadSend.IsEnabled = enabled;
+        }
+        ThreadSendLook.Opacity = enabled ? 1 : 0.4;
+    }
+
+    /// <summary>
+    /// The chat list, the conversation and the thread across this view (<see cref="ConversationColumn.Arrange"/>): the list
+    /// narrows first, then the thread goes OVER the conversation instead of beside it — on an opaque underlay, since what it
+    /// covers is still there — so the conversation's field always keeps its run of text.
+    /// </summary>
+    private void Arrange()
+    {
+        if (gone || ChatsRoot.ActualWidth <= 0)
+        {
+            return;
+        }
+        var arranged = ConversationColumn.Arrange(ChatsRoot.ActualWidth, ThreadPanel.Visibility == Visibility.Visible);
+        if (ListColumn.Width.Value != arranged.ListWidth)
+        {
+            ListColumn.Width = new GridLength(arranged.ListWidth);
+        }
+        var over = ThreadPanel.Visibility == Visibility.Visible && !arranged.ThreadBeside;
+        var underlay = over ? Visibility.Visible : Visibility.Collapsed;
+        if (ThreadUnderlay.Visibility != underlay)
+        {
+            ThreadUnderlay.Visibility = underlay;
+        }
+        if (Grid.GetColumn(ThreadPanel) != (over ? 2 : 3))
+        {
+            Grid.SetColumn(ThreadPanel, over ? 2 : 3);
+            Grid.SetColumnSpan(ThreadPanel, over ? 2 : 1);
+            ThreadPanel.Width = over ? double.NaN : ConversationColumn.ThreadEpx;
+        }
+    }
+
+    /// <summary>
+    /// The conversation column for the pane as it now is (<see cref="ConversationColumn.Width"/>): the messages and everything
+    /// under them exactly as wide, centred. A bubble's own cap and margin make it <see cref="ConversationColumn.BubbleMax"/> of
+    /// whatever this is, so a resize redraws no bubble and the incremental list stays incremental.
+    /// </summary>
+    private void FitColumn()
+    {
+        var width = ConversationColumn.Width(ConversationPane.ActualWidth);
+        if (MessageStack.Width != width)
+        {
+            MessageStack.Width = width;
+            ComposerColumn.Width = width;
+        }
+        // The jump button at the column's trailing edge, not the pane's (#106, doc 2.2): on a wide window the pane's edge is
+        // far from the newest bubble it takes the reader to. Outside the width check — past 1024 the column stops growing
+        // and only its margins do.
+        var jump = ConversationColumn.JumpInset(ConversationPane.ActualWidth);
+        if (JumpButton.Margin.Right != jump)
+        {
+            JumpButton.Margin = new Thickness(0, 0, jump, 16);
+        }
     }
 
     /// <summary>
@@ -1125,14 +1372,21 @@ public sealed partial class ChatsView : UserControl
         return grid;
     }
 
-    /// <summary>A chat's circle: the family's house, a direct chat's peer, the assistant's initials.</summary>
+    /// <summary>A chat's circle: the family's house, a group's people, a direct chat's peer, the assistant's initials.</summary>
     private FrameworkElement Face(ChatDto chat, string title, double size, IReadOnlyDictionary<long, int>? versions = null)
     {
-        var peer = chat.Kind == "direct" ? chat.PeerUserId : null;
+        var peer = chat.Kind == ChatKinds.Direct ? chat.PeerUserId : null;
         var version = peer is { } id
             ? versions?.GetValueOrDefault(id) ?? connection.Chats.Member(id)?.AvatarVersion ?? 0
             : 0;
-        return faces.Face(title, chat.Kind == "family", peer, version, size);
+        var face = faces.Face(title, ChatFaces.For(chat.Kind), peer, version, size);
+        if (ChatFaces.For(chat.Kind) == ChatFace.People)
+        {
+            // A group's circle says what it is: a group's name can be anybody's name, and nothing else on the row says so.
+            AutomationProperties.SetAccessibilityView(face, AccessibilityView.Content);
+            AutomationProperties.SetName(face, services.Say.Get("Group"));
+        }
+        return face;
     }
 
     private void OnChatPicked(object sender, SelectionChangedEventArgs e)
@@ -1194,6 +1448,7 @@ public sealed partial class ChatsView : UserControl
         DrawNotSent();
         ComposerError.Visibility = Visibility.Collapsed;
         var held = connection.Chats.Chat(chatId);
+        openWasGroup = held is not null && ChatKinds.IsGroup(held.Chat.Kind);
         ConversationTitle.Text = held is { } row ? list.Title(row.Chat) : string.Empty;
         ConversationFace.Content = held is { } shown ? Face(shown.Chat, ConversationTitle.Text, 32) : null;
         ConversationHeader.Visibility = Visibility.Visible;
@@ -1202,10 +1457,12 @@ public sealed partial class ChatsView : UserControl
         unreadAtOpen = held?.UnreadCount ?? 0;
         lastReadAtOpen = held?.LastReadMessageId ?? 0;
         DecideAnchor(chat);
-        // Polls are the family chat's alone: anywhere else the server answers invalid_poll.
-        var family = connection.Chats.Chat(chatId)?.Chat.Kind == "family";
-        openPolls = family ? new OpenPollsModel(chatId, connection.Chats, connection.Api) : null;
-        OpenPollsButton.Visibility = family ? Visibility.Visible : Visibility.Collapsed;
+        // Polls are the family chat's and a group's (docs/protocol.md, "Polls", amended 2026-10-22): anywhere else the
+        // server answers invalid_poll.
+        var shared = ChatKinds.IsShared(connection.Chats.Kind(chatId));
+        openPolls = shared ? new OpenPollsModel(chatId, connection.Chats, connection.Api) : null;
+        OpenPollsButton.Visibility = shared ? Visibility.Visible : Visibility.Collapsed;
+        ShowGroupInfoButton();
         ShowPollsBadge();
         ShowCallButtons();
         DrawList();
@@ -1236,6 +1493,8 @@ public sealed partial class ChatsView : UserControl
             MessageStack.Children.Clear();
             callBackLinks.Clear();
             conversationDrawn = string.Empty;
+            keepRowsOnce = false;
+            ForgetDrawnRows();
             return;
         }
         var bubbles = chat.Bubbles();
@@ -1259,41 +1518,149 @@ public sealed partial class ChatsView : UserControl
         {
             return;
         }
+        // An EMPTY signature is a redraw asked for outright — a new chat, a reveal, a vote, a block — because something the
+        // rows are drawn from changed where no signature looks: every row is built again, as every redraw used to be. Only
+        // a send keeps what it can (it changes the rows on their way and nothing above them).
+        var whole = conversationDrawn.Length == 0 && !keepRowsOnce;
+        keepRowsOnce = false;
         conversationDrawn = drawn;
-        MessageStack.Children.Clear();
-        balloons.Clear();
-        callBackLinks.Clear();
+        var kind = connection.Chats.Kind(chat.ChatId);
+        // Names over bubbles only where there is more than one other person to tell apart: the family chat or a group.
+        var family = ChatKinds.IsShared(kind);
+        var around = DrawnAround(chat, kind);
+        whole = whole || !ReferenceEquals(drawnFor, chat) || !string.Equals(around, drawnAround, StringComparison.Ordinal);
+
+        // What each row is drawn from, and so whether the one on screen is still it.
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        var peerRead = connection.PeerReads.UpTo(chat.ChatId);
+        var lines = Timeline.Rows(bubbles, family, Reader, anchor, TimeZoneInfo.Local);
+        var wanted = new List<RowMark>(lines.Count + pending.Count + 1);
         if (bubbles.Count == 0 && pending.Count == 0)
         {
-            MessageStack.Children.Add(new TextBlock
+            wanted.Add(new RowMark(ConversationRows.EmptyKey, string.Empty));
+        }
+        foreach (var line in lines)
+        {
+            wanted.Add(new RowMark(
+                ConversationRows.MessageKey(line.Bubble.Message.Id),
+                ConversationRows.Signature(line, RowDrawnWith(line, family, peerRead))));
+        }
+        foreach (var row in pending)
+        {
+            // A send on its way is drawn again on every redraw, as it always was: there are few, and what they show moves.
+            wanted.Add(new RowMark(ConversationRows.PendingKey(row.ClientMsgId), string.Empty));
+        }
+        var plan = whole
+            ? null
+            : ConversationRows.Plan([.. drawnRows.Select(row => new RowMark(row.Key, row.Signature))], wanted, index => drawnRows[index].Settled);
+        if (whole)
+        {
+            balloons.Clear();
+            callBackLinks.Clear();
+        }
+
+        var rows = new List<DrawnRow>(wanted.Count);
+        var at = 0;
+        if (bubbles.Count == 0 && pending.Count == 0)
+        {
+            rows.Add(Kept(at) ?? Built(wanted[at], row => row.Elements.Add(new TextBlock
             {
                 Text = services.Say.Get("Say something to get started."),
                 Opacity = 0.7,
                 Margin = new Thickness(0, 12, 0, 0),
-            });
+            })));
+            at++;
         }
-        // Names over bubbles only where there is more than one other person to tell apart.
-        var family = connection.Chats.Chat(chat.ChatId)?.Chat.Kind == "family";
-        var today = DateOnly.FromDateTime(DateTime.Now);
-        FrameworkElement? divider = null;
-        foreach (var line in Timeline.Rows(bubbles, family, Reader, anchor, TimeZoneInfo.Local))
+        foreach (var line in lines)
         {
-            if (line.DayAbove is { } day)
+            var message = line.Bubble.Message;
+            rows.Add(Kept(at) ?? Built(wanted[at], row =>
             {
-                MessageStack.Children.Add(DayPill(Timeline.DayLabel(day, today, services.Culture, services.Say)));
-            }
-            if (line.UnreadDividerAbove)
-            {
-                divider = Divider(Timeline.DividerText(unreadAtOpen, services.Say));
-                MessageStack.Children.Add(divider);
-            }
-            MessageStack.Children.Add(BubbleElement(chat, line));
+                row.MessageId = message.Id;
+                // A hidden row fetches what a visible one would and keeps none of it on screen: built again on every redraw,
+                // so it asks again on the same schedule a visible row's retry does.
+                row.Volatile = !line.Bubble.Reads && message.Media.Count > 0;
+                if (line.DayAbove is { } day)
+                {
+                    row.Elements.Add(DayPill(Timeline.DayLabel(day, today, services.Culture, services.Say)));
+                }
+                if (line.UnreadDividerAbove)
+                {
+                    row.Divider = Divider(Timeline.DividerText(unreadAtOpen, services.Say));
+                    row.Elements.Add(row.Divider);
+                }
+                row.Elements.Add(BubbleElement(chat, line));
+                if (balloons.TryGetValue(message.Id, out var balloon))
+                {
+                    row.Balloon = balloon;
+                }
+            }));
+            at++;
         }
-        foreach (var row in pending)
+        foreach (var pendingRow in pending)
         {
-            MessageStack.Children.Add(PendingElement(chat, row));
+            rows.Add(Built(wanted[at], row =>
+            {
+                row.Volatile = true;
+                row.Elements.Add(PendingElement(chat, pendingRow));
+            }));
+            at++;
         }
-        MessageScroller.UpdateLayout();
+
+        // What left the screen leaves what points at it: the balloon a quote scrolls to, and the "Call back" a call toggles.
+        if (!whole)
+        {
+            var kept = new HashSet<DrawnRow>(rows, ReferenceEqualityComparer.Instance);
+            foreach (var gone in drawnRows.Where(row => !kept.Contains(row)))
+            {
+                if (gone.MessageId is { } id && gone.Balloon is { } was
+                    && balloons.TryGetValue(id, out var now) && ReferenceEquals(now.Balloon, was.Balloon))
+                {
+                    balloons.Remove(id);
+                }
+                foreach (var link in gone.CallBackLinks)
+                {
+                    callBackLinks.Remove(link);
+                }
+            }
+        }
+        drawnRows.Clear();
+        drawnRows.AddRange(rows);
+        drawnFor = chat;
+        drawnAround = around;
+
+        var elements = rows.SelectMany(row => row.Elements).ToList();
+        if (!whole && MergeStack(elements) < 0)
+        {
+            // Not in place after all (MergeStack says why). Built again WHOLE rather than the kept elements put back: an
+            // element taken out and put back in one turn may hear Unloaded after Loaded, and its sticker, animation, circle
+            // or recording would let go of the very element on screen.
+            Diagnostics.Write("the conversation could not be updated in place: drawn whole");
+            MessageStack.Children.Clear();
+            balloons.Clear();
+            callBackLinks.Clear();
+            ForgetDrawnRows();
+            conversationDrawn = string.Empty;
+            DrawConversation(keepFromBottom);
+            return;
+        }
+        if (whole)
+        {
+            MessageStack.Children.Clear();
+            stackShown.Clear();
+            foreach (var element in elements)
+            {
+                MessageStack.Children.Add(element);
+                stackShown.Add(element);
+            }
+        }
+        var divider = rows.FirstOrDefault(row => row.Divider is not null)?.Divider;
+        // Layout is forced only where a scroll below is about to read it. A reader up the history is not moved, and what
+        // changed is laid out with the next frame like anything else.
+        if (keepFromBottom is not null || scrollToAnchor || atNewest)
+        {
+            MessageScroller.UpdateLayout();
+        }
         if (keepFromBottom is { } distance)
         {
             // Paging back must not move what the reader is looking at: the page lands ABOVE it.
@@ -1321,7 +1688,133 @@ public sealed partial class ChatsView : UserControl
             MessageScroller.ChangeView(null, MessageScroller.ScrollableHeight, null, disableAnimation: true);
         }
         ShowJump();
+
+        DrawnRow? Kept(int index) => plan is not null && plan[index] >= 0 ? drawnRows[plan[index]] : null;
     }
+
+    /// <summary>
+    /// Build one row of the conversation, noting as it goes what its drawing still waits for and which "Call back" links it
+    /// drew — so a later redraw can tell whether to keep it, and what to forget when it goes.
+    /// </summary>
+    private DrawnRow Built(RowMark mark, Action<DrawnRow> build)
+    {
+        var row = new DrawnRow(mark.Key, mark.Signature);
+        var linksBefore = callBackLinks.Count;
+        var outer = building;
+        building = row;
+        try
+        {
+            build(row);
+        }
+        finally
+        {
+            building = outer;
+        }
+        if (callBackLinks.Count > linksBefore)
+        {
+            row.CallBackLinks.AddRange(callBackLinks.GetRange(linksBefore, callBackLinks.Count - linksBefore));
+        }
+        return row;
+    }
+
+    /// <summary>
+    /// Turn the stack into these elements by inserting and removing only what changed (<see cref="ConversationRows.Merge"/>).
+    /// Answers how many changes that took, or -1 when the stack has to be built whole instead — the copy kept of it no longer
+    /// matches it, the kept elements would have to move, or the window refused a change half-way.
+    /// </summary>
+    private int MergeStack(IReadOnlyList<UIElement> elements)
+    {
+        var children = MessageStack.Children;
+        if (children.Count != stackShown.Count)
+        {
+            return -1;
+        }
+        try
+        {
+            return ConversationRows.Merge(stackShown, elements, children.RemoveAt, children.Insert);
+        }
+        catch (Exception e)
+        {
+            // The stack is in some state between the two: the caller clears it and draws the conversation whole.
+            Diagnostics.Write($"updating the conversation in place: {e.GetType().Name}");
+            return -1;
+        }
+    }
+
+    /// <summary>The open chat is gone: nothing drawn for it is kept.</summary>
+    private void ForgetDrawnRows()
+    {
+        drawnRows.Clear();
+        stackShown.Clear();
+        drawnFor = null;
+        drawnAround = string.Empty;
+    }
+
+    /// <summary>
+    /// What every row of the conversation is drawn from that is not any one row's: the chat, the reader's block list and the
+    /// roster (names, faces, voters), the call switches, the card and map settings, today, the theme, the language, the
+    /// family's and the assistant's documents and whether formulas can be drawn. A change to any of it builds every row again
+    /// — what every redraw used to do.
+    /// </summary>
+    private string DrawnAround(ConversationModel chat, string? kind)
+    {
+        var state = connection.Session.State;
+        return string.Join(
+            Field,
+            chat.ChatId,
+            kind,
+            string.Join(',', connection.Chats.Blocked()),
+            Wire.Encode(connection.Chats.Members()),
+            callBusy,
+            state.CallsEnabled,
+            state.VideoCallsEnabled,
+            LinkPreviewSetting.Enabled,
+            MapPreviewSetting.Enabled,
+            previewPicturesRefused,
+            DateOnly.FromDateTime(DateTime.Now),
+            ActualTheme,
+            services.Culture.Name,
+            unreadAtOpen,
+            Wire.Encode(state.Assistant),
+            Wire.Encode(state.Family),
+            // Formulas and diagrams are drawn by it, and typed out without it.
+            services.Rich is not null);
+    }
+
+    /// <summary>
+    /// What one message's row is drawn from beyond the message itself and its place (<see cref="ConversationRows.Signature"/>):
+    /// the words an answer has streamed so far and whether it stopped, the state of its link's card, its ticks, and whether
+    /// the text of each recording it carries is already held — the things <see cref="BubbleElement"/> reads per bubble.
+    /// </summary>
+    private string RowDrawnWith(TimelineRow line, bool familyChat, long peerRead)
+    {
+        var bubble = line.Bubble;
+        var message = bubble.Message;
+        var body = connection.Answers.BodyOf(message);
+        var writing = connection.Answers.IsWriting(message) ? body : string.Empty;
+        var failure = connection.Answers.FailureSentence(message, services.Say, services.Culture) ?? string.Empty;
+        var card = LinkPreviewSetting.Enabled
+            && message.Call is null
+            && PreviewLinkOf(message, body, emojiOnly: false) is { } link
+            && connection.Previews.State(link) is { } state
+                ? (int)state.Status
+                : -1;
+        // Only where the row draws its time — the tick is beside it — so a peer reading a burst rebuilds its last row alone.
+        var seen = (line.RunEnd || message.EditedAt is not null || !bubble.Reads)
+            && BubbleRules.ShowsTick(message, Reader, familyChat)
+            && BubbleRules.Seen(message, Reader, familyChat, peerRead);
+        var texts = string.Concat(message.Media
+            .Where(attachment => attachment.Kind is "audio" or "video")
+            .Select(attachment => connection.Transcripts.Holds(attachment.Id) ? '1' : '0'));
+        return string.Join(Field, writing, failure, card, seen ? 1 : 0, texts);
+    }
+
+    /// <summary>
+    /// Something a row's drawing is still waiting for — a picture, a sticker's frames, a map tile, a face — as a question that
+    /// answers whether it came. A row with an unanswered one is built again by the next redraw, which is how the redraw that
+    /// rebuilt everything used to retry it. Asked only while a conversation row is being built; the thread panel's are not.
+    /// </summary>
+    private void SettlesWhen(Func<bool> settled) => building?.Settles.Add(settled);
 
     /// <summary>Decide where the open chat opens, from what it holds now.</summary>
     private void DecideAnchor(ConversationModel chat)
@@ -1417,15 +1910,16 @@ public sealed partial class ChatsView : UserControl
         var secondary = (Brush)resources["TextFillColorSecondaryBrush"];
         var message = bubble.Message;
         var mine = bubble.Mine;
-        var kind = connection.Chats.Chat(chat.ChatId)?.Chat.Kind;
+        var kind = connection.Chats.Kind(chat.ChatId);
         var assistantChat = kind == "ai";
-        var familyChat = kind == "family";
+        // The family chat or a group: no "seen" where there are many readers.
+        var familyChat = ChatKinds.IsShared(kind);
         var assistantId = connection.Session.State.Assistant?.UserId;
         // The body as drawn: an answer still being written shows what has streamed so far.
         var body = connection.Answers.BodyOf(message);
         var awaited = BubbleRules.Awaited(message, body, Reader, assistantChat, assistantId);
-        // What a failed answer says, remembered with the failure: the provider's refusal, or "ask again".
-        var failure = connection.Answers.FailureSentence(message, say);
+        // What a failed answer says, remembered with the failure: the provider's refusal, a used-up allowance, or "ask again".
+        var failure = connection.Answers.FailureSentence(message, say, services.Culture);
         var failed = failure is not null;
         var shown = bubble with { Message = message with { Body = body } };
         // A STICKER (docs/protocol.md, "How it is drawn"): one flagged photo and no words. A message from before stickers,
@@ -1445,6 +1939,11 @@ public sealed partial class ChatsView : UserControl
             // The same rule for a circle: its poster — all a visible one fetches — is fetched and drawn nowhere.
             _ = FetchHiddenPosterAsync(unseenRound);
         }
+        if (!bubble.Reads && message.AnimationVideo is { } unseenAnimation)
+        {
+            // And for an animation (#96): its poster, and its video where a visible tile would play it.
+            _ = FetchHiddenAnimationAsync(unseenAnimation);
+        }
         // One to four emoji and nothing else: drawn large and bare — the apps' ladder, scaled to this window's 14-pixel body.
         var emojiSize = !awaited && bubble.Reads && message.Call is null && message.Poll is null && message.Media.Count == 0 && message.ReplyTo is null
             ? Emoji.DisplayFontSizeForBody(body, 14)
@@ -1453,17 +1952,18 @@ public sealed partial class ChatsView : UserControl
         var column = new StackPanel
         {
             Spacing = 3,
-            MaxWidth = 600,
+            // min(column − 48, 560) (ConversationColumn.BubbleMax): the cap and the margin on the side it does not lean to.
+            MaxWidth = ConversationColumn.BubbleMaxEpx,
             HorizontalAlignment = mine ? HorizontalAlignment.Right : HorizontalAlignment.Left,
             // Runs breathe less than turns do.
-            Margin = new Thickness(mine ? 72 : 0, row.RunStart ? 8 : 1, mine ? 0 : 72, 0),
+            Margin = new Thickness(mine ? ConversationColumn.BubbleSpacerEpx : 0, row.RunStart ? 8 : 1, mine ? 0 : ConversationColumn.BubbleSpacerEpx, 0),
         };
         if (row.ShowsSender)
         {
             // The run's head: a face beside a tinted name — the one place a family thread tells its speakers apart at a glance.
             var name = BubbleText.Sender(bubble, connection.Chats, say);
             var head = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, Margin = new Thickness(4, 0, 0, 0) };
-            head.Children.Add(faces.Face(name, false, message.SenderId, connection.Chats.Member(message.SenderId)?.AvatarVersion ?? 0, 18));
+            head.Children.Add(faces.Face(name, false, message.SenderId, connection.Chats.Member(message.SenderId)?.AvatarVersion ?? 0, 18, SettlesWhen));
             head.Children.Add(new TextBlock
             {
                 Text = name,
@@ -2392,6 +2892,17 @@ public sealed partial class ChatsView : UserControl
         }
         if (row.Failed)
         {
+            // Why, where the refusal has words of its own (a paid family's storage allowance); otherwise the two actions alone.
+            if (PaidFamilies.SendRefusal(row.FailedCode, say) is { } why)
+            {
+                stack.Children.Add(new TextBlock
+                {
+                    Text = why,
+                    FontSize = 12,
+                    TextWrapping = TextWrapping.Wrap,
+                    Foreground = Palette.Ink(),
+                });
+            }
             var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right };
             var retry = new HyperlinkButton { Content = say.Get("Try Again") };
             retry.Click += (_, _) =>
@@ -2432,9 +2943,9 @@ public sealed partial class ChatsView : UserControl
             Child = stack,
             Padding = new Thickness(12, 8, 12, 8),
             CornerRadius = new CornerRadius(14),
-            MaxWidth = 600,
+            MaxWidth = ConversationColumn.BubbleMaxEpx,
             HorizontalAlignment = HorizontalAlignment.Right,
-            Margin = new Thickness(72, 8, 0, 0),
+            Margin = new Thickness(ConversationColumn.BubbleSpacerEpx, 8, 0, 0),
             Background = Palette.Surface(ActualTheme),
             Opacity = row.Failed ? 0.9 : 0.6,
         };
@@ -2535,7 +3046,7 @@ public sealed partial class ChatsView : UserControl
         {
             Spacing = 3,
             HorizontalAlignment = HorizontalAlignment.Right,
-            Margin = new Thickness(72, 8, 0, 0),
+            Margin = new Thickness(ConversationColumn.BubbleSpacerEpx, 8, 0, 0),
         };
         column.Children.Add(balloon);
         column.Children.Add(PendingFoot(chat, row));
@@ -2551,6 +3062,14 @@ public sealed partial class ChatsView : UserControl
     private FrameworkElement MediaElement(MessageDto message, bool mine, string? chatKind)
     {
         var panel = new StackPanel { Spacing = 4 };
+        if (message.AnimationVideo is { } animation)
+        {
+            // An ANIMATION (docs/protocol.md, "Animations"): one flagged video, drawn as a picture that moves in a photo's box —
+            // no play button, no length, and no text under it, since it has no sound to transcribe.
+            var (tileWidth, tileHeight) = MediaText.TileSize(animation.Width, animation.Height);
+            panel.Children.Add(AnimationElement(animation, tileWidth, tileHeight));
+            return panel;
+        }
         var looked = message.Media.Where(attachment => MediaText.IsMedia(attachment.Kind)).ToList();
         if (looked.Count == 1)
         {
@@ -2662,6 +3181,8 @@ public sealed partial class ChatsView : UserControl
         if (source != AttachmentFiles.TileSource.None)
         {
             _ = ShowPictureAsync(image, attachment, preview: source == AttachmentFiles.TileSource.Preview);
+            // Until the picture is in, the next redraw builds this tile again — and so asks for it again.
+            SettlesWhen(() => image.Source is not null);
         }
         frame.Tapped += (_, _) => OpenViewer(album, index);
         return frame;
@@ -2681,7 +3202,12 @@ public sealed partial class ChatsView : UserControl
                 }
                 return;
             }
-            if (await DecodeAsync(bytes) is not { } decoded)
+            // A photo's own bytes — it has no small copy — decoded near the tile's size rather than the camera's
+            // (PictureDecode). Never a sticker, whose frames a smaller decode is not asked to keep moving.
+            var tileWidth = !(preview && attachment.HasPreview) && attachment.Kind == "photo" && !attachment.Sticker
+                ? PictureDecode.TileWidth(attachment.Width, attachment.Height, RasterScale())
+                : null;
+            if (await DecodeAsync(bytes, tileWidth) is not { } decoded)
             {
                 return;
             }
@@ -2690,7 +3216,8 @@ public sealed partial class ChatsView : UserControl
         image.Source = picture;
     }
 
-    private static async Task<BitmapImage?> DecodeAsync(byte[] bytes)
+    /// <param name="width">The width to decode at, in effective pixels — null for the picture's own size.</param>
+    private static async Task<BitmapImage?> DecodeAsync(byte[] bytes, int? width = null)
     {
         try
         {
@@ -2704,6 +3231,12 @@ public sealed partial class ChatsView : UserControl
             }
             stream.Seek(0);
             var picture = new BitmapImage();
+            if (width is { } wide)
+            {
+                // Set BEFORE the source, or the whole picture is decoded first. One side only: the other follows the shape.
+                picture.DecodePixelType = DecodePixelType.Logical;
+                picture.DecodePixelWidth = wide;
+            }
             await picture.SetSourceAsync(stream);
             return picture;
         }
@@ -2723,6 +3256,7 @@ public sealed partial class ChatsView : UserControl
     {
         // A circle playing in place makes way for the viewer (one thing at a time, S5.3) — Open Full Screen included.
         YieldRound();
+        viewerDrawing = null;
         viewing = new MediaAlbum(items, index, round);
         ViewerOverlay.Visibility = Visibility.Visible;
         ShowViewerItem();
@@ -2733,6 +3267,7 @@ public sealed partial class ChatsView : UserControl
     private void CloseViewer()
     {
         viewing = null;
+        viewerDrawing = null;
         viewerShown++;
         StopViewerVideo();
         var played = viewerRoundPlayed;
@@ -2826,6 +3361,13 @@ public sealed partial class ChatsView : UserControl
         // Only a video message — opened from its circle or its menu, S5.1's test of the whole message — is shown in its circle.
         SetViewerRound(album.IsRound);
         ShowZoom();
+        // A drawing (issue #97) is in hand already, and is no attachment: nothing to fetch, save or share.
+        if (viewerDrawing is { } drawing)
+        {
+            ShowViewerDrawing(drawing);
+            return;
+        }
+        ShowViewerAttachment();
         ViewerLoading.IsActive = true;
         _ = LoadViewerItemAsync(album.Current, album.IsVideo, token);
     }
@@ -2880,6 +3422,8 @@ public sealed partial class ChatsView : UserControl
                 // Not by itself under a running microphone, and not at all until it stops (S1.7).
                 ViewerVideo.AutoPlay = recorder is null;
                 ViewerVideo.Source = Windows.Media.Core.MediaSource.CreateFromStream(stream, item.Mime ?? "video/mp4");
+                // An animation plays larger here as it does in its tile: muted, looping, no controls (docs/protocol.md, "Animations").
+                PlayViewerAs(viewing is { IsAnimation: true });
                 QuietViewerVideo();
                 ViewerLoading.IsActive = false;
                 if (viewerRound)
@@ -3120,7 +3664,7 @@ public sealed partial class ChatsView : UserControl
         }
         var recording = recorder is not null;
         // A circle has its own bar under it, which the same rule dims.
-        ViewerVideo.AreTransportControlsEnabled = !recording && !viewerRound;
+        ViewerVideo.AreTransportControlsEnabled = !recording && !viewerRound && viewing is not { IsAnimation: true };
         ViewerRoundPlay.IsEnabled = !recording;
         ViewerRoundSeek.IsEnabled = !recording;
         try
@@ -3153,7 +3697,7 @@ public sealed partial class ChatsView : UserControl
     /// <summary>Share — Windows' own share window, as the Mac's viewer offers its sharing menu — with the original's bytes.</summary>
     private async Task ShareViewedAsync()
     {
-        if (viewing is not { } album)
+        if (viewing is not { } album || viewerDrawing is not null)
         {
             return;
         }
@@ -3179,7 +3723,7 @@ public sealed partial class ChatsView : UserControl
     /// <summary>Save hands over the page that is up when it is clicked — the original's bytes.</summary>
     private async Task SaveViewedAsync()
     {
-        if (viewing is not { } album)
+        if (viewing is not { } album || viewerDrawing is not null)
         {
             return;
         }
@@ -3395,9 +3939,9 @@ public sealed partial class ChatsView : UserControl
         // What is held is drawn; what could not be fetched is said, rather than passed off as the whole chain.
         ThreadNotice.Text = say.Get("Couldn't load the whole thread.");
         ThreadNotice.Visibility = bubbles.Count > 0 && chain.Failure is not null ? Visibility.Visible : Visibility.Collapsed;
-        var family = connection.Chats.Chat(chat.ChatId)?.Chat.Kind == "family";
+        var shared = ChatKinds.IsShared(connection.Chats.Kind(chat.ChatId));
         var today = DateOnly.FromDateTime(DateTime.Now);
-        foreach (var line in Timeline.Rows(bubbles, family, Reader, null, TimeZoneInfo.Local))
+        foreach (var line in Timeline.Rows(bubbles, shared, Reader, null, TimeZoneInfo.Local))
         {
             if (line.DayAbove is { } day)
             {
@@ -3409,9 +3953,9 @@ public sealed partial class ChatsView : UserControl
         {
             ThreadStack.Children.Add(PendingElement(chat, row));
         }
-        // A reply needs a root to answer.
+        // A reply needs a root to answer — and Send, something to say (DrawThreadSend).
         ThreadComposer.IsEnabled = hasRoot;
-        ThreadSend.IsEnabled = hasRoot;
+        DrawThreadSend();
         ShowStickerButton();
         ThreadScroller.UpdateLayout();
         if (atEnd)
@@ -3422,10 +3966,16 @@ public sealed partial class ChatsView : UserControl
 
     private void OnThreadComposerKey(object sender, KeyRoutedEventArgs e)
     {
-        // Escape closes the panel, as it closes the web client's.
+        // Escape closes the panel, as it closes the web client's — but never over a draft (#106, doc 2.3): closing would lose
+        // it, so with words in the box the first Esc only leaves the box, onto the panel's Close, and a second closes it.
         if (e.Key == Windows.System.VirtualKey.Escape)
         {
             e.Handled = true;
+            if (!string.IsNullOrWhiteSpace(ThreadComposer.Text))
+            {
+                ThreadClose.Focus(FocusState.Keyboard);
+                return;
+            }
             CloseThread();
             return;
         }
@@ -3433,14 +3983,40 @@ public sealed partial class ChatsView : UserControl
         {
             return;
         }
-        // Enter sends and Shift+Enter is a new line, as in the conversation's own composer.
-        var shift = InputKeyboardSource.GetKeyStateForCurrentThread(Windows.System.VirtualKey.Shift)
-            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
-        if (!shift)
+        // Enter sends and Enter with Shift, Ctrl or Alt is a new line, as in the conversation's own composer (#95).
+        e.Handled = true;
+        if (NewLineHeld(e))
         {
-            e.Handled = true;
+            PutNewLine(ThreadComposer);
+        }
+        else
+        {
             SendInThread();
         }
+    }
+
+    /// <summary>
+    /// Enter with Shift, Ctrl or Alt held (#95, <see cref="NewLineKeys"/>). Alt is read from the event too: an Alt combination
+    /// is a menu-key press, which the key-state query alone has been known to miss.
+    /// </summary>
+    private static bool NewLineHeld(KeyRoutedEventArgs e) =>
+        NewLineKeys.EnterMakesLine(
+            shift: IsHeld(Windows.System.VirtualKey.Shift),
+            control: IsHeld(Windows.System.VirtualKey.Control),
+            alt: e.KeyStatus.IsMenuKeyDown || IsHeld(Windows.System.VirtualKey.Menu));
+
+    private static bool IsHeld(Windows.System.VirtualKey key) =>
+        InputKeyboardSource.GetKeyStateForCurrentThread(key).HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+
+    /// <summary>
+    /// A new line at the caret, over the selection — done here rather than left to the TextBox, which makes one of Shift+Enter
+    /// but not of Ctrl+Enter or Alt+Enter. A CR, as the TextBox itself writes a line; it goes out as a LF.
+    /// </summary>
+    private static void PutNewLine(TextBox box)
+    {
+        var at = box.SelectionStart;
+        box.SelectedText = "\r";
+        box.Select(at + 1, 0);
     }
 
     /// <summary>
@@ -3455,7 +4031,7 @@ public sealed partial class ChatsView : UserControl
         }
         var body = ThreadComposer.Text.Trim();
         chat.Send(body, replyToMessageId: chain.RootId,
-            mentions: ComposerMentions.ForSend(body, connection.Chats.Members(), IsFamily(chat)));
+            mentions: ComposerMentions.ForSend(body, Candidates(chat), IsShared(chat)));
         ThreadComposer.Text = string.Empty;
         threadDrawn = string.Empty;
         DrawThread(scrollToEnd: true);
@@ -3567,7 +4143,7 @@ public sealed partial class ChatsView : UserControl
             }
             chat.Send(
                 body, replyToMessageId: replyTo, pendingFiles: handles,
-                mentions: ComposerMentions.ForSend(body, connection.Chats.Members(), IsFamily(chat)));
+                mentions: ComposerMentions.ForSend(body, Candidates(chat), IsShared(chat)));
             if (!editingNow)
             {
                 drafts.Sent(chat.ChatId);
@@ -4419,13 +4995,13 @@ public sealed partial class ChatsView : UserControl
         liveLevels.Clear();
         levelsMove = StickerImaging.AnimationsWanted();
         RecordingLevels.Children.Clear();
-        RecordingRow.MinHeight = Math.Max(ComposerBox.ActualHeight, ComposerTools.ActualHeight);
+        RecordingRow.MinHeight = Math.Max(ComposerField.ActualHeight, ComposerTools.ActualHeight);
         RecordingStop.Visibility = recordingBesideDraft ? Visibility.Collapsed : Visibility.Visible;
         RecordingWarning.Visibility = Visibility.Collapsed;
         RecordingTime.ClearValue(TextBlock.ForegroundProperty);
         ShowRecording();
         ComposerTools.Visibility = Visibility.Collapsed;
-        ComposerBox.Visibility = Visibility.Collapsed;
+        ComposerField.Visibility = Visibility.Collapsed;
         SuggestionScroller.Visibility = Visibility.Collapsed;
         RecordingRow.Visibility = Visibility.Visible;
         FadeIn(RecordingRow);
@@ -4563,7 +5139,7 @@ public sealed partial class ChatsView : UserControl
             handle = await Task.Run(() => store.Stage(note));
             chat.Send(
                 string.Empty, replyToMessageId: replyTo, pendingFiles: [handle],
-                mentions: ComposerMentions.ForSend(string.Empty, connection.Chats.Members(), IsFamily(chat)));
+                mentions: ComposerMentions.ForSend(string.Empty, Candidates(chat), IsShared(chat)));
         }
         catch (Exception e)
         {
@@ -4639,9 +5215,9 @@ public sealed partial class ChatsView : UserControl
         RecordingRow.Visibility = Visibility.Collapsed;
         RecordingLevels.Visibility = Visibility.Collapsed;
         RecordingLevels.Children.Clear();
-        ComposerBox.Visibility = Visibility.Visible;
+        ComposerField.Visibility = Visibility.Visible;
         ComposerTools.Visibility = Visibility.Visible;
-        FadeIn(ComposerBox);
+        FadeIn(ComposerField);
         FadeIn(ComposerTools);
         AttachButton.IsEnabled = !finding;
         DrawSuggestions();
@@ -5194,7 +5770,7 @@ public sealed partial class ChatsView : UserControl
             }
             chat.Send(
                 caption, replyToMessageId: entry.ReplyToMessageId, pendingFiles: [handle],
-                mentions: ComposerMentions.ForSend(caption, connection.Chats.Members(), IsFamily(chat)));
+                mentions: ComposerMentions.ForSend(caption, Candidates(chat), IsShared(chat)));
             if (!await Task.Run(() => parked.Remove(entry)))
             {
                 Diagnostics.Write("a voice message that was sent could not be taken out of the not-sent store");
@@ -5843,7 +6419,7 @@ public sealed partial class ChatsView : UserControl
                 var error = look.Error ?? ApiError.Transport("no answer");
                 var line = new TextBlock
                 {
-                    Text = TranscriptRules.FailureSentence(error, say),
+                    Text = TranscriptRules.FailureSentence(error, say, services.Culture, renewsAt: look.RenewsAt),
                     FontSize = 12,
                     TextWrapping = TextWrapping.Wrap,
                     Opacity = 0.85,
@@ -6476,6 +7052,7 @@ public sealed partial class ChatsView : UserControl
             Canvas.SetTop(image, tile.Top);
             canvas.Children.Add(image);
             _ = ShowTileAsync(image, tile);
+            SettlesWhen(() => image.Source is not null);
         }
         // The place: a red dot where the pin stands, ringed in white so it reads on any colour of map.
         var ring = new Microsoft.UI.Xaml.Shapes.Ellipse
@@ -6740,9 +7317,10 @@ public sealed partial class ChatsView : UserControl
 
     // ---- polls ---------------------------------------------------------------------------------------
 
+    /// <summary>What a poll card is drawn with; the M in "N of M voted" is the people in THIS chat — a group's members in a group.</summary>
     private PollCard.Seen PollSeen() => new(
         services.Say, Reader, connection.Chats.Member, connection.Chats.IsBlocked,
-        PollText.MemberCount(connection.Chats.Members()));
+        PollText.MemberCount(open is { } chat ? Candidates(chat) : connection.Chats.Members()));
 
     /// <summary>How many open polls the reader has still to answer — nothing drawn at none.</summary>
     private void ShowPollsBadge()
@@ -6758,7 +7336,7 @@ public sealed partial class ChatsView : UserControl
     /// </summary>
     private async Task AskPollAsync()
     {
-        if (open is not { } chat || !IsFamily(chat))
+        if (open is not { } chat || !IsShared(chat))
         {
             return;
         }
@@ -6779,7 +7357,7 @@ public sealed partial class ChatsView : UserControl
         }
         chat.Send(
             poll.Question, replyToMessageId: replyingTo?.Id, pollOptions: poll.Options,
-            mentions: ComposerMentions.ForSend(poll.Question, connection.Chats.Members(), familyChat: true));
+            mentions: ComposerMentions.ForSend(poll.Question, Candidates(chat), enabled: true));
         if (replyingTo is not null)
         {
             EndComposerMode(clear: false);
@@ -6812,47 +7390,65 @@ public sealed partial class ChatsView : UserControl
 
     // ---- mentioning a member ---------------------------------------------------------------------
 
-    private bool IsFamily(ConversationModel chat) => connection.Chats.Chat(chat.ChatId)?.Chat.Kind == "family";
+    /// <summary>
+    /// The family chat or a group (<see cref="ChatKinds.IsShared"/>): where a name names somebody, a poll may be started and
+    /// names stand over bubbles (docs/protocol.md, "Groups").
+    /// </summary>
+    private bool IsShared(ConversationModel chat) => ChatKinds.IsShared(Kind(chat));
 
     /// <summary>
-    /// What KIND of chat this is, in the protocol's own words — "family", "direct", "ai" — or
+    /// Who a name in this chat may name, and who its polls count: the live roster in the family chat, the group's own live
+    /// members in a group (<see cref="ComposerMentions.Candidates"/>).
+    /// </summary>
+    private IReadOnlyList<MemberDto> Candidates(ConversationModel chat) =>
+        ComposerMentions.Candidates(connection.Chats.Chat(chat.ChatId)?.Chat, connection.Chats.Members());
+
+    /// <summary>
+    /// What KIND of chat this is, in the protocol's own words — "family", "direct", "ai", "group" — or
     /// null while the list has not caught up with it. The assistant's rules are written against
     /// it (docs/protocol.md, "Consenting to the assistant").
     /// </summary>
-    private string? Kind(ConversationModel chat) => connection.Chats.Chat(chat.ChatId)?.Chat.Kind;
+    private string? Kind(ConversationModel chat) => connection.Chats.Kind(chat.ChatId);
 
     /// <summary>
-    /// The strip over the composer: the names a half-typed @ could mean, in the family chat alone. The arrows walk
-    /// it, Enter or Tab takes the highlighted name, and a click takes that one.
+    /// The strip over the composer: the names a half-typed @ could mean, in the family chat or a group — that group's members
+    /// alone — the assistant first,
+    /// where it can be asked, whose pick writes @ai (#106). The arrows walk it, Enter or Tab takes the highlighted name, and a
+    /// click takes that one.
     /// </summary>
     private void DrawSuggestions()
     {
         offered = open is { } chat
-            ? ComposerMentions.Offered(ComposerBox.Text, connection.Chats.Members(), Reader, connection.Chats.IsBlocked, IsFamily(chat), editing is not null)
+            ? ComposerMentions.Choices(
+                ComposerBox.Text, Candidates(chat), Reader, connection.Chats.IsBlocked, IsShared(chat), editing is not null,
+                connection.Session.State.Assistant)
             : [];
         SuggestionStrip.Children.Clear();
         SuggestionScroller.Visibility = offered.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
         AutomationProperties.SetName(SuggestionStrip, services.Say.Get("Members"));
         for (var index = 0; index < offered.Count; index++)
         {
-            var member = offered[index];
+            var choice = offered[index];
             var label = new TextBlock();
-            label.Inlines.Add(new Run { Text = member.DisplayName, FontWeight = FontWeights.SemiBold });
-            if (member.Username.Length > 0)
+            label.Inlines.Add(new Run { Text = choice.Name, FontWeight = FontWeights.SemiBold });
+            if (choice.Handle.Length > 0)
             {
-                label.Inlines.Add(new Run { Text = $"  @{member.Username}", Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"] });
+                label.Inlines.Add(new Run { Text = $"  {choice.Handle}", Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"] });
             }
             var button = new Button { Content = label, IsTabStop = false };
             if (index == Math.Min(activeName, offered.Count - 1))
             {
                 button.Style = (Style)Application.Current.Resources["AccentButtonStyle"];
             }
-            button.Click += (_, _) => AcceptName(member.DisplayName);
+            button.Click += (_, _) => AcceptName(choice.Writes);
             SuggestionStrip.Children.Add(button);
         }
     }
 
-    /// <summary>The trailing @prefix replaced by the whole name — which is what makes the resolution at send find somebody.</summary>
+    /// <summary>
+    /// The trailing @prefix replaced by the whole name — which is what makes the resolution at send find somebody — or by
+    /// <c>ai</c>, the assistant's token.
+    /// </summary>
     private void AcceptName(string name)
     {
         ComposerBox.Text = Mentions.Accept(ComposerBox.Text, name);
@@ -6861,30 +7457,45 @@ public sealed partial class ChatsView : UserControl
     }
 
     /// <summary>
-    /// A body laid out (<see cref="BubbleBody"/>): one text block fills the bubble's words and answers null; a body with a
-    /// table answers its blocks, text and tables in turn.
+    /// A body laid out (<see cref="BubbleBody"/>): one text block of words fills the bubble's words and answers null; a body
+    /// with a table, a rich block or an inline formula answers its own element — its blocks, text, tables and rich blocks in
+    /// turn, and a text block holding a formula as a RichTextBlock, the one text element a picture can stand in
+    /// (ChatsView.Rich.cs).
     /// </summary>
     private FrameworkElement? BodyElement(TextBlock words, string body, MentionDto[]? named, bool mine)
     {
         var blocks = BubbleBody.Lay(body, named, connection.Chats.Members(), Reader, connection.Chats.IsBlocked);
+        var ink = mine ? Palette.Ink() : (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
         if (blocks is [BodyTextBlock { Runs: var only }])
         {
+            if (services.Rich is not null && HasFormula(only))
+            {
+                return FormulaText(only, mine, ink);
+            }
             FillRuns(words, only, mine);
             return null;
         }
-        var ink = mine ? Palette.Ink() : (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
         var panel = new StackPanel { Spacing = 6 };
         foreach (var block in blocks)
         {
             if (block is BodyTableBlock { Table: var table })
             {
-                panel.Children.Add(TableElement(table, ink));
+                panel.Children.Add(TableElement(table, ink, mine));
             }
             else if (block is BodyTextBlock { Runs: var runs })
             {
+                if (services.Rich is not null && HasFormula(runs))
+                {
+                    panel.Children.Add(FormulaText(runs, mine, ink));
+                    continue;
+                }
                 var text = new TextBlock { TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true, Foreground = ink };
                 FillRuns(text, runs, mine);
                 panel.Children.Add(text);
+            }
+            else if (block is BodyRichBlock rich)
+            {
+                panel.Children.Add(RichBlockElement(rich, ink, mine));
             }
         }
         return panel;
@@ -6897,18 +7508,33 @@ public sealed partial class ChatsView : UserControl
     /// </summary>
     private void FillRuns(TextBlock words, IReadOnlyList<BodyRun> runs, bool mine)
     {
-        var ink = mine ? Palette.Ink() : (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
         words.Text = string.Empty;
         words.Inlines.Clear();
+        AddRuns(words.Inlines, runs, mine, formula: null);
+    }
+
+    /// <summary>
+    /// <see cref="FillRuns"/>'s inlines, into any inline collection. <paramref name="formula"/> makes an inline formula's inline
+    /// (ChatsView.Rich.cs); without it a formula is its typed text in the code face, like any run.
+    /// </summary>
+    private void AddRuns(InlineCollection inlines, IReadOnlyList<BodyRun> runs, bool mine, Func<BodyRun, Inline>? formula)
+    {
+        var ink = mine ? Palette.Ink() : (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
         foreach (var run in runs)
         {
+            if (formula is not null && run.Math is not null)
+            {
+                // A formula never carries a link or a mark (MessageBody): it is a run of its own.
+                inlines.Add(formula(run));
+                continue;
+            }
             var styled = StyledRun(run.Text, run.Style, run.Marked);
             if (run.MemberId is { } id && run.Opens)
             {
                 var door = new Hyperlink { UnderlineStyle = UnderlineStyle.None, Foreground = ink };
                 door.Inlines.Add(styled);
                 door.Click += (_, _) => _ = OpenDirectAsync(id);
-                words.Inlines.Add(door);
+                inlines.Add(door);
             }
             else if (BubbleBody.Openable(run.Link) is { } uri)
             {
@@ -6919,18 +7545,19 @@ public sealed partial class ChatsView : UserControl
                 }
                 link.Inlines.Add(styled);
                 link.Click += (_, _) => OpenLinkSoon(uri);
-                words.Inlines.Add(link);
+                inlines.Add(link);
             }
             else
             {
-                words.Inlines.Add(styled);
+                inlines.Add(styled);
             }
         }
     }
 
     /// <summary>
     /// One run in its markdown style: bold, italic, struck, code in a monospaced face, and a heading on the apps' ladder
-    /// (1.29, 1.18 and 1.00 of the body). A name or an assistant token is semibold whatever it sits in.
+    /// (1.29, 1.18 and 1.00 of the body). A name or an assistant token is semibold whatever it sits in. An inline formula not
+    /// drawn (yet) is its typed text, delimiters and all, in the code face (issue #97).
     /// </summary>
     private static Run StyledRun(string text, MarkdownStyle style, bool marked)
     {
@@ -6951,9 +7578,9 @@ public sealed partial class ChatsView : UserControl
         {
             run.TextDecorations = Windows.UI.Text.TextDecorations.Strikethrough;
         }
-        if (style.Code || style.Face == MarkdownFace.Monospaced)
+        if (style.Code || style.Face == MarkdownFace.Monospaced || style.Math is not null)
         {
-            run.FontFamily = new FontFamily("Cascadia Mono, Consolas");
+            run.FontFamily = CodeFace;
         }
         switch (style.Face)
         {
@@ -6974,10 +7601,12 @@ public sealed partial class ChatsView : UserControl
 
     /// <summary>
     /// A table (ios MessageBodyView): the header semibold above a one-pixel rule, the columns sharing the width, cells
-    /// wrapping and aligned as the delimiter row says. Cells carry their styles and nothing else — no links, no names.
+    /// wrapping and aligned as the delimiter row says. Cells carry their styles and nothing else — no links, no names — but an
+    /// inline formula is drawn in a cell as in a line (issue #97).
     /// </summary>
-    private static FrameworkElement TableElement(MarkdownTable table, Brush ink)
+    private FrameworkElement TableElement(MarkdownTable table, Brush ink, bool mine)
     {
+        var look = LookFor(mine);
         var grid = new Grid { ColumnSpacing = 12, RowSpacing = 4, Margin = new Thickness(0, 2, 0, 2) };
         for (var column = 0; column < table.ColumnCount; column++)
         {
@@ -6989,25 +7618,35 @@ public sealed partial class ChatsView : UserControl
             grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             for (var column = 0; column < cells.Count && column < table.ColumnCount; column++)
             {
-                var cell = new TextBlock
+                var alignment = table.Alignment(column) switch
                 {
-                    TextWrapping = TextWrapping.Wrap,
-                    IsTextSelectionEnabled = true,
-                    Foreground = ink,
-                    TextAlignment = table.Alignment(column) switch
-                    {
-                        MarkdownAlignment.Center => TextAlignment.Center,
-                        MarkdownAlignment.Trailing => TextAlignment.Right,
-                        _ => TextAlignment.Left,
-                    },
+                    MarkdownAlignment.Center => TextAlignment.Center,
+                    MarkdownAlignment.Trailing => TextAlignment.Right,
+                    _ => TextAlignment.Left,
                 };
-                if (header)
+                FrameworkElement cell;
+                if (services.Rich is not null && cells[column].Runs.Any(run => run.Style.Math is not null))
                 {
-                    cell.FontWeight = FontWeights.SemiBold;
+                    cell = FormulaCell(cells[column], header, alignment, ink, look);
                 }
-                foreach (var run in cells[column].Runs)
+                else
                 {
-                    cell.Inlines.Add(StyledRun(run.Text, run.Style, marked: false));
+                    var words = new TextBlock
+                    {
+                        TextWrapping = TextWrapping.Wrap,
+                        IsTextSelectionEnabled = true,
+                        Foreground = ink,
+                        TextAlignment = alignment,
+                    };
+                    if (header)
+                    {
+                        words.FontWeight = FontWeights.SemiBold;
+                    }
+                    foreach (var run in cells[column].Runs)
+                    {
+                        words.Inlines.Add(StyledRun(run.Text, run.Style, marked: false));
+                    }
+                    cell = words;
                 }
                 Grid.SetRow(cell, row);
                 Grid.SetColumn(cell, column);
@@ -7103,7 +7742,7 @@ public sealed partial class ChatsView : UserControl
     /// </summary>
     private string? PreviewLinkOf(MessageDto message, string body, bool emojiOnly)
     {
-        var assistantChat = connection.Chats.Chat(message.ChatId)?.Chat.Kind == "ai";
+        var assistantChat = connection.Chats.Kind(message.ChatId) == "ai";
         return Lookups.MayPreview(
             message, body, Reader, assistantChat, connection.Session.State.Assistant?.UserId, connection.Answers.IsWriting(message))
             ? BubbleBody.PreviewLink(body, emojiOnly)
@@ -7242,10 +7881,12 @@ public sealed partial class ChatsView : UserControl
                 ShowProblem(FamilyText.GenericFailure(answer.Error ?? ApiError.Transport("no answer"), services.Say));
                 return;
             }
+            // Taken before the request, so its answer cannot undo a group changed meanwhile (ChatStore.Replace).
+            var mark = connection.Chats.ListMark;
             var chats = await connection.Api.Chats();
             if (chats is { Ok: true, Value.Chats: { } rows })
             {
-                connection.Chats.Replace(rows);
+                connection.Chats.Replace(rows, mark);
             }
             OpenChat(opened.Chat.Id);
         }
@@ -7274,9 +7915,11 @@ public sealed partial class ChatsView : UserControl
                     activeName = (activeName + offered.Count - 1) % offered.Count;
                     DrawSuggestions();
                     return;
-                case Windows.System.VirtualKey.Enter or Windows.System.VirtualKey.Tab when !shifted:
+                // Enter with a new-line modifier is a new line even here (#95); Tab with Shift walks focus back.
+                case Windows.System.VirtualKey.Enter when !NewLineHeld(e):
+                case Windows.System.VirtualKey.Tab when !shifted:
                     e.Handled = true;
-                    AcceptName(offered[Math.Min(activeName, offered.Count - 1)].DisplayName);
+                    AcceptName(offered[Math.Min(activeName, offered.Count - 1)].Writes);
                     return;
             }
         }
@@ -7296,19 +7939,19 @@ public sealed partial class ChatsView : UserControl
         {
             return;
         }
-        // Enter sends and Shift+Enter is a new line — the convention of every desktop chat.
-        var shift = InputKeyboardSource.GetKeyStateForCurrentThread(Windows.System.VirtualKey.Shift)
-            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
-        if (!shift)
+        // Enter sends, and Enter with Shift, Ctrl or Alt is a new line — whichever habit somebody brings (#95).
+        e.Handled = true;
+        if (NewLineHeld(e))
         {
-            e.Handled = true;
-            // Enter is the slot's activation in rows 2 to 5 (S1.3), so it waits out the slot's guard as a click does: a second
-            // Enter after the slot's Stop in row 3 must not send the words the note is being staged beside (S1.1). Words typed
-            // since are never guarded, so "ok" sent at once still goes.
-            if (!slotGuard.IgnoresFieldKey(Environment.TickCount64, e.KeyStatus.WasKeyDown, sends: true, ComposerBox.Text))
-            {
-                Send();
-            }
+            PutNewLine(ComposerBox);
+            return;
+        }
+        // Enter is the slot's activation in rows 2 to 5 (S1.3), so it waits out the slot's guard as a click does: a second
+        // Enter after the slot's Stop in row 3 must not send the words the note is being staged beside (S1.1). Words typed
+        // since are never guarded, so "ok" sent at once still goes.
+        if (!slotGuard.IgnoresFieldKey(Environment.TickCount64, e.KeyStatus.WasKeyDown, sends: true, ComposerBox.Text))
+        {
+            Send();
         }
     }
 
@@ -7374,7 +8017,7 @@ public sealed partial class ChatsView : UserControl
         // Written down first; the outbox owns it from here, and a send interrupted by anything at
         // all is a message that can be finished rather than one that never happened.
         // The names are resolved from the text at send: a name typed by hand mentions too.
-        chat.Send(body, replyToMessageId: replyTo, mentions: ComposerMentions.ForSend(body, connection.Chats.Members(), IsFamily(chat)));
+        chat.Send(body, replyToMessageId: replyTo, mentions: ComposerMentions.ForSend(body, Candidates(chat), IsShared(chat)));
         drafts.Sent(chat.ChatId);
         EndComposerMode(clear: true);
         // A send that empties the composer turns Send into the microphone under the pointer: a double click on Send cannot
@@ -7410,7 +8053,9 @@ public sealed partial class ChatsView : UserControl
             });
             chat.Send(
                 body, replyToMessageId: replyTo, pendingFiles: handles,
-                mentions: ComposerMentions.ForSend(body, connection.Chats.Members(), IsFamily(chat)));
+                mentions: ComposerMentions.ForSend(body, Candidates(chat), IsShared(chat)),
+                // One animation alone is sent AS one (docs/protocol.md, "Animations"); beside anything else it is the video it is.
+                animation: AnimationSend.Is(items));
             drafts.Sent(chat.ChatId);
             Queued();
         }
@@ -7440,6 +8085,8 @@ public sealed partial class ChatsView : UserControl
     {
         atNewest = true;
         conversationDrawn = string.Empty;
+        // Drawn now, and at the newest — but the messages above the new send did not change, and are kept.
+        keepRowsOnce = true;
         DrawConversation(keepFromBottom: null);
         _ = connection.Live.FlushAsync(SendRules.FlushTrigger.Queued);
     }
@@ -7467,8 +8114,9 @@ public sealed partial class ChatsView : UserControl
             assistantChat: kind == "ai",
             // The assistant's own chat, a server that can see, and a family that allows it — all three, or no door that lies.
             offersPictureAttach: AssistantPictures.OffersPictureAttach(kind == "ai", state.Assistant?.Vision == true, state.Family?.AiVision == true),
-            familyChat: kind == "family",
-            roundAvailable: RoundAvailable());
+            sharedChat: ChatKinds.IsShared(kind),
+            roundAvailable: RoundAvailable(),
+            assistantAvailable: AttachMenu.AssistantAvailable(state.Assistant));
         foreach (var group in groups)
         {
             // Between groups only: a group that would be empty is not in the list, so it draws no line.
@@ -7544,6 +8192,19 @@ public sealed partial class ChatsView : UserControl
                 video.Click += (_, _) => _ = OpenRoundRecorderAsync(AttachButton);
                 return video;
             }
+            case AttachItem.AskAssistant:
+            {
+                // "Ask the Assistant" (#106): @ai put into the draft, as its button did — appended, the caret at the end. Off in
+                // an edit, which cannot become a request.
+                var ask = new MenuFlyoutItem
+                {
+                    Text = say.Get("Ask the Assistant"),
+                    Icon = new FontIcon { Glyph = ((char)ComposerRow.AssistantGlyph).ToString() },
+                    IsEnabled = editing is null,
+                };
+                ask.Click += (_, _) => PutInComposer(AssistantText.WithAssistantMention(ComposerBox.Text));
+                return ask;
+            }
             case AttachItem.Location:
             {
                 // A map pin, in Segoe Fluent Icons.
@@ -7565,8 +8226,8 @@ public sealed partial class ChatsView : UserControl
     //
     // Phase 3d (docs/audio-video-messages-2026-10-04.md, S1.4–S1.6, S3, S4, S8.6): the video button inside the empty field,
     // "Record Video Message" in the paperclip's menu and the microphone's, and the recorder they open over the window. All of
-    // it is drawn only where RoundVideoRules.Available — this build records (RoundVideoRules.RecordingEnabled, off until the
-    // owner's trials T1–T3), the server named the limits, and the machine has a camera — so a build that can only RECEIVE
+    // it is drawn only where RoundVideoRules.Available — this build records (RoundVideoRules.RecordingEnabled, on since
+    // 2026-10-21; the owner's trials T1–T3 still to run), the server named the limits, and the machine has a camera — so a build that can only RECEIVE
     // circles shows no way of recording one (Decision 40).
 
     /// <summary>The video button's glyph: Segoe Fluent E714, a video camera (S1.4).</summary>
@@ -7642,7 +8303,7 @@ public sealed partial class ChatsView : UserControl
         }
         return ComposerButton.VideoDoor(new DoorInputs(
             inputs,
-            FamilyOrDirectChat: Kind(chat) is "family" or "direct",
+            FamilyOrDirectChat: ChatKinds.TakesVideoMessages(Kind(chat)),
             ServerOffersRound: connection.Session.State.RoundVideo is not null,
             HasCamera: hasCamera,
             EncoderProbePasses: true,
@@ -7650,31 +8311,17 @@ public sealed partial class ChatsView : UserControl
     }
 
     /// <summary>
-    /// The video button inside the empty field (S1.4): drawn — dimmed with the slot's sentence in rows 7 and 8 — or not, and
-    /// the field given trailing room while it is, so a placeholder never runs under it. Its 600 ms guard starts when it appears.
+    /// The video button inside the empty field (S1.4): drawn — dimmed with the slot's sentence in rows 7 and 8 — or not, beside
+    /// the stickers, and the field given trailing room while it is (DrawField), so a placeholder never runs under it. Its
+    /// 600 ms guard starts when it appears.
     /// </summary>
     private void DrawVideoDoor()
     {
         var door = CurrentDoor();
-        var showing = door.Kind != DoorKind.Hidden && ComposerBox.Visibility == Visibility.Visible;
+        var showing = door.Kind != DoorKind.Hidden && ComposerField.Visibility == Visibility.Visible;
         doorGuard.Showing(showing, Environment.TickCount64);
-        var shown = showing ? Visibility.Visible : Visibility.Collapsed;
-        if (VideoDoorButton.Visibility != shown)
-        {
-            VideoDoorButton.Visibility = shown;
-        }
-        // Room for it at the field's trailing edge while it shows; the style's own padding back when it goes.
-        if (showing && !fieldPadded)
-        {
-            var padding = ComposerBox.Padding;
-            ComposerBox.Padding = new Thickness(padding.Left, padding.Top, padding.Right + ComposerButton.MinTargetWindowsEpx, padding.Bottom);
-            fieldPadded = true;
-        }
-        else if (!showing && fieldPadded)
-        {
-            ComposerBox.ClearValue(Control.PaddingProperty);
-            fieldPadded = false;
-        }
+        doorShowing = showing;
+        DrawField();
         if (!showing)
         {
             return;
@@ -8105,6 +8752,7 @@ public sealed partial class ChatsView : UserControl
         };
         DrawRoundCopy(copy);
         _ = ShowPosterAsync(copy);
+        SettlesWhen(() => !video.HasPreview || copy.Poster is not null);
         return column;
     }
 
@@ -8733,7 +9381,7 @@ public sealed partial class ChatsView : UserControl
         ViewerRoundRetry.Visibility = Visibility.Collapsed;
         ViewerRoundBar.Visibility = Visibility.Collapsed;
         ViewerRoundFrame.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
-        ViewerVideo.AreTransportControlsEnabled = !on && recorder is null;
+        ViewerVideo.AreTransportControlsEnabled = !on && recorder is null && viewing is not { IsAnimation: true };
         if (on)
         {
             viewerBackdrop ??= ViewerOverlay.Background;
@@ -9018,7 +9666,7 @@ public sealed partial class ChatsView : UserControl
         {
             Spacing = 3,
             HorizontalAlignment = HorizontalAlignment.Right,
-            Margin = new Thickness(72, 8, 0, 0),
+            Margin = new Thickness(ConversationColumn.BubbleSpacerEpx, 8, 0, 0),
         };
         var face = new Grid
         {
@@ -9091,6 +9739,8 @@ public sealed partial class ChatsView : UserControl
         if (row.Failed)
         {
             var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right };
+            // Why, where the refusal has words of its own (a paid family's storage allowance) — above the two actions.
+            var why = PaidFamilies.SendRefusal(row.FailedCode, say);
             var retry = new HyperlinkButton { Content = say.Get("Try Again") };
             retry.Click += (_, _) =>
             {
@@ -9112,7 +9762,21 @@ public sealed partial class ChatsView : UserControl
             };
             actions.Children.Add(retry);
             actions.Children.Add(discard);
-            return actions;
+            if (why is null)
+            {
+                return actions;
+            }
+            var foot = new StackPanel { Spacing = 2, HorizontalAlignment = HorizontalAlignment.Right };
+            foot.Children.Add(new TextBlock
+            {
+                Text = why,
+                FontSize = 12,
+                TextWrapping = TextWrapping.Wrap,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(4, 0, 4, 0),
+            });
+            foot.Children.Add(actions);
+            return foot;
         }
         return new TextBlock
         {
@@ -9173,6 +9837,9 @@ public sealed partial class ChatsView : UserControl
         frame.Children.Add(image);
         AutomationProperties.SetName(frame, say.Get("Sticker"));
         _ = ShowStickerAsync(image, word, picture);
+        // Drawn, or known to be undrawable here: either way a redraw has nothing to try again. Bytes that did not come are
+        // not remembered (ShowStickerAsync), and the next redraw builds it again to ask.
+        SettlesWhen(() => word.Visibility == Visibility.Collapsed || stickerPictures.Holds(picture.Id));
         IReadOnlyList<AttachmentDto> album = [picture];
         frame.Tapped += (_, _) => OpenViewer(album, 0);
         return frame;
@@ -9272,7 +9939,7 @@ public sealed partial class ChatsView : UserControl
         {
             Spacing = 3,
             HorizontalAlignment = HorizontalAlignment.Right,
-            Margin = new Thickness(72, 8, 0, 0),
+            Margin = new Thickness(ConversationColumn.BubbleSpacerEpx, 8, 0, 0),
         };
         var frame = new Grid
         {
@@ -9479,14 +10146,18 @@ public sealed partial class ChatsView : UserControl
     }
 
     /// <summary>
-    /// A pack item in a panel cell: the item's ORIGINAL bytes, fetched once and kept under its attachment id. The cell's
-    /// word goes only when there is a picture to put in its place.
+    /// A pack item in a panel cell: the item's ORIGINAL bytes, fetched once and kept on the shelf under its
+    /// <see cref="PanelKey"/>. ANIMATED where this machine can and Windows' animation effects are on (docs/protocol.md,
+    /// "Sticker pack", amended 2026-10-19, #96) — and only while the cell is on screen (<see cref="StickerAnimator"/>) — within
+    /// the panel's shelf's budget, which makes the least recently drawn still. The cell's word goes only when there is a picture
+    /// to put in its place.
     /// </summary>
     private async Task ShowStickerThumbAsync(Image image, TextBlock word, PackItemDto item)
     {
+        var key = PanelKey(item.Id);
         try
         {
-            if (!stickerThumbs.TryGetValue(item.Id, out var decoded))
+            if (!panelStickerPictures.TryGet(key, out var decoded))
             {
                 var (bytes, error) = await pack.BytesAsync(item);
                 if (gone)
@@ -9501,19 +10172,38 @@ public sealed partial class ChatsView : UserControl
                     }
                     return;
                 }
-                decoded = await StickerImaging.DecodeAsync(bytes, StickerLook.PanelCell, RasterScale(), animate: false);
-                if (gone)
+                // One decode at a time, as the conversation's: frames are decoded before the shelf can make room for them.
+                await stickerDecoding.WaitAsync();
+                try
                 {
-                    return;
+                    if (gone)
+                    {
+                        return;
+                    }
+                    if (!panelStickerPictures.TryGet(key, out decoded))
+                    {
+                        decoded = await StickerImaging.DecodeAsync(
+                            bytes, StickerLook.PanelCell, RasterScale(), StickerImaging.AnimationsWanted());
+                        if (gone)
+                        {
+                            decoded?.Release();
+                            return;
+                        }
+                        // A null is kept: the panel is opened again and again, and a codec that is not there is still not there.
+                        panelStickerPictures.Put(key, decoded, decoded?.Bytes ?? 0);
+                    }
                 }
-                // A null is kept: the panel is opened again and again, and a codec that is not there is still not there.
-                stickerThumbs[item.Id] = decoded;
+                finally
+                {
+                    stickerDecoding.Release();
+                }
             }
             if (decoded is null)
             {
                 return;
             }
-            stickers.Show(image, decoded);
+            // The cell's clock is the sticker's: reopening the panel joins the animation where it was.
+            stickers.Show(image, decoded, panelStickerPictures.Started(key, stickers.Now));
             word.Visibility = Visibility.Collapsed;
         }
         catch (Exception e)
@@ -9772,7 +10462,7 @@ public sealed partial class ChatsView : UserControl
         if (open is { } chat)
         {
             var state = connection.Session.State;
-            var kind = connection.Chats.Chat(chat.ChatId)?.Chat.Kind;
+            var kind = connection.Chats.Kind(chat.ChatId);
             var serverCanSee = state.Assistant?.Vision == true;
             var familyAllows = state.Family?.AiVision == true;
             // What travels of a photo staged here is the photo as prepared.
@@ -9783,7 +10473,7 @@ public sealed partial class ChatsView : UserControl
                 said = AssistantPictures.PrivateNotice(
                     staged, AssistantPictures.OffersPictureAttach(true, serverCanSee, familyAllows), services.Say);
             }
-            else if (kind == "family" && editing is null && state.Assistant is { } assistant)
+            else if (ChatKinds.IsShared(kind) && editing is null && state.Assistant is { } assistant)
             {
                 List<PictureCandidate> quoted =
                 [
@@ -9990,7 +10680,10 @@ public sealed partial class ChatsView : UserControl
         try
         {
             // The strip is marked as preparing before its first await, so the bar can be drawn from it straight away.
-            var ingest = strip.IngestAsync(files, MediaPreparing.PrepareAsync, () => !gone, services.Say);
+            // An animated picture becomes an animation in a chat — not in the assistant's, whose model is shown a photograph.
+            var animations = Kind(chat) != "ai";
+            var ingest = strip.IngestAsync(
+                files, (file, token) => MediaPreparing.PrepareAsync(file, token, animations), () => !gone, services.Say);
             ShowPreparing();
             said = await ingest;
         }

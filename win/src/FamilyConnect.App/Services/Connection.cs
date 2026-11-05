@@ -24,39 +24,46 @@ internal sealed class Connection : IAsyncDisposable
         Tokens = new LockerTokenStore(server);
         Api = new ApiClient(Http, server, Tokens);
         Cache = Database.Open(cachePath);
-        Session = new AppSession(Api, Tokens, Cache, new AwaitingJoinFile(server));
+        Session = new AppSession(Api, Tokens, Cache, new AwaitingJoinFile(server), new CurrentFamilyFile(server));
         // The reader is whoever `GET /me` last said: read when asked, never captured, because a
-        // sign-in as somebody else must not be drawn as the previous person's "You".
-        Chats = new ChatStore(Cache, () => Session.State.Me?.Id ?? 0);
-        Board = new BoardStore(Cache);
-        Pack = new PackStore(Cache);
+        // sign-in as somebody else must not be drawn as the previous person's "You". The family shown, the same way: the
+        // chat list, the roster, the wall and the stickers are the shown family's (docs/protocol.md, "Several families").
+        Chats = new ChatStore(
+            Cache, () => Session.State.Me?.Id ?? 0, () => Session.State.CurrentFamilyId, () => Session.State.HomeFamilyId);
+        Board = new BoardStore(Cache, () => Session.State.CurrentFamilyId);
+        Pack = new PackStore(Cache, () => Session.State.CurrentFamilyId);
         Outbox = new OutboxStore(Cache);
         Socket = new ChatSocket(() => new ClientWebSocketAdapter(), () => Api.SocketUrl, Tokens);
         Staging = new FolderMediaStore(AppFolders.StagingPath);
-        Media = new MediaOutbox(Outbox, Api, Staging);
+        // A queued message's uploads are for the family its CHAT is in — only where the server names families at all.
+        Media = new MediaOutbox(Outbox, Api, Staging, chatId => Session.State.NamesFamilies
+            ? FamilyRules.UploadFamily(Chats.Chat(chatId)?.Chat, Session.State.CurrentFamilyId, Session.State.HomeFamilyId)
+            : null);
         Sending = new SendPipeline(Socket, Outbox, Chats, Api, uploads: PushMediaAsync);
         Router = new FrameRouter(Chats, Board, Pack);
         Attachments = new AttachmentCache(Api, new FileBlobStore(AppFolders.BlobsPath));
         // A sticker on its way out is bytes this device already holds: kept under the id the server just gave them, so
         // the message it becomes is drawn at once rather than downloaded back. A video message too — its square video
-        // and the poster this device made, so the reader's own circle is drawn and opened without asking (S5.6).
+        // and the poster this device made, so the reader's own circle is drawn and opened without asking (S5.6). And an
+        // animation (#96): its video and poster, so the sender's own tile plays at once instead of downloading what it made.
         Media.Landed += (row, attachment, staged) =>
         {
-            if (!row.Sticker && !row.Round)
+            if (!row.Sticker && !row.Round && !row.Animation)
             {
                 return;
             }
             try
             {
                 Attachments.Remember(attachment, staged.Bytes);
-                if (row.Round && staged.Preview is { IsEmpty: false } poster)
+                if ((row.Round || row.Animation) && staged.Preview is { IsEmpty: false } poster)
                 {
                     Attachments.RememberPreview(attachment, poster);
                 }
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
-                Diagnostics.Write($"keeping a sent {(row.Round ? "video message" : "sticker")}'s bytes: {e.GetType().Name}");
+                var what = row.Round ? "video message" : row.Animation ? "animation" : "sticker";
+                Diagnostics.Write($"keeping a sent {what}'s bytes: {e.GetType().Name}");
             }
         };
         Avatars = new AvatarCache(Api, new FileBlobStore(AppFolders.BlobsPath));

@@ -52,6 +52,7 @@ use crate::auth::AuthUser;
 use crate::config::TranscribeRoute;
 use crate::error::{ApiError, codes};
 use crate::handlers_chat::ensure_chat_access;
+use crate::keyring::{KeyError, Owner, SealedRow};
 use crate::state::AppState;
 
 /// How many transcription calls may be in flight on one server at once.
@@ -101,6 +102,10 @@ enum Outcome {
     /// The provider named no language — `not_transcribable` too, and never
     /// an answer of silence (speech contract only; see [`ai::Unheard`]).
     Unheard,
+    /// A PAID family has used this month's transcript minutes, and the
+    /// provider was not called (protocol.md, "Paid families") — terminal
+    /// until the month turns.
+    AllowanceUsed,
     /// Anything else — transient, `internal`.
     Failed,
 }
@@ -141,6 +146,9 @@ struct Held {
     size_bytes: i64,
     duration_ms: Option<i32>,
     storage_key: String,
+    /// The recording's own key, sealed (#59) — `None` for a file from before
+    /// encryption at rest that the background conversion has not reached.
+    file_key: Option<Vec<u8>>,
 }
 
 /// What a call is FOR — handed to the spawned task, which outlives the
@@ -149,6 +157,9 @@ struct Ask {
     route: TranscribeRoute,
     asker: i64,
     family_id: Option<i64>,
+    /// The chat the recording was sent in: a transcript is sealed under its
+    /// key, and goes with it (#59).
+    chat_id: i64,
     message_id: i64,
     attachment_id: i64,
     duration_ms: Option<i32>,
@@ -169,8 +180,9 @@ struct Ask {
 /// 5. the ASKER's consent — `assistant_consent_required`, asked even when an
 ///    answer is already stored;
 /// 6. the rule — `transcript_not_allowed`: the asker's own message anywhere;
-///    another member's only in the family chat, only with `ai_transcripts`
-///    on, and only when that SENDER has consented too;
+///    the other person's in a direct chat when that SENDER has consented;
+///    another member's in the family chat only with `ai_transcripts` on,
+///    and only when that SENDER has consented too;
 /// 7. the recording in this form — `not_transcribable`;
 /// 8. the provider — `transcript_refused` for its filter, `not_transcribable`
 ///    when it refuses the file itself or names no language (speech
@@ -205,13 +217,17 @@ pub async fn transcript(
         ));
     }
 
-    // 6: whose voice it is.
+    // 6: whose voice it is. The switch, the language hint and the family the
+    // cost is booked to are the CHAT's family's — the family whose owner
+    // decided what may be asked of its chat — and not "the asker's", which
+    // since 2026-10-22 may be several (docs/protocol.md, "Several
+    // families").
     let family = sqlx::query(
-        "SELECT u.family_id, f.language, COALESCE(f.ai_transcripts, false) AS ai_transcripts
-         FROM users u LEFT JOIN families f ON f.id = u.family_id
-         WHERE u.id = $1",
+        "SELECT c.family_id, f.language, COALESCE(f.ai_transcripts, false) AS ai_transcripts
+         FROM chats c LEFT JOIN families f ON f.id = c.family_id
+         WHERE c.id = $1",
     )
-    .bind(auth.user_id)
+    .bind(chat_id)
     .fetch_one(&state.pool)
     .await?;
     let family_id: Option<i64> = family.get("family_id");
@@ -242,6 +258,7 @@ pub async fn transcript(
         route,
         asker: auth.user_id,
         family_id,
+        chat_id,
         message_id,
         attachment_id,
         duration_ms: held.duration_ms,
@@ -310,7 +327,7 @@ async fn load(
         ));
     };
     let attachment = sqlx::query(
-        "SELECT kind, mime, size_bytes, duration_ms, storage_key
+        "SELECT kind, mime, size_bytes, duration_ms, storage_key, file_key
          FROM attachments
          WHERE id = $1 AND message_id = $2",
     )
@@ -336,22 +353,28 @@ async fn load(
         storage_key: attachment
             .get::<Option<String>, _>("storage_key")
             .unwrap_or_default(),
+        file_key: attachment.get("file_key"),
     })
 }
 
 /// THE RULE (protocol.md, "Transcripts on request"), in one place:
 ///
 /// - the asker's OWN message — any chat they are in, direct chats included;
-/// - another member's — only in the family chat (its threads are the same
-///   chat), only while the family's `ai_transcripts` is on, and only when
-///   that SENDER has agreed to the assistant themselves: the history a
-///   mention carries is filtered by each sender's consent for exactly this
-///   reason, and a voice is somebody's words;
-/// - never another member's in a direct chat, at any setting;
+/// - the other person's in a direct chat — only when that SENDER has agreed
+///   to the assistant themselves (amended 2026-10-21; until then never). No
+///   owner's switch: a direct chat is two people's, not the family's;
+/// - another member's in a GROUP — the direct chat's rule, that sender's
+///   consent alone (protocol.md, "Groups"): the owner cannot see a group
+///   they are not in, and `ai_transcripts` is about the family chat;
+/// - another member's in the family chat (its threads are the same chat) —
+///   only while the family's `ai_transcripts` is on, and only when that
+///   SENDER has agreed to the assistant: the history a mention carries is
+///   filtered by each sender's consent for exactly this reason, and a voice
+///   is somebody's words;
 /// - never the assistant's: its account has no consent to give (the
-///   history filter's own exception says as much), so the third key above
+///   history filter's own exception says as much), so the sender's consent
 ///   refuses it in the family chat, and in an `ai` chat it is the other
-///   party and the second refuses it. It sends no sound in any case.
+///   party and no chat kind lets it through. It sends no sound in any case.
 async fn allowed(
     state: &AppState,
     asker: i64,
@@ -361,7 +384,12 @@ async fn allowed(
     if held.sender_id == asker {
         return Ok(true);
     }
-    if held.chat_kind != "family" || !switch_on {
+    let shared = match held.chat_kind.as_str() {
+        "direct" | "group" => true,
+        "family" => switch_on,
+        _ => false,
+    };
+    if !shared {
         return Ok(false);
     }
     Ok(crate::handlers_ai::has_assistant_consent(state, held.sender_id).await?)
@@ -381,10 +409,14 @@ async fn stored_answer(
         .bind(attachment_id)
         .fetch_optional(&state.pool)
         .await?;
-    Ok(row.map(|row| Transcript {
-        text: row.get("text"),
-        language: row.get("language"),
-    }))
+    Ok(row
+        .map(|row| {
+            Ok::<_, KeyError>(Transcript {
+                text: row.text(&state.keys, "text")?,
+                language: row.get("language"),
+            })
+        })
+        .transpose()?)
 }
 
 /// `200 {"transcript": {"text": "…", "language": "ru"}}` — `language` only
@@ -422,6 +454,10 @@ fn respond(outcome: Outcome) -> Result<Response, ApiError> {
         )),
         Outcome::Unheard => Err(not_transcribable(
             "the transcription provider could not tell which language this recording is in",
+        )),
+        Outcome::AllowanceUsed => Err(ApiError::forbidden(
+            codes::AI_ALLOWANCE_USED,
+            "this family has used this month's transcript minutes",
         )),
         Outcome::Failed => Err(ApiError::Internal(anyhow::anyhow!(
             "the transcription could not be made"
@@ -501,11 +537,27 @@ async fn call_with_stored_bytes(
         .find(|(mime, _)| *mime == held.mime)
         .map(|(mime, _)| *mime)
         .unwrap_or(SUPPLIED_MIME);
-    let path = state.storage.blob_path(&held.storage_key);
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
+    // Opened from its seal (#59), or read as it is when the background
+    // conversion has not reached it yet.
+    let bytes = match crate::handlers_attachment::read_whole(
+        state,
+        &held.storage_key,
+        false,
+        held.file_key.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            warn!(
+                attachment_id = ask.attachment_id,
+                "a recording to transcribe is not on disk"
+            );
+            log_outcome(ask, "failed");
+            return Outcome::Failed;
+        }
         Err(error) => {
-            warn!(attachment_id = ask.attachment_id, %error, "could not read a recording to transcribe");
+            warn!(attachment_id = ask.attachment_id, error = ?error, "could not read a recording to transcribe");
             log_outcome(ask, "failed");
             return Outcome::Failed;
         }
@@ -525,16 +577,22 @@ async fn call_with_stored_bytes(
         // can only already be here if a second call was somehow made; the
         // first answer stands. A failure to keep it is not the asker's
         // problem: they get their answer, and the next asker pays again.
-        if let Err(error) = sqlx::query(
-            "INSERT INTO transcripts (attachment_id, text, language) VALUES ($1, $2, $3)
-             ON CONFLICT (attachment_id) DO NOTHING",
-        )
-        .bind(ask.attachment_id)
-        .bind(&transcript.text)
-        .bind(&transcript.language)
-        .execute(&state.pool)
-        .await
-        {
+        // Sealed under the chat's key (#59).
+        let kept = match state.keys.key(&state.pool, Owner::Chat(ask.chat_id)).await {
+            Ok(key) => sqlx::query(
+                "INSERT INTO transcripts (attachment_id, text, language) VALUES ($1, $2, $3)
+                 ON CONFLICT (attachment_id) DO NOTHING",
+            )
+            .bind(ask.attachment_id)
+            .bind(key.seal_str(&transcript.text))
+            .bind(&transcript.language)
+            .execute(&state.pool)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = kept {
             warn!(attachment_id = ask.attachment_id, %error, "could not keep a transcript");
         }
         log_outcome(ask, "stored");
@@ -648,6 +706,28 @@ fn multipart_error(error: axum::extract::multipart::MultipartError, max_bytes: u
 /// The provider call itself, and what it cost. Shared by both forms; what
 /// differs is only what happens to the answer afterwards.
 async fn call(state: &AppState, ask: &Ask, recording: Recording) -> Outcome {
+    // Here, at the call, and nowhere earlier: a transcript already stored is
+    // handed out whatever the allowance says, because handing it out calls
+    // nobody (protocol.md, "Paid families").
+    if let Some(family_id) = ask.family_id {
+        match crate::subscriptions::may_spend(
+            state,
+            family_id,
+            crate::subscriptions::Spend::Transcript,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                log_outcome(ask, "allowance used");
+                return Outcome::AllowanceUsed;
+            }
+            Err(error) => {
+                warn!(?error, "could not read the family's allowance");
+                return Outcome::Failed;
+            }
+        }
+    }
     match ai::transcribe(&state.http, &ask.route, recording, ask.language.as_deref()).await {
         Ok(Transcription {
             transcript,

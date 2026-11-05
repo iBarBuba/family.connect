@@ -10,7 +10,7 @@
  *                 call_offer / call_answer / call_ice / call_end
  *   ServerFrame — ack / message / read / typing / member_joined /
  *                 member_left / member_deleted / family_owner /
- *                 member_blocked /
+ *                 family_plan / member_blocked / chat_updated / chat_removed /
  *                 reaction / poll / pong / error /
  *                 call_offer / call_ringing / call_answer / call_ice / call_end
  *
@@ -30,7 +30,9 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonClassDiscriminator
+import me.nettrash.familyconnect.data.net.dto.ChatDto
 import me.nettrash.familyconnect.data.net.dto.IceCandidateDto
+import me.nettrash.familyconnect.data.net.dto.InvitationDto
 import me.nettrash.familyconnect.data.net.dto.MemberDto
 import me.nettrash.familyconnect.data.net.dto.MessageDto
 import me.nettrash.familyconnect.data.net.dto.MentionDto
@@ -95,6 +97,12 @@ sealed interface ClientFrame {
          * way; never `false`, never beside [sticker].
          */
         val round: Boolean? = null,
+        /**
+         * Optional: `true` sends the one `kind=video` attachment as an
+         * ANIMATION (protocol.md, "Animations"; #96). Omitted the same way;
+         * never `false`, never beside [sticker] or [round].
+         */
+        val animation: Boolean? = null,
     ) : ClientFrame
 
     @Serializable
@@ -211,6 +219,16 @@ sealed interface ServerFrame {
     data class MemberJoined(
         @SerialName("family_id") val familyId: Long,
         val user: UserDto,
+        /**
+         * Whether the family's OWNER may reset the newcomer's password — the
+         * roster's `Member.password_reset`, carried TOP-LEVEL because `user`
+         * is a `UserBrief` (docs/protocol.md, "Several families"). On the
+         * owner's copy of the frame alone: absent from everyone else's and
+         * from a server that predates it, and absent means "not told", so it
+         * never overwrites a value already stored for that member
+         * ([me.nettrash.familyconnect.data.db.MemberDao.upsertLeavingBirthday]).
+         */
+        @SerialName("password_reset") val passwordReset: Boolean? = null,
     ) : ServerFrame
 
     @Serializable
@@ -267,6 +285,23 @@ sealed interface ServerFrame {
     ) : ServerFrame
 
     /**
+     * A PAID family's deadline appeared or went (docs/protocol.md, "Paid
+     * families", added 2026-10-30): to every member when the owner's
+     * subscription stops covering it, and again when it covers it once
+     * more. A state-set over that family's `plan` and `delete_at`, so an
+     * ABSENT [deleteAt] CLEARS the deadline — this frame says what the
+     * deadline now is, and "none" is said by leaving it out. Applied to the
+     * family it names, shown or not.
+     */
+    @Serializable
+    @SerialName("family_plan")
+    data class FamilyPlan(
+        @SerialName("family_id") val familyId: Long,
+        val plan: String? = null,
+        @SerialName("delete_at") val deleteAt: String? = null,
+    ) : ServerFrame
+
+    /**
      * One member blocked or unblocked, delivered to every connection of the
      * BLOCKER and to NOBODY else.
      *
@@ -294,6 +329,44 @@ sealed interface ServerFrame {
         @SerialName("user_id") val userId: Long,
         val blocked: Boolean,
     ) : ServerFrame
+
+    /**
+     * A GROUP as it now is — created, renamed, or its members or admin
+     * changed — to every member, one just added included, which is how a
+     * group appears on their devices at once (docs/protocol.md, "Groups";
+     * added 2026-10-22). Applied as a state-set over the chat row: the
+     * title, the member list and the admin are the server's, everything
+     * else on the row is this device's and survives. Never notifies.
+     */
+    @Serializable
+    @SerialName("chat_updated")
+    data class ChatUpdated(val chat: ChatDto) : ServerFrame
+
+    /**
+     * A GROUP this reader is no longer in: they left or were removed (to
+     * every device of theirs), or its admin deleted it (to every member).
+     * The client drops the chat, its messages and anything it was drafting
+     * there (docs/protocol.md, "Groups"; added 2026-10-22). `GET /chats`
+     * stays the reconciler for a device that missed it.
+     */
+    @Serializable
+    @SerialName("chat_removed")
+    data class ChatRemoved(@SerialName("chat_id") val chatId: Long) : ServerFrame
+
+    /**
+     * An invitation into a family, pending — to the invited person's
+     * connections and to the inviting family's owner's (docs/protocol.md,
+     * "Several families"; added 2026-10-22). The invited person shows it as
+     * a banner; the owner's pending list follows it.
+     */
+    @Serializable
+    @SerialName("invitation")
+    data class Invitation(val invitation: InvitationDto) : ServerFrame
+
+    /** That invitation is gone — accepted, declined, withdrawn or lapsed. */
+    @Serializable
+    @SerialName("invitation_removed")
+    data class InvitationRemoved(@SerialName("invitation_id") val invitationId: Long) : ServerFrame
 
     /**
      * One board note in whatever state it now has — created, edited, moved,
@@ -338,7 +411,7 @@ sealed interface ServerFrame {
      * decoded into an enum, because a value this client does not know must
      * read as ABSENT — never as a frame that failed to decode — so a later
      * server can add one without this client inventing a meaning for it.
-     * [isRefused] is the only question asked of it.
+     * [isRefused] and [isAllowanceUsed] are the only questions asked of it.
      */
     @Serializable
     @SerialName("ai_error")
@@ -346,6 +419,11 @@ sealed interface ServerFrame {
         @SerialName("chat_id") val chatId: Long,
         @SerialName("message_id") val messageId: Long,
         val reason: String? = null,
+        /**
+         * With `"allowance_used"`: the start of the next UTC month, when a
+         * paid family's assistant allowance starts again (added 2026-10-30).
+         */
+        @SerialName("renews_at") val renewsAt: String? = null,
     ) : ServerFrame {
         /**
          * The AI provider's OWN safety or content filter refused the
@@ -355,9 +433,19 @@ sealed interface ServerFrame {
          */
         val isRefused: Boolean get() = reason == REASON_REFUSED
 
+        /**
+         * A PAID family has used this month's assistant allowance, and the
+         * provider was never called (docs/protocol.md, "Paid families").
+         * Asking again before [renewsAt] gets the same answer.
+         */
+        val isAllowanceUsed: Boolean get() = reason == REASON_ALLOWANCE_USED
+
         companion object {
-            /** The one `reason` protocol.md defines. */
+            /** The provider's own filter refused it. */
             const val REASON_REFUSED = "refused"
+
+            /** A paid family's month is used up (2026-10-30). */
+            const val REASON_ALLOWANCE_USED = "allowance_used"
         }
     }
 

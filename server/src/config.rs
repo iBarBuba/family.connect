@@ -55,6 +55,9 @@ pub struct Config {
 
     #[serde(default)]
     pub greetings: GreetingsConfig,
+
+    #[serde(default)]
+    pub subscriptions: SubscriptionsConfig,
 }
 
 /// `[families]` — who may start a family here (docs/protocol.md, "Starting
@@ -86,6 +89,40 @@ pub struct FamiliesConfig {
     /// large number, the way `limits.retention_days` spells it.
     #[serde(default = "default_familyless_account_ttl_days")]
     pub familyless_account_ttl_days: i64,
+
+    /// Whether a member who is ALREADY in a family may start another one
+    /// from inside the app (docs/protocol.md, "Several families"; decision
+    /// D3). Read through [`FamiliesConfig::member_families_enabled`].
+    ///
+    /// Its own switch, deliberately NOT `registration`: that one is about an
+    /// account's FIRST family — a stranger arriving at the server — and the
+    /// case issue #88 describes is the opposite one, somebody already here
+    /// who marries and starts their own. A server closed to strangers'
+    /// families can still let its members start theirs by setting this to
+    /// `true`.
+    ///
+    /// UNSET, it follows `registration`. A server that predates several
+    /// families and was closed with `registration = false` must not reopen
+    /// on upgrade without its operator saying so: in-app creation hands out
+    /// new invite codes, and so new ways in for strangers. An open server —
+    /// the default — gets it with nothing to change.
+    #[serde(default)]
+    pub member_families: Option<bool>,
+
+    /// The most families one account may belong to, counting every door —
+    /// creating, an invitation, an invite code (docs/protocol.md, "Limits").
+    /// 5 by default; at least 1, because an account that may be in no family
+    /// is an account nothing on this server is for.
+    #[serde(default = "default_max_families_per_account")]
+    pub max_families_per_account: i64,
+}
+
+impl FamiliesConfig {
+    /// Whether a member may start another family in the app: the operator's
+    /// `member_families` when set, and `registration` when not.
+    pub fn member_families_enabled(&self) -> bool {
+        self.member_families.unwrap_or(self.registration)
+    }
 }
 
 impl Default for FamiliesConfig {
@@ -93,9 +130,166 @@ impl Default for FamiliesConfig {
         Self {
             registration: default_family_registration(),
             familyless_account_ttl_days: default_familyless_account_ttl_days(),
+            member_families: None,
+            max_families_per_account: default_max_families_per_account(),
         }
     }
 }
+
+/// `[subscriptions]` — paid family hosting (docs/protocol.md, "Paid
+/// families"; issue #89).
+///
+/// Off by default, and off means nothing in this section is read: no plans,
+/// no limits, no deadlines. On, a NEW family needs its owner's App Store
+/// subscription, verified offline by `crate::appstore`; a paid family that
+/// loses it is deleted `unpaid_days` later, and has the limits below. It
+/// narrows the `[families]` doors and never opens one.
+///
+/// Unknown keys are REFUSED, as `[ai]`'s are: `enable = true` misspelt would
+/// otherwise boot a server that charges nobody while its operator believes
+/// it does.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// The app whose purchases count.
+    #[serde(default = "default_subscription_bundle_id")]
+    pub bundle_id: String,
+
+    /// The auto-renewable subscriptions that host a family, in the order
+    /// the app shows them.
+    #[serde(default = "default_subscription_product_ids")]
+    pub product_ids: Vec<String>,
+
+    /// The App Store environments believed. App Review and TestFlight buy
+    /// in "Sandbox" against the production server, hence both by default.
+    #[serde(default = "default_subscription_environments")]
+    pub environments: Vec<String>,
+
+    /// Days a paid family stays after its owner's subscription ends,
+    /// counted from when the server noticed.
+    #[serde(default = "default_unpaid_days")]
+    pub unpaid_days: i64,
+
+    /// A paid family's member ceiling. 0 turns it off.
+    #[serde(default = "default_paid_max_members")]
+    pub max_members: i64,
+
+    /// Bytes a paid family may keep on the disk. 0 turns it off.
+    #[serde(default = "default_paid_storage_bytes")]
+    pub storage_bytes: i64,
+
+    /// The assistant per UTC calendar month. 0 turns each off.
+    #[serde(default = "default_paid_ai_tokens")]
+    pub ai_tokens_per_month: i64,
+    #[serde(default = "default_paid_images")]
+    pub images_per_month: i64,
+    #[serde(default = "default_paid_transcript_minutes")]
+    pub transcript_minutes_per_month: i64,
+
+    /// The root the App Store chain must end in: always Apple Root CA – G3,
+    /// except in tests, which sign with a chain of their own. NOT a config
+    /// key — `serde(skip)` keeps a TOML from ever setting it.
+    #[serde(skip)]
+    pub trust_root_for_tests: Option<Vec<u8>>,
+}
+
+impl SubscriptionsConfig {
+    /// The DER of the root an App Store chain must end in.
+    pub fn trust_root(&self) -> &[u8] {
+        self.trust_root_for_tests
+            .as_deref()
+            .unwrap_or(crate::appstore::APPLE_ROOT_CA_G3)
+    }
+
+    /// The verifier's policy: this app, these products, these environments.
+    pub fn policy(&self) -> crate::appstore::Policy<'_> {
+        crate::appstore::Policy {
+            root: self.trust_root(),
+            bundle_id: &self.bundle_id,
+            product_ids: &self.product_ids,
+            environments: &self.environments,
+        }
+    }
+
+    /// A limit as the wire and the checks want it: `None` when off.
+    fn limit(value: i64) -> Option<i64> {
+        (value > 0).then_some(value)
+    }
+
+    pub fn member_limit(&self) -> Option<i64> {
+        Self::limit(self.max_members)
+    }
+    pub fn storage_limit(&self) -> Option<i64> {
+        Self::limit(self.storage_bytes)
+    }
+    pub fn ai_token_limit(&self) -> Option<i64> {
+        Self::limit(self.ai_tokens_per_month)
+    }
+    pub fn image_limit(&self) -> Option<i64> {
+        Self::limit(self.images_per_month)
+    }
+    /// Transcript minutes in the unit `ai_usage` counts: milliseconds.
+    pub fn transcript_ms_limit(&self) -> Option<i64> {
+        Self::limit(self.transcript_minutes_per_month).map(|minutes| minutes * 60_000)
+    }
+}
+
+impl Default for SubscriptionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bundle_id: default_subscription_bundle_id(),
+            product_ids: default_subscription_product_ids(),
+            environments: default_subscription_environments(),
+            unpaid_days: default_unpaid_days(),
+            max_members: default_paid_max_members(),
+            storage_bytes: default_paid_storage_bytes(),
+            ai_tokens_per_month: default_paid_ai_tokens(),
+            images_per_month: default_paid_images(),
+            transcript_minutes_per_month: default_paid_transcript_minutes(),
+            trust_root_for_tests: None,
+        }
+    }
+}
+
+fn default_subscription_bundle_id() -> String {
+    "me.nettrash.FamilyConnect".to_string()
+}
+fn default_subscription_product_ids() -> Vec<String> {
+    vec![
+        "me.nettrash.FamilyConnect.family.monthly".to_string(),
+        "me.nettrash.FamilyConnect.family.yearly".to_string(),
+    ]
+}
+fn default_subscription_environments() -> Vec<String> {
+    vec!["Production".to_string(), "Sandbox".to_string()]
+}
+fn default_unpaid_days() -> i64 {
+    14
+}
+fn default_paid_max_members() -> i64 {
+    25
+}
+fn default_paid_storage_bytes() -> i64 {
+    10 * 1024 * 1024 * 1024
+}
+fn default_paid_ai_tokens() -> i64 {
+    2_000_000
+}
+fn default_paid_images() -> i64 {
+    30
+}
+fn default_paid_transcript_minutes() -> i64 {
+    120
+}
+
+/// The App Store environments a server may believe. "Xcode" is not one: a
+/// transaction from Xcode's StoreKit testing is signed by a certificate on
+/// the developer's Mac, not by Apple.
+const SUBSCRIPTION_ENVIRONMENTS: [&str; 2] = ["Production", "Sandbox"];
 
 /// `[greetings]` — the assistant's one unprompted message a day
 /// (docs/protocol.md, "The daily greeting").
@@ -1534,7 +1728,7 @@ fn speech_url(endpoint: &str, api_version: &str) -> String {
     format!("{base}{SPEECH_PATH}?api-version={api_version}")
 }
 
-/// `[storage]` — where attachment bytes live.
+/// `[storage]` — where attachment bytes live, and the key that seals them.
 ///
 /// On disk, not in PostgreSQL: see migration 0009. The default matches the
 /// systemd unit's `StateDirectory=family-connect`, which has been reserved
@@ -1543,12 +1737,20 @@ fn speech_url(endpoint: &str, api_version: &str) -> String {
 pub struct StorageConfig {
     #[serde(default = "default_attachments_dir")]
     pub attachments_dir: PathBuf,
+    /// The server key (#59): the file every stored value and file is sealed
+    /// under, by way of the per-family keys it wraps (docs/operations.md,
+    /// "Encryption at rest"). No default, and the server refuses to start
+    /// without it: a path guessed for the operator is a key file nobody knew
+    /// to copy off the box.
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             attachments_dir: default_attachments_dir(),
+            key_file: None,
         }
     }
 }
@@ -2226,6 +2428,17 @@ impl Config {
         if self.database.max_connections == 0 {
             anyhow::bail!("database.max_connections must be at least 1");
         }
+        // The key file must never be backed up with what it protects, and the
+        // backup copies the attachments directory whole (#59): a key inside
+        // it would travel in every backup and unlock every one of them.
+        if let Some(key_file) = &self.storage.key_file
+            && key_file.starts_with(&self.storage.attachments_dir)
+        {
+            anyhow::bail!(
+                "storage.key_file must not be inside storage.attachments_dir: the backup copies \
+                 that directory, and a backup that carries its own key protects nothing"
+            );
+        }
         if self.auth.session_ttl_days < 1 {
             anyhow::bail!("auth.session_ttl_days must be at least 1");
         }
@@ -2257,6 +2470,56 @@ impl Config {
                 "families.familyless_account_ttl_days must be 0 (off) or a number of days up \
                  to {MAX_FAMILYLESS_ACCOUNT_TTL_DAYS} — for \"never\", write 0"
             );
+        }
+        // At least one: an account that may belong to no family is an
+        // account nothing on this server is for — and a 0 would make every
+        // registration a dead end the server itself refused to open.
+        if !(1..=MAX_FAMILIES_PER_ACCOUNT_CEILING).contains(&self.families.max_families_per_account)
+        {
+            anyhow::bail!(
+                "families.max_families_per_account must be between 1 and \
+                 {MAX_FAMILIES_PER_ACCOUNT_CEILING}"
+            );
+        }
+        // Checked whether or not it is on, so a section written today and
+        // switched on next month cannot fail at that moment instead.
+        let subs = &self.subscriptions;
+        if subs.bundle_id.trim().is_empty() {
+            anyhow::bail!("subscriptions.bundle_id must name the app");
+        }
+        if subs.product_ids.is_empty() || subs.product_ids.iter().any(|p| p.trim().is_empty()) {
+            anyhow::bail!("subscriptions.product_ids must name at least one product, none empty");
+        }
+        if subs.environments.is_empty()
+            || subs
+                .environments
+                .iter()
+                .any(|e| !SUBSCRIPTION_ENVIRONMENTS.contains(&e.as_str()))
+        {
+            anyhow::bail!("subscriptions.environments must list \"Production\" and/or \"Sandbox\"");
+        }
+        // Bound above for the reason familyless_account_ttl_days is: the
+        // sweep binds it as an `int` for make_interval.
+        if !(1..=365).contains(&subs.unpaid_days) {
+            anyhow::bail!("subscriptions.unpaid_days must be between 1 and 365");
+        }
+        for (name, value) in [
+            ("max_members", subs.max_members),
+            ("storage_bytes", subs.storage_bytes),
+            ("ai_tokens_per_month", subs.ai_tokens_per_month),
+            ("images_per_month", subs.images_per_month),
+            (
+                "transcript_minutes_per_month",
+                subs.transcript_minutes_per_month,
+            ),
+        ] {
+            if value < 0 {
+                anyhow::bail!("subscriptions.{name} must be 0 (off) or more");
+            }
+        }
+        // Minutes become milliseconds; keep the product inside an i64.
+        if subs.transcript_minutes_per_month > i64::MAX / 60_000 {
+            anyhow::bail!("subscriptions.transcript_minutes_per_month is too large");
         }
         if self.auth.session_touch_interval_mins < 1 {
             anyhow::bail!("auth.session_touch_interval_mins must be at least 1");
@@ -2608,6 +2871,15 @@ fn default_familyless_account_ttl_days() -> i64 {
     7
 }
 
+fn default_max_families_per_account() -> i64 {
+    5
+}
+
+/// The ceiling on `[families] max_families_per_account`. A family server is
+/// a handful of families; a number above this is a typo, and the cap is read
+/// into a count compared on every join.
+pub const MAX_FAMILIES_PER_ACCOUNT_CEILING: i64 = 100;
+
 /// A century. Above this the sweep's `int` bind could wrap, and an
 /// operator who means "never" has `0` for it.
 pub const MAX_FAMILYLESS_ACCOUNT_TTL_DAYS: i64 = 36_500;
@@ -2650,6 +2922,47 @@ mod tests {
         );
         let closed = Config::from_toml_str("[families]\nregistration = false\n").expect("parses");
         assert!(!closed.families.registration);
+    }
+
+    /// In-app creation is its own switch: unset it follows `registration`,
+    /// so a server closed to strangers stays closed on upgrade, and set it
+    /// wins either way. The per-account cap defaults to five and refuses a
+    /// number no account could live under (docs/protocol.md, "Several
+    /// families").
+    #[test]
+    fn member_families_follows_registration_unless_set_and_the_cap_defaults_to_five() {
+        let defaults = Config::from_toml_str("").expect("an empty file is a valid config");
+        assert!(
+            defaults.families.member_families_enabled(),
+            "an open server"
+        );
+        assert_eq!(defaults.families.max_families_per_account, 5);
+        let closed_on_upgrade =
+            Config::from_toml_str("[families]\nregistration = false\n").expect("parses");
+        assert!(
+            !closed_on_upgrade.families.member_families_enabled(),
+            "a server closed to strangers is not reopened by an upgrade"
+        );
+        let closed =
+            Config::from_toml_str("[families]\nregistration = false\nmember_families = true\n")
+                .expect("parses");
+        assert!(!closed.families.registration);
+        assert!(
+            closed.families.member_families_enabled(),
+            "closing the server to strangers need not close it to members"
+        );
+        let open_but_not_to_members =
+            Config::from_toml_str("[families]\nmember_families = false\n").expect("parses");
+        assert!(!open_but_not_to_members.families.member_families_enabled());
+        let err = Config::from_toml_str("[families]\nmax_families_per_account = 0\n")
+            .expect_err("an account must be allowed one family");
+        assert!(
+            err.to_string().contains("max_families_per_account"),
+            "{err}"
+        );
+        let two =
+            Config::from_toml_str("[families]\nmax_families_per_account = 2\n").expect("parses");
+        assert_eq!(two.families.max_families_per_account, 2);
     }
 
     #[test]
@@ -2706,6 +3019,13 @@ mod tests {
         assert!(
             !cfg.ai.enabled,
             "the example must ship with the assistant off"
+        );
+        // The one key with no default, because the server refuses to start
+        // without it: the example names the path docs/operations.md makes.
+        assert_eq!(defaults.storage.key_file, None);
+        assert_eq!(
+            cfg.storage.key_file.as_deref(),
+            Some(std::path::Path::new("/etc/family-connect/storage.key"))
         );
         // The video-message ceiling is documented COMMENTED OUT, because
         // unset is a different statement from any number: the clamped
@@ -3733,6 +4053,83 @@ height = 1024
     }
 
     #[test]
+    fn subscriptions_are_off_by_default_with_the_documented_limits() {
+        let cfg = Config::from_toml_str("").expect("empty config parses");
+        let subs = &cfg.subscriptions;
+        assert!(!subs.enabled);
+        assert_eq!(subs.bundle_id, "me.nettrash.FamilyConnect");
+        assert_eq!(
+            subs.product_ids,
+            [
+                "me.nettrash.FamilyConnect.family.monthly",
+                "me.nettrash.FamilyConnect.family.yearly"
+            ]
+        );
+        assert_eq!(subs.environments, ["Production", "Sandbox"]);
+        assert_eq!(subs.unpaid_days, 14);
+        assert_eq!(subs.member_limit(), Some(25));
+        assert_eq!(subs.storage_limit(), Some(10 * 1024 * 1024 * 1024));
+        assert_eq!(subs.ai_token_limit(), Some(2_000_000));
+        assert_eq!(subs.image_limit(), Some(30));
+        assert_eq!(subs.transcript_ms_limit(), Some(120 * 60_000));
+        assert_eq!(subs.trust_root(), crate::appstore::APPLE_ROOT_CA_G3);
+    }
+
+    #[test]
+    fn a_zero_subscription_limit_is_off() {
+        let cfg = Config::from_toml_str(
+            "[subscriptions]\nenabled = true\nmax_members = 0\nstorage_bytes = 0\n\
+             ai_tokens_per_month = 0\nimages_per_month = 0\ntranscript_minutes_per_month = 0\n",
+        )
+        .expect("parses");
+        let subs = &cfg.subscriptions;
+        assert!(subs.enabled);
+        assert_eq!(subs.member_limit(), None);
+        assert_eq!(subs.storage_limit(), None);
+        assert_eq!(subs.ai_token_limit(), None);
+        assert_eq!(subs.image_limit(), None);
+        assert_eq!(subs.transcript_ms_limit(), None);
+    }
+
+    #[test]
+    fn validate_rejects_a_bad_subscriptions_section() {
+        for (toml, what) in [
+            ("[subscriptions]\nenable = true\n", "a misspelt key"),
+            (
+                "[subscriptions]\ntrust_root_for_tests = \"x\"\n",
+                "the test-only root",
+            ),
+            ("[subscriptions]\nbundle_id = \" \"\n", "an empty bundle"),
+            ("[subscriptions]\nproduct_ids = []\n", "no products"),
+            (
+                "[subscriptions]\nproduct_ids = [\"\"]\n",
+                "an empty product",
+            ),
+            ("[subscriptions]\nenvironments = []\n", "no environments"),
+            (
+                "[subscriptions]\nenvironments = [\"Xcode\"]\n",
+                "Xcode's environment",
+            ),
+            ("[subscriptions]\nunpaid_days = 0\n", "no unpaid days"),
+            ("[subscriptions]\nunpaid_days = 366\n", "over a year"),
+            ("[subscriptions]\nmax_members = -1\n", "a negative limit"),
+            (
+                "[subscriptions]\ntranscript_minutes_per_month = 9223372036854775807\n",
+                "minutes that overflow milliseconds",
+            ),
+        ] {
+            assert!(
+                Config::from_toml_str(toml).is_err(),
+                "{what} must be refused"
+            );
+        }
+        let production_only =
+            Config::from_toml_str("[subscriptions]\nenvironments = [\"Production\"]\n")
+                .expect("Production alone is legal");
+        assert_eq!(production_only.subscriptions.environments, ["Production"]);
+    }
+
+    #[test]
     fn validate_rejects_a_family_ceiling_below_one() {
         // A ceiling of 0 boots happily and then answers `family_full` to
         // every attempt to CREATE a family — an error that endpoint does
@@ -3745,6 +4142,19 @@ height = 1024
         );
         cfg.limits.max_family_members = 1;
         assert!(cfg.validate().is_ok(), "one is a legal, if lonely, ceiling");
+    }
+
+    #[test]
+    fn validate_refuses_a_key_file_inside_the_attachments_directory() {
+        let err = Config::from_toml_str(
+            "[storage]\nattachments_dir = \"/var/lib/fc\"\nkey_file = \"/var/lib/fc/storage.key\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("storage.key_file"), "{err:#}");
+        Config::from_toml_str(
+            "[storage]\nattachments_dir = \"/var/lib/fc\"\nkey_file = \"/etc/fc/storage.key\"\n",
+        )
+        .expect("a key file elsewhere is fine");
     }
 
     #[test]

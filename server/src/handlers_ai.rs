@@ -65,16 +65,20 @@ use crate::ai::{self, ChatTurn, GeneratedImage, InlineImage};
 use crate::config::ModelRoute;
 use crate::events;
 use crate::handlers_chat;
+use crate::keyring::{KeyError, Owner, SealedRow};
 use crate::lookups::{self, Ledger, LookupLanguage, LookupPlan, LookupResult, LookupTool};
 use crate::models::{Attachment, Message};
 use crate::state::AppState;
+use crate::subscriptions::{self, Spend};
 use crate::ws::{AiErrorReason, ServerFrame};
 
 /// The reserved account the assistant sends under (migration 0015). Looked
-/// up rather than hard-coded: the id is whatever the sequence gave it.
+/// up rather than hard-coded: the id is whatever the sequence gave it. Found
+/// by its mark (0059), since its name is sealed like everybody's.
 pub async fn assistant_user_id(state: &AppState) -> Result<Option<i64>> {
     let id = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM users WHERE lower(username) = 'assistant' AND family_id IS NULL",
+        "SELECT id FROM users u WHERE is_assistant
+           AND NOT EXISTS (SELECT 1 FROM family_members fm WHERE fm.user_id = u.id)",
     )
     .fetch_optional(&state.pool)
     .await?;
@@ -145,51 +149,44 @@ pub fn consent_stamp(at: Option<OffsetDateTime>) -> serde_json::Value {
     .unwrap_or(serde_json::Value::Null)
 }
 
-/// Make sure this member has their assistant chat, and answer with its id.
+/// Make sure this member has their assistant chat IN THIS FAMILY, and
+/// answer with its id.
 ///
 /// Created on demand rather than at registration: a server that turns the
 /// assistant on later should not need every member to re-register, and one
 /// that never turns it on should not carry an empty chat in every list.
-pub async fn ensure_ai_chat(state: &AppState, user_id: i64) -> Result<Option<i64>> {
+///
+/// One per family since 2026-10-22 (docs/protocol.md, "Several families";
+/// decision D6): "this family's assistant", under that family's owner's
+/// switches, listed in that family. A member who is not in `family_id` gets
+/// none — the assistant is not an exception to "no family, no chats".
+pub async fn ensure_ai_chat(state: &AppState, user_id: i64, family_id: i64) -> Result<Option<i64>> {
     if !state.cfg.ai.is_usable() {
         return Ok(None);
     }
-    let Some(family_id) =
-        sqlx::query_scalar::<_, Option<i64>>("SELECT family_id FROM users WHERE id = $1")
-            .bind(user_id)
-            .fetch_optional(&state.pool)
-            .await?
-            .flatten()
-    else {
-        // No family, no chats of any kind — the assistant is not an
-        // exception to that.
+    if !crate::families::is_member(&state.pool, family_id, user_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?
+    {
         return Ok(None);
-    };
+    }
 
     let mut tx = state.pool.begin().await?;
-    let existing =
-        sqlx::query_scalar::<_, i64>("SELECT id FROM chats WHERE kind = 'ai' AND user_a_id = $1")
-            .bind(user_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let existing = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM chats WHERE kind = 'ai' AND user_a_id = $1 AND family_id = $2",
+    )
+    .bind(user_id)
+    .bind(family_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     if let Some(id) = existing {
         // Existing is not the same as reachable. Leaving a family deletes
-        // the caller's row from `chat_members` for EVERY chat of that
-        // family, this one included (handlers_family::remove_membership) —
-        // so without restoring it here a member who left and came back is
+        // the caller's row from `chat_members` for that family's own chats,
+        // this one included (handlers_family::remove_membership) — so
+        // without restoring it here a member who left and came back is
         // locked out of their own assistant thread forever, by a 403 on a
         // chat nobody else can even see. protocol.md promises history
         // "resurfaces on rejoin"; this is what makes that true here.
-        //
-        // The family_id is re-pointed for the same reason the direct-chat
-        // upsert re-points its own: the thread belongs to the member, not
-        // to the family they were in when they started it, and a stale
-        // family id would take it down with a family they have left.
-        sqlx::query("UPDATE chats SET family_id = $1 WHERE id = $2 AND family_id <> $1")
-            .bind(family_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
         sqlx::query(
             "INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
         )
@@ -201,13 +198,25 @@ pub async fn ensure_ai_chat(state: &AppState, user_id: i64) -> Result<Option<i64
         return Ok(Some(id));
     }
 
-    let chat_id: i64 = sqlx::query_scalar(
-        "INSERT INTO chats (family_id, kind, user_a_id) VALUES ($1, 'ai', $2) RETURNING id",
+    // ON CONFLICT against the per-family uniqueness (0057), so two listings
+    // racing to create the same family's thread end with one.
+    // Its own key (#59), rolled back with the insert when the race is lost.
+    let key = state.keys.create(&mut tx).await?;
+    let created: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO chats (family_id, kind, user_a_id, key_id) VALUES ($1, 'ai', $2, $3)
+         ON CONFLICT (user_a_id, family_id) WHERE kind = 'ai' DO NOTHING
+         RETURNING id",
     )
     .bind(family_id)
     .bind(user_id)
-    .fetch_one(&mut *tx)
+    .bind(key.id())
+    .fetch_optional(&mut *tx)
     .await?;
+    let Some(chat_id) = created else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    state.keys.remember(Owner::Chat(chat_id), &key);
     // Only the owner is a member. That is what makes `GET /chats` return it
     // to them and nobody else, using the membership check every other chat
     // already goes through.
@@ -360,6 +369,24 @@ pub fn compose_system_prompt(configured: &str, notes: &[String], language: Optio
     parts.join("\n\n")
 }
 
+/// What the assistant is told about how its answer will be drawn (issue #97).
+///
+/// Every client draws a markdown subset in the bubble — and, since #97,
+/// formulas, Mermaid and Graphviz diagrams and graphs of functions
+/// (docs/protocol.md, "Rich blocks"). A model that does not know that writes
+/// a formula as prose or an ASCII sketch, and writes the one fence it could
+/// not have guessed, `plot`, not at all. So it is said once, in every prompt,
+/// with the plot fence's shape spelled out, since no model has seen it.
+///
+/// It is a NOTE, composed in before the language line like any other, and
+/// says nothing about language: the last word stays the language
+/// instruction's.
+pub const FORMATTING_INSTRUCTION: &str = "Your answer is shown with Markdown. When it genuinely helps, you may also \
+     write formulas in LaTeX — inline between single dollar signs, or on lines of their own between double \
+     dollar signs — draw diagrams in fenced ```mermaid or ```dot blocks, and draw a graph of a function in a \
+     fenced ```plot block: one line per setting or curve, such as `x: -5..5`, `title: Growth`, then \
+     expressions in x like `sin(x)` or `x^2/2`. Plain words are better when they do the job.";
+
 /// What the assistant is told about being mentioned in a group chat.
 ///
 /// Worth saying explicitly, because the honest description of what it can
@@ -411,6 +438,16 @@ pub const MENTION_WITH_HISTORY_INSTRUCTION: &str = "You have been mentioned with
      addressed to you. \
      If answering needs context you were not given, say so in one line and ask for it. \
      Keep the answer short — this is a group chat, not a document.";
+
+/// What a mention in a GROUP adds to the instruction: which chat this is,
+/// and that nothing outside it is shown (protocol.md, "Groups").
+pub fn group_note(name: &str) -> String {
+    format!(
+        "This chat is not the whole family's: it is a group called \"{name}\" of some of the \
+         family's members, and only they read your answer. You can see nothing from outside this \
+         group — not the family chat, and not any other group."
+    )
+}
 
 /// How far back a mention may look. One of THREE bounds on the same
 /// window (docs/protocol.md, "Mentioning the assistant in the family chat"),
@@ -1518,7 +1555,7 @@ async fn load_history(
             attachments_by_message
                 .entry(row.get("message_id"))
                 .or_default()
-                .push(Attachment::from_row(row));
+                .push(Attachment::from_row(row, &state.keys)?);
         }
     }
 
@@ -1526,22 +1563,24 @@ async fn load_history(
 
     let messages: Vec<HistoryMessage> = rows
         .iter()
-        .map(|row| HistoryMessage {
-            id: row.get("id"),
-            sender_id: row.get("sender_id"),
-            at: row.get("created_at"),
-            sender: if row.get::<i64, _>("sender_id") == assistant_id {
-                state.cfg.ai.title.clone()
-            } else {
-                row.get("display_name")
-            },
-            body: row.get("body"),
-            attachments: attachments_by_message
-                .remove(&row.get::<i64, _>("id"))
-                .unwrap_or_default(),
-            poll: polls_by_message.remove(&row.get::<i64, _>("id")),
+        .map(|row| {
+            Ok(HistoryMessage {
+                id: row.get("id"),
+                sender_id: row.get("sender_id"),
+                at: row.get("created_at"),
+                sender: if row.get::<i64, _>("sender_id") == assistant_id {
+                    state.cfg.ai.title.clone()
+                } else {
+                    row.text(&state.keys, "display_name")?
+                },
+                body: row.text(&state.keys, "body")?,
+                attachments: attachments_by_message
+                    .remove(&row.get::<i64, _>("id"))
+                    .unwrap_or_default(),
+                poll: polls_by_message.remove(&row.get::<i64, _>("id")),
+            })
         })
-        .collect();
+        .collect::<Result<_, KeyError>>()?;
     Ok(messages)
 }
 
@@ -1606,14 +1645,14 @@ async fn polls_for(
     // costs no extra round trip.
     //
     // Counted exactly as every client's own footer counts it: the LIVE
-    // roster. Leaving a family and deleting an account both set
-    // `users.family_id` to NULL (handlers_family, handlers_auth), so this
-    // is the same "who is still here" every membership question in this
-    // server asks — and the assistant, which belongs to no family, is not
-    // one of them. A tally must not go on counting somebody who no longer
-    // exists.
+    // roster of the chat's family. Leaving a family and deleting an account
+    // both remove the membership row (handlers_family, handlers_auth), so
+    // this is the same "who is still here" every membership question in
+    // this server asks — and the assistant, which belongs to no family, is
+    // not one of them. A tally must not go on counting somebody who no
+    // longer exists.
     let members: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM users
+        "SELECT count(*) FROM family_members
          WHERE family_id = (SELECT family_id FROM chats WHERE id = $1)",
     )
     .bind(chat_id)
@@ -1629,7 +1668,7 @@ async fn polls_for(
             })
             .options
             .push(HistoryPollOption {
-                text: row.get("text"),
+                text: row.text(&state.keys, "text")?,
                 votes: row.get("votes"),
             });
     }
@@ -1759,14 +1798,17 @@ async fn reply(state: &AppState, chat_id: i64, user_id: i64, language: Option<&s
         return Ok(());
     };
     // The member's own thread may look things up when the server has a
-    // source, the member's FAMILY has `ai_lookups` on, and the member gave
-    // the lookup consent (protocol.md, "Looking things up").
+    // source, the thread's FAMILY has `ai_lookups` on, and the member gave
+    // the lookup consent (protocol.md, "Looking things up"). The thread's
+    // family, not "the member's": an `ai` chat belongs to one family and is
+    // under that family's owner's switches (docs/protocol.md, "Several
+    // families").
     if let Ask::Words { lookups, .. } = &mut prompt.ask {
         let family = sqlx::query(
-            "SELECT f.id, f.ai_lookups FROM users u JOIN families f ON f.id = u.family_id
-             WHERE u.id = $1",
+            "SELECT f.id, f.ai_lookups FROM chats c JOIN families f ON f.id = c.family_id
+             WHERE c.id = $1",
         )
-        .bind(user_id)
+        .bind(chat_id)
         .fetch_optional(&state.pool)
         .await?;
         if let Some(family) = family {
@@ -1955,7 +1997,7 @@ async fn thread_prompt(
     let mut turns: Vec<ChatTurn> = Vec::with_capacity(history.len());
     // Oldest first, which is the order a conversation reads in.
     for row in history.iter().rev() {
-        let body: String = row.get("body");
+        let body = row.text(&state.keys, "body")?;
         let attachments = attachments_by_message
             .remove(&row.get::<i64, _>("id"))
             .unwrap_or_default();
@@ -1985,7 +2027,7 @@ async fn thread_prompt(
     // established is the member's.
     let question = history.first().expect("history is not empty here");
     let question_id: i64 = question.get("id");
-    let question_body: String = question.get("body");
+    let question_body = question.text(&state.keys, "body")?;
 
     // A picture request is decided from the body of that one message and
     // nothing else, and it short-circuits everything above: what leaves the
@@ -2008,7 +2050,7 @@ async fn thread_prompt(
     let mut notes = Vec::new();
     let mut route = state.cfg.ai.text_route();
     if let Some(vision) = state.cfg.ai.vision_route()
-        && family_allows_vision(state, user_id).await?
+        && family_allows_vision(state, chat_id).await?
     {
         let looked = vision_images(state, question_id, VISION_MAX_IMAGES).await?;
         // The note goes whenever the member pointed at a photograph — shown
@@ -2031,6 +2073,8 @@ async fn thread_prompt(
             route = vision;
         }
     }
+
+    notes.push(FORMATTING_INSTRUCTION.to_string());
 
     let draw = state.cfg.ai.contextual_images_route();
     Ok(Some(Prompt {
@@ -2082,7 +2126,7 @@ async fn attachments_for(
         by_message
             .entry(row.get("message_id"))
             .or_default()
-            .push(Attachment::from_row(row));
+            .push(Attachment::from_row(row, &state.keys)?);
     }
     Ok(by_message)
 }
@@ -2124,18 +2168,19 @@ fn numbered_turn_content(
     })
 }
 
-/// Has this member's family allowed photographs to be shown to the model?
+/// Has this thread's family allowed photographs to be shown to the model?
 ///
 /// A column read, deliberately, rather than a value carried down from the
 /// send: the switch may have been turned off between the member pressing
 /// send and this task running, and the answer that matters is the one that
-/// holds when the bytes are about to leave. A member with no family answers
-/// false, which is also what a missing row answers.
-async fn family_allows_vision(state: &AppState, user_id: i64) -> Result<bool> {
+/// holds when the bytes are about to leave. The THREAD's family — an `ai`
+/// chat is one family's, under that family's switches (docs/protocol.md,
+/// "Several families") — and a missing row answers false.
+async fn family_allows_vision(state: &AppState, chat_id: i64) -> Result<bool> {
     let allowed = sqlx::query_scalar::<_, bool>(
-        "SELECT f.ai_vision FROM users u JOIN families f ON f.id = u.family_id WHERE u.id = $1",
+        "SELECT f.ai_vision FROM chats c JOIN families f ON f.id = c.family_id WHERE c.id = $1",
     )
-    .bind(user_id)
+    .bind(chat_id)
     .fetch_optional(&state.pool)
     .await?;
     Ok(allowed.unwrap_or(false))
@@ -2184,7 +2229,7 @@ struct LookedAt {
 /// family chat, or for its history, would be the copy that drifted.
 async fn vision_images(state: &AppState, message_id: i64, budget: usize) -> Result<LookedAt> {
     let rows = sqlx::query(
-        "SELECT id, kind, mime, has_preview, storage_key
+        "SELECT id, kind, mime, has_preview, storage_key, file_key
          FROM attachments
          WHERE message_id = $1 AND kind = 'photo'
          ORDER BY position, id",
@@ -2205,19 +2250,28 @@ async fn vision_images(state: &AppState, message_id: i64, budget: usize) -> Resu
         // The preview is a JPEG by definition (protocol.md, "Photos,
         // videos, audio, files and locations"), so preferring it also
         // settles the media type.
-        let (path, mime) = if has_preview {
-            (
-                state.storage.preview_path(&storage_key),
-                "image/jpeg".to_string(),
-            )
+        let mime = if has_preview {
+            "image/jpeg".to_string()
         } else {
-            (state.storage.blob_path(&storage_key), mime)
+            mime
         };
         if mime != "image/jpeg" && mime != "image/png" {
             looked.omitted += 1;
             continue;
         }
-        let Ok(bytes) = tokio::fs::read(&path).await else {
+        // Opened from its seal (#59) — or read as it is, for a file from
+        // before encryption at rest the background conversion has not
+        // reached yet.
+        let file_key: Option<Vec<u8>> = row.get("file_key");
+        let Some(bytes) = crate::handlers_attachment::read_whole(
+            state,
+            &storage_key,
+            has_preview,
+            file_key.as_deref(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("reading a photo for the model: {error:?}"))?
+        else {
             // Swept, or never finished uploading. Not an error: the
             // question is still worth answering without it.
             looked.omitted += 1;
@@ -2263,13 +2317,15 @@ struct LookedAtFaces {
 /// - **only members with a line in the transcript.** A face travels only for
 ///   a name the model has already been told; nobody else's is fetched, and
 ///   in particular not the whole roster's;
-/// - **only members of THIS chat's family, now.** The predicate is the one
-///   `GET /users/{id}/avatar` enforces — `u.family_id IS NOT NULL AND
-///   u.family_id = <the chat's family>` — restated here because reading
-///   `user_avatars` directly inherits none of that handler's protections, and
-///   one server hosts several families. A member who left, or whose account
-///   was scrubbed, still has lines in the transcript and sends NO face: their
-///   row's `family_id` is NULL;
+/// - **only members of THIS chat's family, now.** A membership of the
+///   chat's family in `family_members` — narrower than what
+///   `GET /users/{id}/avatar` enforces ("shares a family with the reader"),
+///   because the face goes to the model on THIS family's owner's switch, and
+///   one server hosts several families (an account may be in several since
+///   2026-10-22). Restated here because reading `user_avatars` directly
+///   inherits none of that handler's protections. A member who left, or
+///   whose account was scrubbed, still has lines in the transcript and sends
+///   NO face: their membership row is gone;
 /// - **never the assistant's own row**, which has no picture and is in no
 ///   family — excluded by the predicate, and by name here so nobody has to
 ///   reason about it;
@@ -2313,9 +2369,11 @@ async fn face_images(
     // chat's family now. The picture rides along when there is one.
     let rows = sqlx::query(
         "SELECT u.id,
-                u.username LIKE 'deleted-%' AS tombstone,
-                (u.family_id IS NOT NULL
-                   AND u.family_id = (SELECT family_id FROM chats WHERE id = $2)) AS here,
+                u.deleted_at IS NOT NULL AS tombstone,
+                EXISTS (SELECT 1 FROM family_members fm
+                         WHERE fm.user_id = u.id
+                           AND fm.family_id = (SELECT family_id FROM chats WHERE id = $2))
+                    AS here,
                 a.content_type, a.bytes
          FROM users u
          LEFT JOIN user_avatars a ON a.user_id = u.id
@@ -2334,8 +2392,8 @@ async fn face_images(
         .iter()
         .map(|row| {
             let mime: Option<String> = row.get("content_type");
-            let bytes: Option<Vec<u8>> = row.get("bytes");
-            (
+            let bytes = row.opened_opt(&state.keys, "bytes")?;
+            Ok((
                 row.get::<i64, _>("id"),
                 Found {
                     tombstone: row.get("tombstone"),
@@ -2344,9 +2402,9 @@ async fn face_images(
                         .zip(bytes)
                         .map(|(mime, bytes)| InlineImage { mime, bytes }),
                 },
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_, KeyError>>()?;
 
     let mut looked = LookedAtFaces::default();
     for id in candidates {
@@ -2509,8 +2567,11 @@ async fn mention_prompt(
                 p.body AS quoted_body,
                 p.sender_id AS quoted_sender_id,
                 (qu.assistant_lookup_consent_at IS NOT NULL) AS quoted_lookup_consent,
-                qu.display_name AS quoted_author
+                qu.display_name AS quoted_author,
+                c.kind AS chat_kind,
+                c.title AS group_title
          FROM messages m
+         JOIN chats c ON c.id = m.chat_id
          LEFT JOIN messages p ON p.id = m.reply_to_message_id AND p.chat_id = m.chat_id
          LEFT JOIN users qu ON qu.id = p.sender_id
          WHERE m.id = $1 AND m.chat_id = $2",
@@ -2524,7 +2585,7 @@ async fn mention_prompt(
         return Ok(None);
     };
 
-    let body: String = row.get("body");
+    let body = row.text(&state.keys, "body")?;
     if body.trim().is_empty() {
         return Ok(None);
     }
@@ -2557,8 +2618,8 @@ async fn mention_prompt(
     let own_words = own_words(&draw, &body);
 
     let quoted_id: Option<i64> = row.get("quoted_id");
-    let quoted: Option<String> = row.get("quoted_body");
-    let quoted_author: Option<String> = row.get("quoted_author");
+    let quoted = row.text_opt(&state.keys, "quoted_body")?;
+    let quoted_author = row.text_opt(&state.keys, "quoted_author")?;
 
     // A quote is somebody else's words, deliberately pointed at — and the
     // asker cannot agree on its author's behalf to a query written from
@@ -2801,6 +2862,16 @@ async fn mention_prompt(
     } else {
         MENTION_INSTRUCTION.to_string()
     };
+    // In a GROUP it is told so, and told the group's edge: a model that
+    // takes "a family group chat" for the whole family will speak as if
+    // everybody can read the answer (protocol.md, "Groups").
+    if row.get::<String, _>("chat_kind") == "group" {
+        instruction.push(' ');
+        instruction.push_str(&group_note(
+            &row.text_opt(&state.keys, "group_title")?
+                .unwrap_or_default(),
+        ));
+    }
     // A marker the model has not been taught is worse than no marker, so a
     // poll on either of the two messages says so in the instruction that
     // describes them — and says it ONCE. When a poll also survived into the
@@ -2829,6 +2900,7 @@ async fn mention_prompt(
     };
     notes.extend(vision_note);
     notes.extend(faces_note);
+    notes.push(FORMATTING_INSTRUCTION.to_string());
 
     let audience = events::chat_member_ids(&state.pool, chat_id)
         .await
@@ -2937,6 +3009,11 @@ async fn stream_words(
     // rate. Draining one channel from one task fixes the order by
     // construction, and coalescing whatever is queued fixes the rate.
     let (deltas, mut queue) = mpsc::unbounded_channel::<String>();
+    // Which of the audience an app from before several families must not
+    // be streamed to: decided ONCE per reply rather than per fragment — a
+    // reply is a few seconds, and the families a chat is listed in do not
+    // move under it (docs/protocol.md, "Several families").
+    let hidden = events::legacy_hidden_or_all(state, audience, &events::Scope::Chat(chat_id)).await;
     let pump = {
         let state = state.clone();
         let audience = audience.to_vec();
@@ -2949,7 +3026,7 @@ async fn stream_words(
                 if !text.is_empty() {
                     state
                         .registry
-                        .fan_out(
+                        .fan_out_hiding(
                             &audience,
                             &ServerFrame::AiDelta {
                                 chat_id,
@@ -2957,6 +3034,7 @@ async fn stream_words(
                                 text,
                             },
                             None,
+                            &hidden,
                         )
                         .await;
                 }
@@ -3525,6 +3603,9 @@ pub(crate) struct WrittenPicture {
     pub storage_key: String,
     pub mime: &'static str,
     pub bytes: i64,
+    /// The file's own key (#59): the row that holds the picture keeps it,
+    /// sealed under its holder's key.
+    pub file_key: crate::vault::DataKey,
 }
 
 impl WrittenPicture {
@@ -3563,15 +3644,22 @@ pub(crate) async fn write_picture(
     let one_chunk = Box::pin(futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
         chunk,
     )]));
+    let file_key = crate::vault::DataKey::generate();
     let written = state
         .storage
-        .write_stream(&path, one_chunk, state.cfg.limits.max_attachment_bytes)
+        .write_stream(
+            &path,
+            one_chunk,
+            state.cfg.limits.max_attachment_bytes,
+            &file_key,
+        )
         .await
         .map_err(|error| anyhow::anyhow!("writing the generated picture: {error:?}"))?;
     Ok(WrittenPicture {
         storage_key,
         mime: image.mime,
         bytes: written.bytes as i64,
+        file_key,
     })
 }
 
@@ -3593,11 +3681,15 @@ async fn store_picture(
             .flatten();
     let written = write_picture(state, &format!("ai-{message_id}"), image).await?;
     let storage_key = written.storage_key.clone();
+    // The picture is the chat's, from the start: its file key is sealed
+    // under the chat's key (#59).
+    let holder = state.keys.key(&state.pool, Owner::Chat(chat_id)).await?;
 
     if let Err(error) = sqlx::query(
         "INSERT INTO attachments
-            (uploader_id, message_id, kind, mime, size_bytes, storage_key, family_id, position)
-         VALUES ($1, $2, 'photo', $3, $4, $5, $6, 0)",
+            (uploader_id, message_id, kind, mime, size_bytes, storage_key, family_id, position,
+             file_key)
+         VALUES ($1, $2, 'photo', $3, $4, $5, $6, 0, $7)",
     )
     .bind(assistant_id)
     .bind(message_id)
@@ -3605,6 +3697,10 @@ async fn store_picture(
     .bind(written.bytes)
     .bind(&storage_key)
     .bind(family_id)
+    .bind(crate::handlers_attachment::seal_file_key(
+        &holder,
+        &written.file_key,
+    ))
     .execute(&state.pool)
     .await
     {
@@ -3617,6 +3713,14 @@ async fn store_picture(
     Ok(())
 }
 
+/// A paid family's allowance check (`subscriptions::may_spend`), in this
+/// module's error type.
+pub(crate) async fn may_spend(state: &AppState, family_id: i64, spend: Spend) -> Result<bool> {
+    subscriptions::may_spend(state, family_id, spend)
+        .await
+        .map_err(|error| anyhow::anyhow!("reading the family's allowance: {error:?}"))
+}
+
 /// Tell the audience the reply stopped early, and — when the server knows
 /// one worth a different sentence — why (protocol.md, "The assistant").
 async fn fan_out_ai_error(
@@ -3626,16 +3730,23 @@ async fn fan_out_ai_error(
     message_id: i64,
     reason: Option<AiErrorReason>,
 ) {
+    let hidden = events::legacy_hidden_or_all(state, audience, &events::Scope::Chat(chat_id)).await;
     state
         .registry
-        .fan_out(
+        .fan_out_hiding(
             audience,
             &ServerFrame::AiError {
                 chat_id,
                 message_id,
                 reason,
+                // A used-up allowance says when it comes back (protocol.md,
+                // "Paid families").
+                renews_at: (reason == Some(AiErrorReason::AllowanceUsed)).then(|| {
+                    crate::subscriptions::next_month_start(time::OffsetDateTime::now_utc())
+                }),
             },
             None,
+            &hidden,
         )
         .await;
 }
@@ -3647,16 +3758,20 @@ async fn answer(
     chat_id: i64,
     user_id: i64,
     assistant_id: i64,
-    prompt: Prompt,
+    mut prompt: Prompt,
     language: Option<&str>,
 ) -> Result<()> {
     // The empty row the reply will fill. Created BEFORE the call, so the
     // bubble appears immediately and every device has the same id to stream
     // into.
-    let inserted: Message = sqlx::query(
+    //
+    // Sealed under the chat's key (#59) even while empty: the column takes
+    // nothing else.
+    let key = state.keys.key(&state.pool, Owner::Chat(chat_id)).await?;
+    let row = sqlx::query(
         "INSERT INTO messages (chat_id, sender_id, client_msg_id, body, reply_to_message_id,
                                thread_root_id)
-         VALUES ($1, $2, $3, '', $4,
+         VALUES ($1, $2, $3, $5, $4,
                  (SELECT COALESCE(q.thread_root_id, q.id) FROM messages q WHERE q.id = $4))
          RETURNING id, chat_id, sender_id, client_msg_id, body, created_at,
                    reaction_seq, edit_seq, edited_at, reply_to_message_id, thread_root_id",
@@ -3665,9 +3780,10 @@ async fn answer(
     .bind(assistant_id)
     .bind(Uuid::new_v4())
     .bind(prompt.reply_to)
+    .bind(key.seal_str(""))
     .fetch_one(&state.pool)
-    .await
-    .map(|row| Message::from_row(&row))?;
+    .await?;
+    let inserted = Message::from_row(&row, &state.keys)?;
 
     let message_id = inserted.id;
     // Re-read through the joined reader when the row quotes something: the
@@ -3690,6 +3806,42 @@ async fn answer(
         "ai_placeholder",
         events::deliver_message_without_push(state, &placeholder, None).await,
     );
+
+    // A PAID family past this month's allowance gets no call at all
+    // (protocol.md, "Paid families"): words need tokens, a picture needs
+    // pictures. Checked BEFORE the call, so an answer may overshoot by its
+    // own size and none is cut off halfway. A question that might DRAW keeps
+    // its words and loses the tool once the pictures are used — the model is
+    // simply not offered `draw_picture`, as a server that cannot draw never
+    // offers it.
+    let family_id: Option<i64> = sqlx::query_scalar("SELECT family_id FROM chats WHERE id = $1")
+        .bind(chat_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    if let Some(family_id) = family_id {
+        let spend = match &prompt.ask {
+            Ask::Words { .. } => Spend::Tokens,
+            Ask::Picture { .. } => Spend::Images,
+        };
+        if !may_spend(state, family_id, spend).await? {
+            info!(%chat_id, "assistant allowance used");
+            fan_out_ai_error(
+                state,
+                &prompt.audience,
+                chat_id,
+                message_id,
+                Some(AiErrorReason::AllowanceUsed),
+            )
+            .await;
+            return Ok(());
+        }
+        if let Ask::Words { draw, .. } = &mut prompt.ask
+            && draw.is_some()
+            && !may_spend(state, family_id, Spend::Images).await?
+        {
+            *draw = None;
+        }
+    }
 
     // From here the two kinds of answer part company: words are streamed
     // into the row, a picture is fetched whole and attached to it. Both come
@@ -3910,7 +4062,7 @@ async fn answer(
          SET body = $1, edit_seq = $2, edited_at = now()
          WHERE id = $3",
     )
-    .bind(&text)
+    .bind(key.seal_str(&text))
     .bind(seq)
     .bind(message_id)
     .execute(&state.pool)
@@ -3935,10 +4087,13 @@ async fn answer(
     };
 
     // What it cost, for Family Statistics. Best effort: a reply the member
-    // has already read must not fail because a counter did not save.
+    // has already read must not fail because a counter did not save. Booked
+    // to the CHAT's family — the family whose assistant answered, in its
+    // chat — since a member in several families asks each family's
+    // assistant separately (docs/protocol.md, "Several families").
     let family_id =
-        sqlx::query_scalar::<_, Option<i64>>("SELECT family_id FROM users WHERE id = $1")
-            .bind(user_id)
+        sqlx::query_scalar::<_, Option<i64>>("SELECT family_id FROM chats WHERE id = $1")
+            .bind(chat_id)
             .fetch_optional(&state.pool)
             .await?
             .flatten();
@@ -3990,8 +4145,8 @@ async fn answer(
 #[cfg(test)]
 mod tests {
     use super::{
-        HISTORY_MAX_CHARS, HISTORY_MAX_MESSAGES, HISTORY_WINDOW_DAYS, HistoryMessage,
-        HistoryPictures, HistoryPoll, HistoryPollOption, MENTION_INSTRUCTION,
+        FORMATTING_INSTRUCTION, HISTORY_MAX_CHARS, HISTORY_MAX_MESSAGES, HISTORY_WINDOW_DAYS,
+        HistoryMessage, HistoryPictures, HistoryPoll, HistoryPollOption, MENTION_INSTRUCTION,
         MENTION_WITH_HISTORY_INSTRUCTION, MIRROR_LANGUAGE_INSTRUCTION, Numbered, POLL_NOTE,
         compose_system_prompt, fallback_words, history_note_header, language_instruction,
         mention_poll_note, mention_vision_note, numbered_turn_content, poll_line, render_history,
@@ -4061,6 +4216,7 @@ mod tests {
             accuracy_m: None,
             sticker: false,
             round: false,
+            animation: false,
             waveform: None,
         }
     }
@@ -5115,6 +5271,37 @@ mod tests {
                 "the mirror rule belongs in the fallback, not in the note: {note}"
             );
         }
+    }
+
+    /// The formatting note names what the bubbles draw (docs/protocol.md,
+    /// "Rich blocks") in the delimiters and fence tags the parsers accept —
+    /// a note that taught `\(…\)` or ```` ```math ```` alone would still
+    /// work, but the plot fence has to be spelled exactly or it is a code
+    /// block — and, like every note, leaves language to the last line.
+    #[test]
+    fn the_formatting_note_names_what_the_bubbles_draw() {
+        for needle in [
+            "dollar signs",
+            "```mermaid",
+            "```dot",
+            "```plot",
+            "x: -5..5",
+        ] {
+            assert!(
+                FORMATTING_INSTRUCTION.contains(needle),
+                "{needle} is missing: {FORMATTING_INSTRUCTION}"
+            );
+        }
+        assert!(
+            !FORMATTING_INSTRUCTION.contains("language"),
+            "the language belongs to the last line alone: {FORMATTING_INSTRUCTION}"
+        );
+        let prompt = compose_system_prompt(
+            "Be brief.",
+            &[FORMATTING_INSTRUCTION.to_string()],
+            Some("de"),
+        );
+        assert!(prompt.ends_with("Answer in German."), "{prompt}");
     }
 
     /// The wider instruction has to say what is still NOT visible, or the

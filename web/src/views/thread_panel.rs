@@ -11,14 +11,17 @@
 //! would from the chat, and is asked about first exactly as there.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use fc_text::i18n::{t, tn};
+use wasm_bindgen::JsCast;
+use web_sys::{HtmlElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
 use crate::actions::Action;
-use crate::model::{AiFailure, Assistant, Family, Member, Message, PackItem};
+use crate::model::{AiFailure, Assistant, Family, Member, PackItem};
 use crate::pack::Gate;
-use crate::store::Draft;
+use crate::store::{Draft, Messages};
 use crate::timeline;
 use crate::views::bubble::Bubble;
 use crate::views::composer::{Composer, Pictures};
@@ -32,12 +35,18 @@ pub struct ThreadPanelProps {
     pub chat_id: i64,
     pub root_id: i64,
     /// The chain as held, root first.
-    pub messages: Vec<Message>,
+    /// The thread's rows, shared with the store (`store::Messages`).
+    pub messages: Messages,
     pub my_user_id: i64,
-    pub is_family_chat: bool,
-    pub is_ai_chat: bool,
+    /// The chat's kind as the server sent it — a thread lives in the chat
+    /// of its root, and offers what that chat offers (fc_text::groups).
+    pub chat_kind: AttrValue,
     pub names: HashMap<i64, String>,
+    /// The family's roster, for the faces.
     pub members: Vec<Member>,
+    /// Whom a mention here may name and a poll counts — the family's
+    /// members, or in a group the group's (`Chat::members_of`).
+    pub chat_members: Vec<Member>,
     pub assistant: Option<Assistant>,
     pub blocked: HashSet<i64>,
     pub revealed: HashSet<i64>,
@@ -74,12 +83,30 @@ pub fn thread_panel(props: &ThreadPanelProps) -> Html {
         let on_action = props.on_action.clone();
         Callback::from(move |_: MouseEvent| on_action.emit(Action::CloseThread))
     };
+    // Esc closes the thread — but never over a draft (#106, 2.3): closing
+    // would lose it, so with words in the box the first Esc only leaves the
+    // box, onto the panel, and a second closes it.
+    let panel_ref = use_node_ref();
     let on_key = {
         let on_action = props.on_action.clone();
+        let panel_ref = panel_ref.clone();
         Callback::from(move |event: KeyboardEvent| {
-            if event.key() == "Escape" {
-                on_action.emit(Action::CloseThread);
+            if event.key() != "Escape" {
+                return;
             }
+            let drafted = event
+                .target()
+                .and_then(|target| target.dyn_into::<HtmlTextAreaElement>().ok())
+                .filter(|area| !area.value().trim().is_empty());
+            if let Some(area) = drafted {
+                event.prevent_default();
+                let _ = area.blur();
+                if let Some(panel) = panel_ref.cast::<HtmlElement>() {
+                    let _ = panel.focus();
+                }
+                return;
+            }
+            on_action.emit(Action::CloseThread);
         })
     };
     // Every send from here answers the root.
@@ -94,15 +121,16 @@ pub fn thread_panel(props: &ThreadPanelProps) -> Html {
     // (views/conversation.rs): by a send — words, or a sticker — that
     // would reach the model before this member has agreed.
     let consent_open = use_state(|| false);
-    // The sticker button, wherever the chat has one — every chat on a
-    // server that has packs, the assistant's included. One click sends,
+    // The sticker button, inside the field as in the chat (#106), wherever
+    // the chat has one — every chat on a server that has packs, the
+    // assistant's included. One click sends,
     // and what it sends answers the root like everything else here. In a
     // thread of the assistant's chat it goes through the consent question
     // and never round it, by the chat's own test (`pack::send_gate`);
     // where the server names nobody nothing is sent, and the strip above
     // the box already says so.
     let sticker_gate = crate::pack::send_gate(
-        props.is_ai_chat,
+        fc_text::groups::known(&props.chat_kind),
         props.assistant.as_ref(),
         props.agreed_to_assistant,
     );
@@ -217,8 +245,15 @@ pub fn thread_panel(props: &ThreadPanelProps) -> Html {
         Callback::from(move |_: i64| focus.set(*focus + 1))
     };
     let replies = props.messages.len().saturating_sub(1);
+    // Once a draw, for every row (conversation::QuotedKinds), and the shared
+    // sets every bubble is handed.
+    let quoted = crate::views::conversation::QuotedKinds::of(&props.messages);
+    let names = Rc::new(props.names.clone());
+    let blocked = Rc::new(props.blocked.clone());
+    let member_ids: Rc<HashSet<i64>> =
+        Rc::new(props.chat_members.iter().map(|member| member.id).collect());
     html! {
-        <aside class="thread-panel" aria-label={t("Thread")} onkeydown={on_key}>
+        <aside ref={panel_ref} class="thread-panel" aria-label={t("Thread")} tabindex="-1" onkeydown={on_key}>
             <header class="thread-bar">
                 <h2>{ tn("%lld replies", replies as i64) }</h2>
                 <button class="link" onclick={close} aria-label={t("Close the thread")}>{ "✕" }</button>
@@ -238,25 +273,25 @@ pub fn thread_panel(props: &ThreadPanelProps) -> Html {
                             <Bubble
                                 message={message.clone()}
                                 my_user_id={props.my_user_id}
-                                names={props.names.clone()}
-                                blocked={props.blocked.clone()}
+                                names={names.clone()}
+                                blocked={blocked.clone()}
                                 quote_revealed={props.revealed_quotes.contains(&(message.id, 0))}
                                 parent_revealed={props.revealed_quotes.contains(&(message.id, 1))}
-                                quote_round={crate::views::conversation::quotes_round(message, &props.messages)}
+                                quote_round={quoted.round(message)}
+                                quote_animation={quoted.animation(message)}
                                 {hidden}
-                                shows_sender={props.is_family_chat && message.sender_id != props.my_user_id && !hidden}
+                                shows_sender={fc_text::groups::offers(&props.chat_kind).sender_names && message.sender_id != props.my_user_id && !hidden}
                                 sender_avatar_version={props.members.iter().find(|member| member.id == message.sender_id).map_or(0, |member| member.avatar_version)}
                                 run_end={true}
                                 seen={false}
                                 awaited={false}
-                                ai_failed={props.ai_failed.get(&message.id).copied()}
+                                ai_failed={props.ai_failed.get(&message.id).cloned()}
                                 {failed}
-                                is_family_chat={props.is_family_chat}
-                                is_ai_chat={props.is_ai_chat}
+                                chat_kind={props.chat_kind.clone()}
                                 {assistant_user_id}
                                 in_thread={true}
-                                member_count={props.members.len()}
-                                member_ids={props.members.iter().map(|member| member.id).collect::<HashSet<i64>>()}
+                                member_count={props.chat_members.len()}
+                                member_ids={member_ids.clone()}
                                 on_action={props.on_action.clone()}
                                 on_reply={on_reply.clone()}
                                 on_edit={Callback::from(|_: i64| {})}
@@ -272,10 +307,9 @@ pub fn thread_panel(props: &ThreadPanelProps) -> Html {
             <Composer
                 key={format!("thread-composer-{root_id}")}
                 {chat_id}
-                is_family_chat={props.is_family_chat}
-                is_ai_chat={props.is_ai_chat}
+                chat_kind={props.chat_kind.clone()}
                 my_user_id={props.my_user_id}
-                members={props.members.clone()}
+                members={props.chat_members.clone()}
                 blocked={props.blocked.clone()}
                 assistant={props.assistant.clone()}
                 agreed_to_assistant={props.agreed_to_assistant}
@@ -292,7 +326,7 @@ pub fn thread_panel(props: &ThreadPanelProps) -> Html {
                 on_typing={props.on_action.reform(move |_: ()| Action::Typing { chat_id })}
                 on_draft={Callback::from(|_: String| {})}
                 in_thread={true}
-                attach={sticker_menu.unwrap_or_default()}
+                stickers={sticker_menu.unwrap_or_default()}
                 focus={*focus}
                 {pictures}
             />

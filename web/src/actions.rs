@@ -28,6 +28,10 @@ use crate::sync::{self, expiry, wake, Channels, Shared, PAGE};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     SelectChat(i64),
+    /// Back to the list, from a conversation that is the whole window — a
+    /// phone's, below the two panes (#106). Nothing is read while the list
+    /// is in front, so the chat is CLOSED, not hidden.
+    CloseChat,
     LoadMore {
         chat_id: i64,
     },
@@ -404,6 +408,41 @@ pub enum Action {
         new_password: String,
         done: Done,
     },
+    /// A new group, named, with the members picked (docs/protocol.md,
+    /// "Groups"): `done` hears None once the server has it — and it is then
+    /// the chat open — or the refusal, for the dialog to word.
+    CreateGroup {
+        title: String,
+        member_ids: Vec<i64>,
+        done: Done,
+    },
+    /// The group admin's tools, each heard the same way.
+    RenameGroup {
+        chat_id: i64,
+        title: String,
+        done: Done,
+    },
+    AddGroupMembers {
+        chat_id: i64,
+        user_ids: Vec<i64>,
+        done: Done,
+    },
+    RemoveGroupMember {
+        chat_id: i64,
+        user_id: i64,
+        done: Done,
+    },
+    /// Every member's: out of the group, which goes from this account's
+    /// devices.
+    LeaveGroup {
+        chat_id: i64,
+        done: Done,
+    },
+    /// The admin's: the group and every message in it, for everyone.
+    DeleteGroup {
+        chat_id: i64,
+        done: Done,
+    },
     /// The family's numbers, read afresh on every opening and kept by the
     /// view that asked (ios StatisticsView never caches them either).
     LoadStats {
@@ -423,6 +462,26 @@ pub enum Action {
     EndCall,
     ToggleMute,
     ToggleCamera,
+    /// Show another family (docs/protocol.md, "Several families").
+    SwitchFamily(i64),
+    /// Accept an invitation: in at once, and shown.
+    AcceptInvitation {
+        invitation_id: i64,
+    },
+    /// Decline one: off the list; its owner is not told.
+    DeclineInvitation {
+        invitation_id: i64,
+    },
+    /// The owner invites somebody from another of their families.
+    Invite {
+        user_id: i64,
+        done: Done,
+    },
+    /// The owner withdraws a pending invitation.
+    WithdrawInvitation {
+        invitation_id: i64,
+        done: Done,
+    },
 }
 
 impl Action {
@@ -487,6 +546,9 @@ pub fn board_failure(error: &ApiError) -> String {
         Some("attachment_too_large") => t("That photo is too large to pin.").to_string(),
         Some("invalid_attachment") => t("The board pins photos only.").to_string(),
         Some("not_in_family") => t("You're not in a family, so there is no board.").to_string(),
+        // A paid family past its storage allowance (docs/protocol.md, "Paid
+        // families").
+        Some("storage_allowance_used") => fc_text::paid::storage_allowance_used().to_string(),
         _ => error.detail(),
     }
 }
@@ -516,10 +578,34 @@ pub fn asks_for_consent(error: &ApiError) -> bool {
 /// refused answer says — once, and not behind "Couldn't draw that.", which
 /// would read as a fault worth a retry (docs/protocol.md, "Board"). Every
 /// other failure is led by what did not happen, as the board's always are.
+///
+/// `ai_allowance_used` is a paid family past this month's pictures: said as
+/// an answer that failed for it is, naming the day it renews.
 pub fn backdrop_failure(error: &ApiError) -> String {
     match error.code() {
-        Some("picture_refused") => AiFailure::Refused.sentence().to_string(),
+        Some("picture_refused") => AiFailure::Refused.sentence(),
+        Some("ai_allowance_used") => fc_text::paid::ai_allowance_used(&renews_on()),
         _ => format!("{} {}", t("Couldn't draw that."), board_failure(error)),
+    }
+}
+
+/// The day a paid family's monthly allowance renews, in the reader's
+/// language, for an `ai_allowance_used` that came over REST — a transcript
+/// or a backdrop — and so with no `renews_at` of its own: the 1st of the
+/// next month, UTC, shown as that UTC calendar day (docs/protocol.md, "Paid
+/// families").
+pub fn renews_on() -> String {
+    let now = js_sys::Date::now();
+    crate::time::utc_day_in_sentence(&fc_text::paid::next_month_utc(now), now)
+}
+
+/// A transcript refused for the month: the day it renews, taken when the
+/// refusal came, so the line names that day however late it is drawn — and
+/// lets go of it then (docs/protocol.md, "Transcripts on request").
+fn transcript_allowance_used() -> fc_text::transcript::Failure {
+    fc_text::transcript::Failure::AllowanceUsed {
+        renews_on: renews_on(),
+        renews_at_ms: fc_text::paid::next_month_utc_ms(js_sys::Date::now()),
     }
 }
 
@@ -541,6 +627,7 @@ pub fn pack_failure(error: &ApiError) -> String {
         Some("invalid_attachment") => t("A sticker is a WebP or PNG picture.").to_string(),
         Some("attachment_expired") => t("The sticker took too long to add. Try again.").to_string(),
         Some("validation") => t("A description is at most 64 characters.").to_string(),
+        Some("storage_allowance_used") => fc_text::paid::storage_allowance_used().to_string(),
         _ => error.detail(),
     }
 }
@@ -577,6 +664,16 @@ pub fn random_color() -> String {
 /// time.
 pub fn still_adding() -> &'static str {
     t("A sticker is still being added. Add the next one when it is in the pack.")
+}
+
+/// The most families this account may be in — the server's number, or the
+/// protocol's default where it sent none (fc_text::families::DEFAULT_MAX).
+pub fn max_families(store: &store::Store) -> i64 {
+    store
+        .account
+        .as_ref()
+        .and_then(|account| account.max_families_per_account)
+        .unwrap_or(fc_text::families::DEFAULT_MAX)
 }
 
 /// What the handler needs of the app.
@@ -635,6 +732,13 @@ impl Actions {
     ) -> Result<Result<transcript::Transcript, ApiError>, transcript::Failure> {
         let sound = self.supplied_sound(attachment, max_bytes).await?;
         Ok(api::transcript_of_sound(token, chat_id, message_id, attachment.id, &sound).await)
+    }
+
+    /// The family on screen — what every family endpoint is asked about,
+    /// taken when the action starts so an answer that lands after a switch
+    /// is still that family's.
+    fn family(&self) -> Option<i64> {
+        self.live.read(|state| state.store.current_family_id())
     }
 
     fn session_and_token(&self) -> Option<(u64, String)> {
@@ -1080,6 +1184,20 @@ impl Actions {
             Action::CloseThread => {
                 live.now(|state| state.store.thread_view = None);
             }
+            Action::CloseChat => {
+                // Over a video message in review, it asks first (S4), as
+                // every way out of a chat does.
+                if !crate::round_video::may_leave() {
+                    return;
+                }
+                live.now(|state| {
+                    state.open_chat = None;
+                    state.at_newest = false;
+                    state.opening = None;
+                    state.store.open_polls = None;
+                    state.store.thread_view = None;
+                });
+            }
             Action::ShowOpenPolls { chat_id } => {
                 spawn_local(async move { this.read_open_polls(session, &token, chat_id).await });
             }
@@ -1091,8 +1209,23 @@ impl Actions {
                 message_id,
                 reason,
             } => {
+                // To the owner of the family the message was said in — the
+                // one its chat is listed in on screen — or, for a person,
+                // of the family on screen.
+                let family = match message_id {
+                    Some(message_id) => live.read(|state| {
+                        state
+                            .store
+                            .threads
+                            .iter()
+                            .find(|(_, thread)| thread.get(message_id).is_some())
+                            .and_then(|(chat_id, _)| state.store.family_of_chat(*chat_id))
+                            .or_else(|| state.store.current_family_id())
+                    }),
+                    None => this.family(),
+                };
                 spawn_local(async move {
-                    match api::report(&token, user_id, &reason, message_id).await {
+                    match api::report(&token, family, user_id, &reason, message_id).await {
                         // Not "to the owner": a report ABOUT the owner is
                         // kept from them, and the server's answer is the same
                         // either way on purpose (docs/protocol.md, "Reporting
@@ -1345,8 +1478,12 @@ impl Actions {
             Action::CreateFamily { name, done } => {
                 spawn_local(async move {
                     match api::create_family(&token, &name).await {
-                        Ok(_) => {
+                        // Added, and shown: the creator is its owner, and
+                        // the family chat is waiting (docs/protocol.md,
+                        // "Getting another family").
+                        Ok(family) => {
                             this.refresh_account(session, &token).await;
+                            sync::show_family(&live, session, family.id);
                             done.emit(None);
                         }
                         Err(error) => this.said(session, error, &done),
@@ -1354,10 +1491,29 @@ impl Actions {
                 });
             }
             Action::JoinFamily { invite_code, done } => {
+                let before: Vec<i64> =
+                    live.read(|state| state.store.families.iter().map(|f| f.id).collect());
                 spawn_local(async move {
                     match api::join_family(&token, &invite_code).await {
                         Ok(joined) => {
                             this.refresh_account(session, &token).await;
+                            // `joined` names the family; from a server that
+                            // predates that, the new one is the one `/me`
+                            // lists now that it did not before. `pending` is
+                            // a row in the switcher instead.
+                            let new = joined.family_id.or_else(|| {
+                                live.read(|state| {
+                                    state
+                                        .store
+                                        .families
+                                        .iter()
+                                        .map(|family| family.id)
+                                        .find(|id| !before.contains(id))
+                                })
+                            });
+                            if let Some(family_id) = new.filter(|_| joined.status == "joined") {
+                                sync::show_family(&live, session, family_id);
+                            }
                             done.emit(Ok(joined.status));
                         }
                         Err(ApiError::Unauthorized) => expiry(&live, session, &this.sign_out)(),
@@ -1376,12 +1532,18 @@ impl Actions {
                 });
             }
             Action::ReadLeaveContext { done } => {
+                let family = this.family();
                 spawn_local(async move {
                     let writes = live.read(|state| state.store.family_writes);
-                    match api::family(&token).await {
+                    match api::family(&token, family).await {
                         Ok(roster) => {
-                            live.update(session, |state| {
-                                sync::take_roster(&mut state.store, roster.clone(), writes)
+                            live.update(session, |state| match family {
+                                Some(family_id) => {
+                                    state.store.with_family(family_id, |store| {
+                                        sync::take_roster(store, roster.clone(), writes)
+                                    });
+                                }
+                                None => sync::take_roster(&mut state.store, roster.clone(), writes),
                             });
                             let owner = live.read(|state| state.store.is_owner());
                             // A successor the fresh roster does not name
@@ -1397,12 +1559,18 @@ impl Actions {
                 });
             }
             Action::LeaveFamily { done } => {
+                // The family on screen, and that one only: afterwards the
+                // first one left is shown, or the gate when none is.
+                let family = this.family();
                 spawn_local(async move {
                     // Who inherits is named from the roster as it stood
                     // BEFORE leaving — afterwards there is none to read.
                     let names = live.read(|state| state.store.names.clone());
-                    match api::leave_family(&token).await {
+                    match api::leave_family(&token, family).await {
                         Ok(successor) => {
+                            if let Some(family_id) = family {
+                                live.update(session, |state| sync::drop_family(state, family_id));
+                            }
                             let heir = successor.and_then(|id| names.get(&id).cloned());
                             // Said on the family gate, which is where this
                             // account lands (ios "Ownership passed on").
@@ -1451,6 +1619,7 @@ impl Actions {
                 birthday,
                 done,
             } => {
+                let family = this.family();
                 spawn_local(async move {
                     let answer = match user_id {
                         None => api::set_my_birthday(&token, birthday).await.map(|user| {
@@ -1462,15 +1631,17 @@ impl Actions {
                                 }
                             });
                         }),
-                        Some(user_id) => api::set_member_birthday(&token, user_id, birthday)
-                            .await
-                            .map(|member| {
-                                live.update(session, |state| {
-                                    state
-                                        .store
-                                        .set_birthday(user_id, member.and_then(|m| m.birthday))
-                                });
-                            }),
+                        Some(user_id) => {
+                            api::set_member_birthday(&token, family, user_id, birthday)
+                                .await
+                                .map(|member| {
+                                    live.update(session, |state| {
+                                        state
+                                            .store
+                                            .set_birthday(user_id, member.and_then(|m| m.birthday))
+                                    });
+                                })
+                        }
                     };
                     match answer {
                         Ok(()) => done.emit(None),
@@ -1509,10 +1680,18 @@ impl Actions {
                 });
             }
             Action::ChangeFamily { patch, done } => {
+                let asked = this.family();
                 spawn_local(async move {
-                    match api::patch_family(&token, &patch).await {
+                    match api::patch_family(&token, asked, &patch).await {
                         Ok(family) => {
-                            live.update(session, |state| state.store.apply_family(family));
+                            live.update(session, |state| match asked {
+                                Some(family_id) => {
+                                    state
+                                        .store
+                                        .with_family(family_id, |store| store.apply_family(family));
+                                }
+                                None => state.store.apply_family(family),
+                            });
                             done.emit(None);
                         }
                         Err(error) => this.said(session, error, &done),
@@ -1520,10 +1699,18 @@ impl Actions {
                 });
             }
             Action::RotateInviteCode { done } => {
+                let family = this.family();
                 spawn_local(async move {
-                    match api::rotate_invite_code(&token).await {
+                    match api::rotate_invite_code(&token, family).await {
                         Ok(code) => {
-                            live.update(session, |state| state.store.set_invite_code(code));
+                            live.update(session, |state| match family {
+                                Some(family_id) => {
+                                    state.store.with_family(family_id, |store| {
+                                        store.set_invite_code(code)
+                                    });
+                                }
+                                None => state.store.set_invite_code(code),
+                            });
                             done.emit(None);
                         }
                         Err(error) => this.said(session, error, &done),
@@ -1531,11 +1718,20 @@ impl Actions {
                 });
             }
             Action::DecideJoinRequest { id, approve, done } => {
+                let family = this.family();
                 spawn_local(async move {
-                    match api::decide_join_request(&token, id, approve).await {
+                    match api::decide_join_request(&token, family, id, approve).await {
                         Ok(()) => {
                             live.update(session, |state| {
-                                state.store.join_requests.retain(|request| request.id != id)
+                                let take = |store: &mut store::Store| {
+                                    store.join_requests.retain(|request| request.id != id)
+                                };
+                                match family {
+                                    Some(family_id) => {
+                                        state.store.with_family(family_id, take);
+                                    }
+                                    None => take(&mut state.store),
+                                }
                             });
                             done.emit(None);
                             // A new member: the roster, and the chats it
@@ -1550,11 +1746,20 @@ impl Actions {
                 });
             }
             Action::ResolveReport { id, done } => {
+                let family = this.family();
                 spawn_local(async move {
-                    match api::resolve_report(&token, id).await {
+                    match api::resolve_report(&token, family, id).await {
                         Ok(()) => {
                             live.update(session, |state| {
-                                state.store.reports.retain(|report| report.id != id)
+                                let take = |store: &mut store::Store| {
+                                    store.reports.retain(|report| report.id != id)
+                                };
+                                match family {
+                                    Some(family_id) => {
+                                        state.store.with_family(family_id, take);
+                                    }
+                                    None => take(&mut state.store),
+                                }
                             });
                             done.emit(None);
                         }
@@ -1563,10 +1768,18 @@ impl Actions {
                 });
             }
             Action::RemoveMember { user_id, done } => {
+                let family = this.family();
                 spawn_local(async move {
-                    match api::remove_member(&token, user_id).await {
+                    match api::remove_member(&token, family, user_id).await {
                         Ok(()) => {
-                            live.update(session, |state| state.store.member_left(user_id));
+                            live.update(session, |state| match family {
+                                Some(family_id) => {
+                                    state
+                                        .store
+                                        .with_family(family_id, |store| store.member_left(user_id));
+                                }
+                                None => state.store.member_left(user_id),
+                            });
                             done.emit(None);
                             this.refresh_account(session, &token).await;
                         }
@@ -1574,13 +1787,83 @@ impl Actions {
                     }
                 });
             }
+            Action::CreateGroup {
+                title,
+                member_ids,
+                done,
+            } => {
+                // In the family on screen, from its roster.
+                let family = this.family();
+                spawn_local(async move {
+                    match api::create_group(&token, family, &title, &member_ids).await {
+                        // The answer is the group whole: into the list at
+                        // once rather than waiting for its `chat_updated`,
+                        // and open, as a new direct chat opens.
+                        Ok(chat) => {
+                            let chat_id = chat.id;
+                            if live
+                                .update(session, |state| state.store.upsert_chat(chat))
+                                .is_some()
+                            {
+                                done.emit(None);
+                                this.handle(Action::SelectChat(chat_id));
+                            }
+                        }
+                        Err(error) => this.said(session, error, &done),
+                    }
+                });
+            }
+            Action::RenameGroup {
+                chat_id,
+                title,
+                done,
+            } => {
+                spawn_local(async move {
+                    let changed = api::rename_group(&token, chat_id, &title).await;
+                    this.group_changed(session, chat_id, changed, &done);
+                });
+            }
+            Action::AddGroupMembers {
+                chat_id,
+                user_ids,
+                done,
+            } => {
+                spawn_local(async move {
+                    let changed = api::add_group_members(&token, chat_id, &user_ids).await;
+                    this.group_changed(session, chat_id, changed, &done);
+                });
+            }
+            Action::RemoveGroupMember {
+                chat_id,
+                user_id,
+                done,
+            } => {
+                spawn_local(async move {
+                    let changed = api::remove_group_member(&token, chat_id, user_id).await;
+                    this.group_changed(session, chat_id, changed, &done);
+                });
+            }
+            Action::LeaveGroup { chat_id, done } => {
+                let me = live.read(|state| state.store.my_user_id);
+                spawn_local(async move {
+                    let left = api::leave_group(&token, chat_id, me).await;
+                    this.group_gone(session, chat_id, left, &done);
+                });
+            }
+            Action::DeleteGroup { chat_id, done } => {
+                spawn_local(async move {
+                    let deleted = api::delete_group(&token, chat_id).await;
+                    this.group_gone(session, chat_id, deleted, &done);
+                });
+            }
             Action::ResetMemberPassword {
                 user_id,
                 new_password,
                 done,
             } => {
+                let family = this.family();
                 spawn_local(async move {
-                    match api::reset_member_password(&token, user_id, &new_password).await {
+                    match api::reset_member_password(&token, family, user_id, &new_password).await {
                         Ok(()) => done.emit(None),
                         Err(error) => this.said(session, error, &done),
                     }
@@ -1606,8 +1889,9 @@ impl Actions {
             Action::ToggleMute => this.calls.toggle_mute(),
             Action::ToggleCamera => this.calls.toggle_camera(),
             Action::LoadStats { done } => {
+                let family = this.family();
                 spawn_local(async move {
-                    match api::stats(&token).await {
+                    match api::stats(&token, family).await {
                         Ok(stats) => done.emit(Ok(stats)),
                         Err(ApiError::Unauthorized) => expiry(&live, session, &this.sign_out)(),
                         Err(error) => done.emit(Err(error)),
@@ -1640,28 +1924,31 @@ impl Actions {
                 // Never read yet — the first read failed, or has not come
                 // back: read it now rather than show "Loading" until the
                 // socket next reconnects.
-                let (loaded, link) = live.read(|state| {
+                let (loaded, link, family) = live.read(|state| {
                     (
                         state.store.board.loaded,
                         state.connected.then_some(state.link),
+                        state.store.current_family_id(),
                     )
                 });
-                if !loaded {
+                if let (false, Some(family_id)) = (loaded, family) {
                     spawn_local(async move {
-                        sync::sync_board(&live, session, &token, 0, link).await;
+                        sync::sync_board(&live, session, &token, family_id, 0, link).await;
                         sync::mark_board_shown(&live, session);
                     });
                 }
             }
             Action::BoardShown => sync::mark_board_shown(&live, session),
             Action::CreateNote { note, done } => {
+                let family = this.family();
                 spawn_local(async move {
-                    match api::create_note(&token, &note).await {
+                    match api::create_note(&token, family, &note).await {
                         // The answer to this device's own create: applied
-                        // under the guard, and moving NO cursor.
+                        // under the guard, and moving NO cursor — on the
+                        // board it was pinned to.
                         Ok(note) => {
                             if live
-                                .update(session, |state| state.store.board.apply(note))
+                                .update(session, |state| state.store.apply_note(family, note))
                                 .is_some()
                             {
                                 done.emit(None);
@@ -1681,11 +1968,12 @@ impl Actions {
                     done.emit(None);
                     return;
                 }
+                let family = this.family();
                 spawn_local(async move {
-                    match api::patch_note(&token, note_id, &patch).await {
+                    match api::patch_note(&token, family, note_id, &patch).await {
                         Ok(note) => {
                             if live
-                                .update(session, |state| state.store.board.apply(note))
+                                .update(session, |state| state.store.apply_note(family, note))
                                 .is_some()
                             {
                                 done.emit(None);
@@ -1701,10 +1989,12 @@ impl Actions {
                 y,
                 done,
             } => {
+                let family = this.family();
                 spawn_local(async move {
-                    match api::patch_note(&token, note_id, &NotePatch::moved_to(x, y)).await {
+                    match api::patch_note(&token, family, note_id, &NotePatch::moved_to(x, y)).await
+                    {
                         Ok(note) => {
-                            live.update(session, |state| state.store.board.apply(note));
+                            live.update(session, |state| state.store.apply_note(family, note));
                         }
                         Err(error) => {
                             this.board_refused(session, &error, Some(note_id), &Callback::noop());
@@ -1717,11 +2007,16 @@ impl Actions {
                 });
             }
             Action::DeleteNote { note_id, done } => {
+                let family = this.family();
                 spawn_local(async move {
-                    match api::delete_note(&token, note_id).await {
+                    match api::delete_note(&token, family, note_id).await {
                         Ok(()) => {
                             if live
-                                .update(session, |state| state.store.board.forget(note_id))
+                                .update(session, |state| {
+                                    if let Some(board) = state.store.board_for(family) {
+                                        board.forget(note_id);
+                                    }
+                                })
                                 .is_some()
                             {
                                 done.emit(None);
@@ -1736,10 +2031,11 @@ impl Actions {
                 answer,
                 done,
             } => {
+                let family = this.family();
                 spawn_local(async move {
-                    match api::answer_event(&token, note_id, answer.as_deref()).await {
+                    match api::answer_event(&token, family, note_id, answer.as_deref()).await {
                         Ok(note) => {
-                            live.update(session, |state| state.store.board.apply(note));
+                            live.update(session, |state| state.store.apply_note(family, note));
                         }
                         Err(error) => {
                             this.board_refused(session, &error, Some(note_id), &Callback::noop());
@@ -1755,10 +2051,11 @@ impl Actions {
                 done_now,
                 done,
             } => {
+                let family = this.family();
                 spawn_local(async move {
-                    match api::tick_task(&token, note_id, item_id, done_now).await {
+                    match api::tick_task(&token, family, note_id, item_id, done_now).await {
                         Ok(note) => {
-                            live.update(session, |state| state.store.board.apply(note));
+                            live.update(session, |state| state.store.apply_note(family, note));
                         }
                         Err(error) => {
                             this.board_refused(session, &error, Some(note_id), &Callback::noop());
@@ -1795,10 +2092,11 @@ impl Actions {
                 // is the proxy's own read timeout; the ordinary calls carry
                 // none either (api.rs). A connection that closes first draws
                 // nothing (docs/protocol.md, "Board").
+                let family = this.family();
                 spawn_local(async move {
-                    let outcome = match api::draw_backdrop(&token, note_id).await {
+                    let outcome = match api::draw_backdrop(&token, family, note_id).await {
                         Ok(note) => {
-                            live.update(session, |state| state.store.board.apply(note));
+                            live.update(session, |state| state.store.apply_note(family, note));
                             Backdrop::Settled
                         }
                         // The server's word over this tab's copy — consent
@@ -1963,6 +2261,14 @@ impl Actions {
                                     ask_consent.emit(());
                                 }
                             }
+                            // A paid family's minutes for the month are
+                            // used: the line names the day they renew.
+                            transcript::Next::AllowanceUsed => {
+                                let failure = transcript_allowance_used();
+                                live.update(session, |state| {
+                                    state.store.transcripts.failed(attachment_id, failure)
+                                });
+                            }
                             transcript::Next::Fail(failure) => {
                                 live.update(session, |state| {
                                     state.store.transcripts.failed(attachment_id, failure)
@@ -1989,7 +2295,8 @@ impl Actions {
                 }
                 live.now(|state| state.store.board.pinning = true);
                 spawn_local(async move {
-                    let pinned = this.pin_photo(session, &token, photo, at).await;
+                    let family = this.family();
+                    let pinned = this.pin_photo(session, &token, family, photo, at).await;
                     live.update(session, |state| {
                         state.store.board.pinning = false;
                         if let Err(reason) = pinned {
@@ -2015,7 +2322,7 @@ impl Actions {
                         state
                             .store
                             .item(chat_id)
-                            .is_some_and(|item| item.chat.is_ai()),
+                            .map_or("", |item| fc_text::groups::known(&item.chat.kind)),
                         state.store.assistant.as_ref(),
                         state.store.assistant_consent_at().is_some(),
                     )
@@ -2070,7 +2377,7 @@ impl Actions {
                 live.now(|state| state.store.pack.adding = true);
                 spawn_local(async move {
                     let added = this
-                        .add_sticker(session, &token, file.into(), Some(label))
+                        .add_sticker(session, &token, this.family(), file.into(), Some(label))
                         .await;
                     if live
                         .update(session, |state| state.store.pack.adding = false)
@@ -2093,8 +2400,12 @@ impl Actions {
                 spawn_local(async move {
                     // The message's own bytes — this tab drew the sticker
                     // from them a moment ago — uploaded again, unprepared.
+                    let family = this.family();
                     let kept = match this.sticker_bytes(attachment.id).await {
-                        Some(bytes) => this.add_sticker(session, &token, bytes, Some(label)).await,
+                        Some(bytes) => {
+                            this.add_sticker(session, &token, family, bytes, Some(label))
+                                .await
+                        }
                         None => Err(t("Check your connection and try again.").to_string()),
                     };
                     if live
@@ -2122,8 +2433,9 @@ impl Actions {
                 });
             }
             Action::RemoveSticker { item_id, done } => {
+                let family = this.family();
                 spawn_local(async move {
-                    let removed = api::remove_pack_item(&token, item_id).await;
+                    let removed = api::remove_pack_item(&token, family, item_id).await;
                     // `pack_item_not_found` IS "ALREADY GONE": somebody else
                     // removed it first, or this device's own earlier
                     // request did and its answer was lost. What was asked
@@ -2144,7 +2456,11 @@ impl Actions {
                         // device's own removal is as final as a tombstone.
                         _ => {
                             if live
-                                .update(session, |state| state.store.pack.forget(item_id))
+                                .update(session, |state| {
+                                    if let Some(pack) = state.store.pack_for(family) {
+                                        pack.forget(item_id);
+                                    }
+                                })
                                 .is_some()
                             {
                                 done.emit(None);
@@ -2159,7 +2475,104 @@ impl Actions {
             Action::CloseSticker => {
                 live.now(|state| state.sticker_open = None);
             }
+            Action::SwitchFamily(family_id) => {
+                if !crate::round_video::may_leave() {
+                    return;
+                }
+                sync::show_family(&live, session, family_id);
+            }
+            Action::AcceptInvitation { invitation_id } => {
+                spawn_local(async move {
+                    match api::accept_invitation(&token, invitation_id).await {
+                        // In, and shown: its chats, board and roster come
+                        // with the resync (docs/protocol.md, "Several
+                        // families").
+                        Ok(family) => {
+                            live.update(session, |state| {
+                                state.store.remove_invitation(invitation_id)
+                            });
+                            this.refresh_account(session, &token).await;
+                            sync::show_family(&live, session, family.id);
+                        }
+                        Err(error) => this.invitation_refused(session, invitation_id, &error),
+                    }
+                });
+            }
+            Action::DeclineInvitation { invitation_id } => {
+                spawn_local(async move {
+                    match api::decline_invitation(&token, invitation_id).await {
+                        Ok(()) => {
+                            live.update(session, |state| {
+                                state.store.remove_invitation(invitation_id)
+                            });
+                        }
+                        Err(error) => this.invitation_refused(session, invitation_id, &error),
+                    }
+                });
+            }
+            Action::Invite { user_id, done } => {
+                let family = this.family();
+                spawn_local(async move {
+                    match api::invite(&token, family, user_id).await {
+                        Ok(invitation) => {
+                            if live
+                                .update(session, |state| state.store.apply_invitation(invitation))
+                                .is_some()
+                            {
+                                done.emit(None);
+                            }
+                        }
+                        Err(error) => this.said(session, error, &done),
+                    }
+                });
+            }
+            Action::WithdrawInvitation {
+                invitation_id,
+                done,
+            } => {
+                let family = this.family();
+                spawn_local(async move {
+                    match api::withdraw_invitation(&token, family, invitation_id).await {
+                        Ok(()) => {
+                            if live
+                                .update(session, |state| {
+                                    state.store.remove_invitation(invitation_id)
+                                })
+                                .is_some()
+                            {
+                                done.emit(None);
+                            }
+                        }
+                        Err(error) => this.said(session, error, &done),
+                    }
+                });
+            }
         }
+    }
+
+    /// An invitation that could not be answered. `invitation_not_pending`
+    /// is one gone already — withdrawn, lapsed, or answered on another
+    /// device — and goes from here too, with a word; the rest are said on
+    /// the bar, and leave it waiting (docs/protocol.md, "Several
+    /// families": `family_full` and `too_many_families` leave it PENDING).
+    fn invitation_refused(&self, session: u64, invitation_id: i64, error: &ApiError) {
+        if *error == ApiError::Unauthorized {
+            expiry(&self.live, session, &self.sign_out)();
+            return;
+        }
+        let max = self.live.read(|state| max_families(&state.store));
+        let text = match error.code() {
+            Some("invitation_not_pending") => {
+                self.live.update(session, |state| {
+                    state.store.remove_invitation(invitation_id)
+                });
+                fc_text::families::refusal(error.code(), max).unwrap_or_default()
+            }
+            Some("family_full") => crate::views::gate::join_failure(error),
+            code => fc_text::families::refusal(code, max)
+                .unwrap_or_else(|| t("That didn't work. Try again.").to_string()),
+        };
+        self.live.update(session, |state| state.notice = Some(text));
     }
 
     /// A sticker into the outbox: ONE attachment, no words, the flag — and
@@ -2202,8 +2615,16 @@ impl Actions {
             );
             // Which sticker was used is this device's to remember, and
             // nobody else's to know: kept here, never sent.
-            let recents = crate::session::use_pack_item(state.store.my_user_id, item_id);
-            state.store.pack.recents = recents;
+            state.store.pack.recents = match state.store.current_family_id() {
+                Some(family_id) => crate::session::use_pack_item(
+                    state.store.my_user_id,
+                    family_id,
+                    state.store.home_family_id() == Some(family_id),
+                    item_id,
+                ),
+                // No family to keep them for: this tab's order alone.
+                None => fc_text::pack::used(&state.store.pack.recents, item_id),
+            };
         });
         if queued.is_some() {
             wake(&self.channels, Wake::Queued);
@@ -2240,6 +2661,7 @@ impl Actions {
         &self,
         session: u64,
         token: &str,
+        family: Option<i64>,
         picture: web_sys::Blob,
         label: Option<String>,
     ) -> Result<bool, String> {
@@ -2265,11 +2687,11 @@ impl Actions {
         // nobody asked to do anything. Only a second refusal is said.
         let mut may_upload_again = true;
         let claimed = loop {
-            let uploaded = api::upload_attachment(token, &item, sticker.file.as_ref())
+            let uploaded = api::upload_attachment(token, &item, sticker.file.as_ref(), family)
                 .await
                 .map_err(|error| self.pack_refusal(session, &error))?;
             // No preview goes up, for a pack item as for a sticker message.
-            match api::add_pack_item(token, uploaded.id, label.as_deref()).await {
+            match api::add_pack_item(token, family, uploaded.id, label.as_deref()).await {
                 Ok(claimed) => break claimed,
                 Err(error) if may_upload_again && error.code() == Some("attachment_expired") => {
                     may_upload_again = false;
@@ -2288,8 +2710,11 @@ impl Actions {
         let added = claimed.added;
         // Under the per-item guard, moving no cursor: the frame for this
         // add is what moves it, for the reason the board gives.
-        self.live
-            .update(session, |state| state.store.pack.apply(claimed.item));
+        self.live.update(session, |state| {
+            if let Some(pack) = state.store.pack_for(family) {
+                pack.apply(claimed.item);
+            }
+        });
         Ok(added)
     }
 
@@ -2299,16 +2724,88 @@ impl Actions {
         if *error == ApiError::Unauthorized {
             expiry(&self.live, session, &self.sign_out)();
         }
+        self.family_gone(error);
         pack_failure(error)
+    }
+
+    /// `family_not_found`: a family this account is no longer in — left,
+    /// removed or deleted elsewhere. The resync puts it away.
+    fn family_gone(&self, error: &ApiError) {
+        if error.code() != Some("family_not_found") {
+            return;
+        }
+        if let Some((session, token)) = self.session_and_token() {
+            let this = self.clone();
+            spawn_local(async move { this.refresh_account(session, &token).await });
+        }
     }
 
     /// A refused account or family change, handed to the dialog that asked
     /// — or, for a 401, the sign-out every other ended session gets.
+    ///
+    /// `family_not_found` is a family this account is no longer in — left,
+    /// removed or deleted elsewhere: the resync puts it away.
     fn said(&self, session: u64, error: ApiError, done: &Done) {
         if error == ApiError::Unauthorized {
             expiry(&self.live, session, &self.sign_out)();
-        } else if self.live.is_live(session) {
+            return;
+        }
+        self.family_gone(&error);
+        if self.live.is_live(session) {
             done.emit(Some(error));
+        }
+    }
+
+    /// A group admin's change answered: the group as it now stands, into
+    /// the list. `chat_not_found` is a group this member is no longer in —
+    /// removed, or deleted, by a frame that has not landed yet — so it goes
+    /// from here too, and the dialog still hears the refusal: what it asked
+    /// for did not happen (docs/protocol.md, "Groups").
+    fn group_changed(
+        &self,
+        session: u64,
+        chat_id: i64,
+        changed: Result<crate::model::Chat, ApiError>,
+        done: &Done,
+    ) {
+        match changed {
+            Ok(chat) => {
+                if self
+                    .live
+                    .update(session, |state| state.store.upsert_chat(chat))
+                    .is_some()
+                {
+                    done.emit(None);
+                }
+            }
+            Err(error) => {
+                if error.code() == Some("chat_not_found") {
+                    self.live
+                        .update(session, |state| sync::drop_chat(state, chat_id));
+                }
+                self.said(session, error, done);
+            }
+        }
+    }
+
+    /// A leave or a delete answered. `chat_not_found` is the group ALREADY
+    /// gone from this member — deleted, or this device's own earlier request
+    /// went in and its answer was lost — which is what was asked for, and no
+    /// refusal at all.
+    fn group_gone(&self, session: u64, chat_id: i64, gone: Result<(), ApiError>, done: &Done) {
+        match gone {
+            Err(error) if error.code() != Some("chat_not_found") => {
+                self.said(session, error, done);
+            }
+            _ => {
+                if self
+                    .live
+                    .update(session, |state| sync::drop_chat(state, chat_id))
+                    .is_some()
+                {
+                    done.emit(None);
+                }
+            }
         }
     }
 
@@ -2340,9 +2837,13 @@ impl Actions {
             expiry(&self.live, session, &self.sign_out)();
             return;
         }
+        self.family_gone(error);
         if let (Some(note_id), Some("note_not_found")) = (note_id, error.code()) {
-            self.live
-                .update(session, |state| state.store.board.forget(note_id));
+            self.live.update(session, |state| {
+                // The board on screen: a refusal answers what was asked of
+                // it a moment ago.
+                state.store.board.forget(note_id)
+            });
         }
         if self.live.is_live(session) {
             done.emit(Some(board_failure(error)));
@@ -2366,11 +2867,12 @@ impl Actions {
         &self,
         session: u64,
         token: &str,
+        family: Option<i64>,
         photo: Prepared,
         at: (f64, f64),
     ) -> Result<(), String> {
         let item = crate::staged::OutgoingItem::new(&photo, -1);
-        let attachment = api::upload_attachment(token, &item, photo.file.as_ref())
+        let attachment = api::upload_attachment(token, &item, photo.file.as_ref(), family)
             .await
             .map_err(|error| self.refusal(session, &error))?;
         if let Some(preview) = photo.preview.clone() {
@@ -2412,11 +2914,11 @@ impl Actions {
             attachment_id: Some(attachment.id),
             ..NewNote::default()
         };
-        let note = api::create_note(token, &note)
+        let note = api::create_note(token, family, &note)
             .await
             .map_err(|error| self.refusal(session, &error))?;
         self.live
-            .update(session, |state| state.store.board.apply(note));
+            .update(session, |state| state.store.apply_note(family, note));
         Ok(())
     }
 
@@ -2441,10 +2943,11 @@ impl Actions {
         self.live
             .update(session, |state| {
                 let me = state.store.my_user_id;
-                let held =
-                    state.store.threads.get_mut(&chat_id).and_then(|thread| {
-                        thread.messages.iter_mut().find(|m| m.id == message_id)
-                    })?;
+                let held = state
+                    .store
+                    .threads
+                    .get_mut(&chat_id)
+                    .and_then(|thread| thread.get_mut(message_id))?;
                 let before = (held.reactions.clone(), held.reaction_seq);
                 let mut reactions = held.reactions.clone().unwrap_or_default();
                 match emoji {
@@ -2477,7 +2980,7 @@ impl Actions {
                 .store
                 .threads
                 .get_mut(&chat_id)
-                .and_then(|thread| thread.messages.iter_mut().find(|m| m.id == message_id))
+                .and_then(|thread| thread.get_mut(message_id))
             {
                 if held.reaction_seq == seq {
                     held.reactions = reactions;
@@ -2629,6 +3132,7 @@ mod tests {
                     kind: "family".into(),
                     title: None,
                     peer_user_id: None,
+                    ..Chat::default()
                 },
                 last_message: None,
                 unread_count: 0,
@@ -2709,6 +3213,10 @@ mod tests {
         assert!(board_failure(&refusal("board_full")).contains("The board is full"));
         assert!(board_failure(&refusal("not_note_author")).contains("Only the person who wrote"));
         assert_eq!(board_failure(&refusal("validation")), "for developers");
+        assert_eq!(
+            board_failure(&refusal("storage_allowance_used")),
+            "This family has used its storage allowance."
+        );
         assert!(fc_text::board::COLORS.contains(&random_color().as_str()));
     }
 
@@ -2737,6 +3245,22 @@ mod tests {
             backdrop_failure(&ApiError::Answered { status: 502 }),
             "Couldn't draw that. The server answered 502."
         );
+        // A paid family past this month's pictures: said as an answer that
+        // failed for it is, with the 1st of next month — not "Couldn't draw
+        // that.", which would read as worth another try.
+        assert_eq!(
+            backdrop_failure(&refusal("ai_allowance_used")),
+            format!(
+                "This family has used this month’s assistant allowance. It renews on {}.",
+                renews_on()
+            )
+        );
+        let now = js_sys::Date::now();
+        assert_eq!(
+            renews_on(),
+            crate::time::utc_day_in_sentence(&fc_text::paid::next_month_utc(now), now)
+        );
+        assert!(!renews_on().is_empty());
         assert!(asks_for_consent(&refusal("assistant_consent_required")));
         assert!(!asks_for_consent(&refusal("picture_refused")));
         assert!(!asks_for_consent(&refusal("not_note_author")));
@@ -2998,6 +3522,9 @@ mod tests {
             (400, "transcript_refused", Failure::Refused),
             (403, "transcript_not_allowed", Failure::NotAvailable),
             (403, "transcripts_unavailable", Failure::NotAvailable),
+            // A paid family's minutes used up: the day they renew, the 1st
+            // of next month (docs/protocol.md, "Paid families").
+            (403, "ai_allowance_used", transcript_allowance_used()),
             (500, "internal", Failure::TryAgain),
         ] {
             agree(&actions);
@@ -3296,6 +3823,25 @@ mod tests {
         actions.live.read(|state| {
             assert!(!state.board_open);
             assert_eq!(state.open_chat, Some(42));
+        });
+    }
+
+    /// The way back to the list, where the conversation is the whole window
+    /// (#106): the chat is CLOSED, its panels with it — nothing is read
+    /// while the list is in front.
+    #[wasm_bindgen_test]
+    fn the_way_back_to_the_list_closes_the_chat_and_its_panels() {
+        let actions = actions();
+        actions.live.now(|state| {
+            state.open_chat = Some(42);
+            state.at_newest = true;
+        });
+        actions.handle(Action::CloseChat);
+        actions.live.read(|state| {
+            assert_eq!(state.open_chat, None);
+            assert!(!state.at_newest);
+            assert!(state.store.thread_view.is_none() && state.store.open_polls.is_none());
+            assert_eq!(crate::sync::reading(state), None, "no chat is being read");
         });
     }
 
@@ -3913,6 +4459,10 @@ mod tests {
         assert!(pack_failure(&refusal("invalid_attachment")).contains("WebP or PNG"));
         assert_eq!(pack_failure(&refusal("not_in_family")), "for developers");
         assert_eq!(
+            pack_failure(&refusal("storage_allowance_used")),
+            "This family has used its storage allowance."
+        );
+        assert_eq!(
             sticker_refusal(fc_text::pack::Refusal::TooLarge),
             too_large_for_a_sticker()
         );
@@ -3932,7 +4482,7 @@ mod tests {
         let picture = webp("not really a picture");
         assert!(
             actions
-                .add_sticker(session, "t", picture.clone(), None)
+                .add_sticker(session, "t", None, picture.clone(), None)
                 .await
                 .is_err(),
             "no limits: a server from before packs"
@@ -3945,7 +4495,7 @@ mod tests {
         });
         assert_eq!(
             actions
-                .add_sticker(session, "t", picture.clone(), Some("x".repeat(65)))
+                .add_sticker(session, "t", None, picture.clone(), Some("x".repeat(65)))
                 .await,
             Err("A description is at most 64 characters.".to_string())
         );
@@ -3953,7 +4503,7 @@ mod tests {
             state.store.pack.apply(pack_item(5, 71));
         });
         assert_eq!(
-            actions.add_sticker(session, "t", picture, None).await,
+            actions.add_sticker(session, "t", None, picture, None).await,
             Err(pack_full().to_string())
         );
     }
@@ -4048,7 +4598,7 @@ mod tests {
         let size = picture.size() as usize;
 
         let added = actions
-            .add_sticker(session, "t", picture, Some("  party cat ".into()))
+            .add_sticker(session, "t", None, picture, Some("  party cat ".into()))
             .await;
 
         assert_eq!(added, Ok(true), "a 201 is a new item");
@@ -4109,7 +4659,7 @@ mod tests {
         with_a_pack(&actions, 200);
 
         let added = actions
-            .add_sticker(session, "t", png(32, 32).await, Some("   ".into()))
+            .add_sticker(session, "t", None, png(32, 32).await, Some("   ".into()))
             .await;
 
         assert_eq!(added, Ok(false), "there all along");
@@ -4149,7 +4699,7 @@ mod tests {
         with_a_pack(&actions, 200);
         assert_eq!(
             actions
-                .add_sticker(session, "t", png(32, 32).await, None)
+                .add_sticker(session, "t", None, png(32, 32).await, None)
                 .await,
             Err(pack_full().to_string())
         );
@@ -4160,7 +4710,7 @@ mod tests {
         let server = FakeServer::answering(|_| Answer::refusal(413, "attachment_too_large"));
         assert_eq!(
             actions
-                .add_sticker(session, "t", png(32, 32).await, None)
+                .add_sticker(session, "t", None, png(32, 32).await, None)
                 .await,
             Err(too_large_for_a_sticker().to_string())
         );
@@ -4202,7 +4752,7 @@ mod tests {
         let picture = png(32, 32).await;
         assert_eq!(
             actions
-                .add_sticker(session, "t", picture, Some("party cat".into()))
+                .add_sticker(session, "t", None, picture, Some("party cat".into()))
                 .await,
             Ok(true),
             "nothing is said of the first expiry"
@@ -4245,7 +4795,7 @@ mod tests {
         with_a_pack(&actions, 200);
         assert_eq!(
             actions
-                .add_sticker(session, "t", png(32, 32).await, None)
+                .add_sticker(session, "t", None, png(32, 32).await, None)
                 .await,
             Err("The sticker took too long to add. Try again.".to_string())
         );
@@ -4271,7 +4821,7 @@ mod tests {
         });
         assert_eq!(
             actions
-                .add_sticker(session, "t", png(32, 32).await, None)
+                .add_sticker(session, "t", None, png(32, 32).await, None)
                 .await,
             Err(too_large_for_a_sticker().to_string())
         );

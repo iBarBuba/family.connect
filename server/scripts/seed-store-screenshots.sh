@@ -33,6 +33,9 @@ docker exec fc-test-pg psql -U postgres \
   -c "DROP DATABASE IF EXISTS family_connect_dev WITH (FORCE);" \
   -c "CREATE DATABASE family_connect_dev;" >/dev/null
 cd "$SCRIPT_DIR/.."
+# The fixture's storage key (uitest-server.toml), made once; it refuses to overwrite.
+[ -f /tmp/fc-uitest-storage.key ] ||
+  cargo run --quiet -- storage-key new /tmp/fc-uitest-storage.key >/dev/null
 (cargo run --quiet -- --config "$SCRIPT_DIR/uitest-server.toml" > /tmp/fc-store-server.log 2>&1 &)
 # Wait for the port rather than sleeping a fixed time: a cold `cargo run`
 # has to compile the server and then apply thirty migrations, which is
@@ -264,10 +267,29 @@ send(with_rob, rob, "It is in my boot. I'll bring it Sunday.")
 with_mae = call("POST", "/chats/direct", nora, {"user_id": me[mae]})["chat"]["id"]
 send(with_mae, mae, "Tell Ellie I found the photographs of her mother.")
 
+# --- a group (1.3) ----------------------------------------------------
+# Posted last, so it is the newest row under the family chat in
+# `01-chats`: a group is the reason 1.3's chat list looks different.
+# Everyone but Ellie, which is the point of this one.
+party = call("POST", "/chats/groups", nora,
+             {"title": "Ellie's birthday 🎂",
+              "member_ids": [me[dan], me[mae], me[rob]]})["chat"]["id"]
+send(party, nora, "She turns sixteen on the 2nd. Party here that Saturday?")
+send(party, rob, "Count me in. I'll do the barbecue.")
+send(party, mae, "I'm making the cake. Not a word to her!")
+
+# --- an account in no family ------------------------------------------
+# The App Review screenshot of the subscription screen is taken as a new
+# account reaches it: "Create a family", a name, "Create Family" — on a
+# server restarted with `[subscriptions] enabled = true` (the families
+# above were made while it was off, so they stay free).
+register("sam", "Sam")
+
 print(f"\n  family 'The Harpers'  chat {family_chat}  invite {code}")
 print("  1.1 material: an 8-reply chain, two open polls, an event with answers,")
 print("                a task list mid-tick — the last two in the phone's board frame")
 print("  photograph as: nora / password123   (owner)")
+print("  subscription review shot: sam / password123   (in no family)")
 print("  server: http://127.0.0.1:8091")
 EOF
 

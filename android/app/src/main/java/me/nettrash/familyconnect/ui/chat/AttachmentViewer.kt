@@ -41,6 +41,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.pager.HorizontalPager
@@ -71,6 +72,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
@@ -83,7 +85,11 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.core.net.toUri
 import me.nettrash.familyconnect.R
 import me.nettrash.familyconnect.data.net.dto.AttachmentDto
+import me.nettrash.familyconnect.ui.components.AnimationPlayback
 import me.nettrash.familyconnect.ui.components.AttachmentAlbum
+import me.nettrash.familyconnect.ui.components.LocalAttachments
+import me.nettrash.familyconnect.ui.components.LoopSource
+import me.nettrash.familyconnect.ui.components.LoopingVideo
 import me.nettrash.familyconnect.ui.components.rememberAttachmentImage
 import kotlin.math.abs
 
@@ -133,7 +139,11 @@ fun AttachmentViewer(
             ) { page ->
                 val item = items[page]
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    if (item.isVideo) {
+                    // An animation is one test on the whole message (#96):
+                    // its only attachment, a video carrying the flag.
+                    if (item.isAnimation && items.size == 1) {
+                        AnimationAttachment(attachment = item, streamUrl = streamUrl)
+                    } else if (item.isVideo) {
                         VideoAttachment(
                             attachment = item,
                             streamUrl = streamUrl,
@@ -224,7 +234,28 @@ private fun ZoomablePhoto(
     val full = rememberAttachmentImage(attachment, preview = false)
     val preview = rememberAttachmentImage(attachment, preview = true)
     val image = full ?: preview
+    if (image == null) {
+        CircularProgressIndicator(color = Color.White)
+        return
+    }
+    ZoomableImage(
+        image = image,
+        contentDescription = stringResource(R.string.s_photo),
+        onZoomedChange = onZoomedChange,
+    )
+}
 
+/**
+ * One picture, full size: pinch and double-tap to zoom, drag to pan while
+ * zoomed — the photo viewer's own behaviour, shared by a photo page and a
+ * rich block's drawing (#97) so the two zoom the same way.
+ */
+@Composable
+private fun ZoomableImage(
+    image: ImageBitmap,
+    contentDescription: String?,
+    onZoomedChange: (Boolean) -> Unit,
+) {
     // Float state, not boxed: these change on every frame of a pinch.
     var zoom by remember { mutableFloatStateOf(1f) }
     var offsetX by remember { mutableFloatStateOf(0f) }
@@ -241,13 +272,9 @@ private fun ZoomablePhoto(
         offsetY = 0f
     }
 
-    if (image == null) {
-        CircularProgressIndicator(color = Color.White)
-        return
-    }
     Image(
         bitmap = image,
-        contentDescription = stringResource(R.string.s_photo),
+        contentDescription = contentDescription,
         contentScale = ContentScale.Fit,
         modifier = Modifier
             .fillMaxSize()
@@ -281,6 +308,54 @@ private fun ZoomablePhoto(
                 translationY = offsetY,
             ),
     )
+}
+
+/**
+ * A rich block's drawing — a diagram or a graph — full size and zoomable
+ * (#97, the design doc's "In the bubble": "using the client's own photo
+ * viewer where it has one"). The photo viewer's dialog and its zoom, minus
+ * the pager and minus Save and Share: those act on an attachment, and a
+ * drawing is not one — what the message holds is its source, which copy
+ * already hands on.
+ *
+ * The drawing keeps its own card, so it reads on the viewer's black the
+ * way it reads in the bubble.
+ */
+@Composable
+internal fun RichDrawingViewer(
+    image: ImageBitmap,
+    contentDescription: String,
+    onDismiss: () -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black),
+            contentAlignment = Alignment.Center,
+        ) {
+            ZoomableImage(
+                image = image,
+                contentDescription = contentDescription,
+                onZoomedChange = {},
+            )
+            IconButton(
+                onClick = onDismiss,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(12.dp),
+                colors = IconButtonDefaults.iconButtonColors(
+                    containerColor = Color.Black.copy(alpha = 0.45f),
+                    contentColor = Color.White,
+                ),
+            ) {
+                Icon(imageVector = Icons.Filled.Close, contentDescription = stringResource(R.string.s_close))
+            }
+        }
+    }
 }
 
 /**
@@ -397,6 +472,54 @@ private fun VideoAttachment(
             view.stopPlayback()
         },
     )
+}
+
+/**
+ * An animation, larger (#96; docs/protocol.md, "Animations"): "playing, muted
+ * and looping, without player controls" — the tile's own looping player at
+ * the picture's whole shape. Its poster shows until the first frame.
+ *
+ * Up to 8 MiB it plays the file the tile downloaded (or the sender seeded);
+ * above that, where no tile downloads, it streams — with the session's
+ * Authorization header, as the video page does.
+ */
+@Composable
+private fun AnimationAttachment(
+    attachment: AttachmentDto,
+    streamUrl: suspend (Long) -> Pair<String, Map<String, String>>?,
+) {
+    val attachments = LocalAttachments.current
+    val poster = rememberAttachmentImage(attachment, preview = true)
+    var source by remember(attachment.id) { mutableStateOf<LoopSource?>(null) }
+    LaunchedEffect(attachment.id) {
+        if (source != null) return@LaunchedEffect
+        source = if (AnimationPlayback.viewerDownloads(attachment.size)) {
+            attachments?.originalFile(attachment.id)?.let { LoopSource.Local(it) }
+        } else {
+            streamUrl(attachment.id)?.let { (url, headers) -> LoopSource.Stream(url, headers) }
+        }
+    }
+    Box(
+        // The largest box of the picture's own shape the screen holds; the
+        // page centres it.
+        modifier = Modifier.aspectRatio(attachment.aspectRatio),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (poster != null) {
+            Image(
+                bitmap = poster,
+                contentDescription = stringResource(R.string.s_gif),
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+        val playing = source
+        if (playing != null) {
+            LoopingVideo(playing, crop = false, modifier = Modifier.fillMaxSize())
+        } else if (poster == null) {
+            CircularProgressIndicator(color = Color.White)
+        }
+    }
 }
 
 private const val MAX_ZOOM = 4f

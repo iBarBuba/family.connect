@@ -54,7 +54,13 @@ public abstract record ServerFrame
     /// </summary>
     public sealed record PackItem(PackItemDto Item) : ServerFrame;
 
-    public sealed record MemberJoined(long? FamilyId, UserDto User) : ServerFrame;
+    /// <summary>
+    /// Somebody arrived in the family the frame names. <paramref name="PasswordReset"/> rides on the family OWNER's copy
+    /// alone — whether they may reset the newcomer's password, exactly as on their roster — and is absent (null) from
+    /// everybody else's and from a server before several families (docs/protocol.md, "Several families"). Null says
+    /// NOTHING: the store keeps whatever flag it already holds for that member.
+    /// </summary>
+    public sealed record MemberJoined(long? FamilyId, UserDto User, bool? PasswordReset = null) : ServerFrame;
 
     public sealed record MemberLeft(long? FamilyId, long UserId) : ServerFrame;
 
@@ -64,6 +70,34 @@ public abstract record ServerFrame
 
     public sealed record MemberBlocked(long UserId, bool Blocked) : ServerFrame;
 
+    /// <summary>
+    /// A GROUP as it now stands — created, renamed, or its members or admin changed — sent to every member, one just added
+    /// included, which is how a group appears on their devices at once (docs/protocol.md, "Groups").
+    /// </summary>
+    public sealed record ChatUpdated(ChatDto Chat) : ServerFrame;
+
+    /// <summary>
+    /// A GROUP this reader is no longer in: they left or were removed, or it was deleted. Drop it, its messages and
+    /// anything being drafted there (docs/protocol.md, "Groups").
+    /// </summary>
+    public sealed record ChatRemoved(long ChatId) : ServerFrame;
+
+    /// <summary>
+    /// An invitation into a family, new or changed — to the invited person and to that family's owner (docs/protocol.md,
+    /// "Several families").
+    /// </summary>
+    public sealed record Invitation(InvitationDto Value) : ServerFrame;
+
+    /// <summary>An invitation that lapsed: accepted, declined, withdrawn, or gone with its family or either account.</summary>
+    public sealed record InvitationRemoved(long InvitationId) : ServerFrame;
+
+    /// <summary>
+    /// A paid family's deadline appeared or went (docs/protocol.md, "Paid families", 2026-10-30): the family it names now has
+    /// this <paramref name="Plan"/> and this <paramref name="DeleteAt"/>. An ABSENT <c>delete_at</c> is the deadline GONE — the
+    /// one frame where absence clears rather than leaves alone — and an absent <c>plan</c> leaves the held one.
+    /// </summary>
+    public sealed record FamilyPlan(long FamilyId, string? Plan, string? DeleteAt) : ServerFrame;
+
     /// <summary>The assistant, mid-reply.</summary>
     public sealed record AiDelta(long ChatId, long MessageId, string Text) : ServerFrame;
 
@@ -72,7 +106,13 @@ public abstract record ServerFrame
     /// assistant": <c>ai_error</c>'s optional <c>reason</c>). Null is every other failure, exactly
     /// as it was before the field existed.
     /// </summary>
-    public sealed record AiError(long ChatId, long MessageId, AiErrorReason? Reason = null) : ServerFrame;
+    /// <param name="RenewsAt">
+    /// With <see cref="AiErrorReason.AllowanceUsed"/>, when the family's allowance starts again — the frame's
+    /// <c>renews_at</c>, the start of the next UTC month (2026-10-30). Null with any other reason, and when the frame's
+    /// stamp was absent or could not be read.
+    /// </param>
+    public sealed record AiError(
+        long ChatId, long MessageId, AiErrorReason? Reason = null, DateTimeOffset? RenewsAt = null) : ServerFrame;
 
     public sealed record CallOffer(
         string CallId, long ChatId, long FromUserId, string Sdp, bool Video) : ServerFrame;
@@ -136,18 +176,24 @@ public abstract record ServerFrame
             "board_note" => Decode<NoteDto>(frame["note"]) is { } note ? new BoardNote(note) : null,
             "pack_item" => Decode<PackItemDto>(frame["item"]) is { } item ? new PackItem(item) : null,
             "member_joined" => Decode<UserDto>(frame["user"]) is { } user
-                ? new MemberJoined(Optional(frame["family_id"]), user) : null,
+                ? new MemberJoined(Optional(frame["family_id"]), user, Flag(frame["password_reset"])) : null,
             "member_left" => new MemberLeft(Optional(frame["family_id"]), Number(frame["user_id"])),
             "member_deleted" => Decode<MemberDto>(frame["member"]) is { } member
                 ? new MemberDeleted(Optional(frame["family_id"]), member) : null,
             "family_owner" => new FamilyOwner(Optional(frame["family_id"]), Number(frame["user_id"])),
+            "chat_updated" => Decode<ChatDto>(frame["chat"]) is { Id: > 0 } updated ? new ChatUpdated(updated) : null,
+            "chat_removed" => Number(frame["chat_id"]) is > 0 and var removed ? new ChatRemoved(removed) : null,
+            "invitation" => Decode<InvitationDto>(frame["invitation"]) is { Id: > 0 } invitation
+                ? new Invitation(invitation) : null,
+            "invitation_removed" => Number(frame["invitation_id"]) is > 0 and var lapsed ? new InvitationRemoved(lapsed) : null,
+            "family_plan" => Number(frame["family_id"]) is > 0 and var planned
+                ? new FamilyPlan(planned, TextOf(frame["plan"]), TextOf(frame["delete_at"])) : null,
             "member_blocked" => new MemberBlocked(
                 Number(frame["user_id"]), frame["blocked"]?.GetValue<bool>() ?? false),
             "ai_delta" => new AiDelta(
                 Number(frame["chat_id"]), Number(frame["message_id"]),
                 frame["text"]?.GetValue<string>() ?? string.Empty),
-            "ai_error" => new AiError(
-                Number(frame["chat_id"]), Number(frame["message_id"]), AiReason(frame["reason"])),
+            "ai_error" => Stopped(frame),
             "call_offer" => frame["call_id"]?.GetValue<string>() is { } offered
                 ? new CallOffer(
                     offered, Number(frame["chat_id"]), Number(frame["from_user_id"]),
@@ -191,6 +237,51 @@ public abstract record ServerFrame
     private static long? Optional(JsonNode? node) => node is null ? null : Number(node);
 
     /// <summary>
+    /// An optional flag, or null. Anything that is not a JSON boolean is read as ABSENT rather than as either answer — an
+    /// absent flag keeps what the store holds, where a guessed one would overwrite it.
+    /// </summary>
+    private static bool? Flag(JsonNode? node)
+    {
+        try
+        {
+            return node?.GetValue<bool>();
+        }
+        catch (Exception exception) when (exception is FormatException or InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// <c>ai_error</c>, with its reason when it is one this client knows — and, for <c>"allowance_used"</c>, when the allowance
+    /// renews. A <c>renews_at</c> beside any other reason means nothing and is not read.
+    /// </summary>
+    private static AiError Stopped(JsonObject frame)
+    {
+        var reason = AiReason(frame["reason"]);
+        return new AiError(
+            Number(frame["chat_id"]), Number(frame["message_id"]), reason,
+            reason == AiErrorReason.AllowanceUsed ? Stamp(frame["renews_at"]) : null);
+    }
+
+    /// <summary>An optional string, or null — anything that is not a JSON string is read as ABSENT, never as text.</summary>
+    private static string? TextOf(JsonNode? node)
+    {
+        try
+        {
+            return node?.GetValue<string>();
+        }
+        catch (Exception exception) when (exception is FormatException or InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>An RFC3339 instant, or null for one that is absent, not a string or not readable.</summary>
+    private static DateTimeOffset? Stamp(JsonNode? node) =>
+        Store.Times.Instant(TextOf(node)) is { } milliseconds ? DateTimeOffset.FromUnixTimeMilliseconds(milliseconds) : null;
+
+    /// <summary>
     /// <c>ai_error</c>'s <c>reason</c>, or null. A value this client does not know — and anything
     /// that is not a string at all — is read as ABSENT, never guessed at: the compatibility rules,
     /// applied to a value rather than a field, so a later reason cannot be given a meaning here.
@@ -209,6 +300,7 @@ public abstract record ServerFrame
         return value switch
         {
             "refused" => AiErrorReason.Refused,
+            "allowance_used" => AiErrorReason.AllowanceUsed,
             _ => null,
         };
     }
@@ -225,6 +317,12 @@ public enum AiErrorReason
     /// picture's description — asking again in the same words gets the same refusal.
     /// </summary>
     Refused,
+
+    /// <summary>
+    /// A PAID family has used this month's assistant allowance, and the provider was not called at all (docs/protocol.md,
+    /// "Paid families", 2026-10-30). The frame says when it renews; asking again before then gets the same answer.
+    /// </summary>
+    AllowanceUsed,
 }
 
 /// <summary>
@@ -252,7 +350,8 @@ public static class ClientFrames
         IReadOnlyList<string>? pollOptions = null,
         IReadOnlyList<MentionDto>? mentions = null,
         bool sticker = false,
-        bool round = false)
+        bool round = false,
+        bool animation = false)
     {
         var frame = new JsonObject
         {
@@ -270,6 +369,11 @@ public static class ClientFrames
         {
             // A video message (docs/protocol.md, "Video messages"): the sticker's pattern — present only when true.
             frame["round"] = true;
+        }
+        if (animation)
+        {
+            // An animation (docs/protocol.md, "Animations"): the same pattern — present only when true.
+            frame["animation"] = true;
         }
         if (replyToMessageId is { } reply)
         {
