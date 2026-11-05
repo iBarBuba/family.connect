@@ -1007,9 +1007,12 @@ store is a Mac app. The iOS notes about what must never appear apply unchanged, 
 keyword-overlap consequence: dropping "private", "chat" and "server" leaves
 `messenger,self-hosted,calls,video,voice,photos,relatives,grandparents,desktop` at 77 characters.*
 
-### macOS Promotional Text (163/170 chars)
+### macOS Promotional Text (167/170 chars)
 
-A private messenger for one family, native on the Mac: a sidebar, chats in their own windows, photos, voice notes and calls. Start on our server, move to your own.
+A private messenger for one family, native on the Mac: chats and groups in a sidebar or their own windows, photos, voice messages and calls. On our server or your own.
+
+*1.3, 2026-11-05: groups in, "voice notes" → "voice messages" (round video ones are messages
+too). Promotional text changes without a review, so this can be pasted before the version is.*
 
 ### macOS What's New in 1.3 (2308/4000 chars)
 

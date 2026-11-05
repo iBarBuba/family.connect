@@ -296,7 +296,7 @@ struct PaidFamiliesRulesTests {
             == .owner("“The Smiths” will be deleted on 14 November because your subscription has ended."))
         #expect(PaidFamilies.subscriptionStatus(
             Fixture.subscription(active: true, renews: false, expires: late),
-            timeZone: losAngeles, now: Fixture.now, locale: Fixture.gb) == "Ends on 14 November")
+            timeZone: losAngeles, now: Fixture.now, locale: Fixture.gb) == "Ends on 14 November 2026")
     }
 
     @Test("the banner: none without delete_at; the owner's; a member's naming the owner")
@@ -316,18 +316,18 @@ struct PaidFamiliesRulesTests {
         #expect(PaidFamilies.banner(family: unpaid, isOwner: false, ownerName: nil) == nil)
     }
 
-    @Test("the Settings row: renews, ends, ended")
+    @Test("the Settings row: renews, ends, ended — always with the year, this year's too")
     func subscriptionStatus() {
         func status(_ subscription: SubscriptionDTO) -> String {
             PaidFamilies.subscriptionStatus(subscription, timeZone: Fixture.utc, now: Fixture.now, locale: Fixture.gb)
         }
-        #expect(status(Fixture.subscription(active: true, renews: true)) == "Renews on 14 November")
-        #expect(status(Fixture.subscription(active: true, renews: nil)) == "Renews on 14 November")
-        #expect(status(Fixture.subscription(active: true, renews: false)) == "Ends on 14 November")
+        #expect(status(Fixture.subscription(active: true, renews: true)) == "Renews on 14 November 2026")
+        #expect(status(Fixture.subscription(active: true, renews: nil)) == "Renews on 14 November 2026")
+        #expect(status(Fixture.subscription(active: true, renews: false)) == "Ends on 14 November 2026")
         #expect(status(Fixture.subscription(active: false, expires: Fixture.date("2026-10-02T09:00:00Z")))
-            == "Ended on 2 October")
+            == "Ended on 2 October 2026")
         // Refunded before its expiry: it ended, not on a day still ahead.
-        #expect(status(Fixture.subscription(active: false, expires: Fixture.deleteAt)) == "Ended on 30 October")
+        #expect(status(Fixture.subscription(active: false, expires: Fixture.deleteAt)) == "Ended on 30 October 2026")
     }
 
     @Test("who sees the row, and who is told the subscription keeps renewing")

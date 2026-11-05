@@ -44,16 +44,18 @@ nonisolated enum PaidFamilies {
 
     /// A day as the person reads it — day and month, and the year only when
     /// it is not this one ("14 November", "2 January 2027"), in their own
-    /// language and calendar.
+    /// language and calendar. `withYear` always adds it: a subscription's
+    /// date is a billing date, and "Renews on 4 December" left its owner
+    /// asking which December (2026-11-04).
     static func day(
         _ date: Date, timeZone: TimeZone = .current, now: Date = .now,
-        locale: Locale = .autoupdatingCurrent
+        locale: Locale = .autoupdatingCurrent, withYear: Bool = false
     ) -> String {
         var calendar = locale.calendar
         calendar.timeZone = timeZone
         var style = Date.FormatStyle(locale: locale, calendar: calendar, timeZone: timeZone)
             .day().month(.wide)
-        if calendar.component(.year, from: date) != calendar.component(.year, from: now) {
+        if withYear || calendar.component(.year, from: date) != calendar.component(.year, from: now) {
             style = style.year()
         }
         return date.formatted(style)
@@ -132,10 +134,11 @@ nonisolated enum PaidFamilies {
         guard subscription.active else {
             // Revoked or refunded before its expiry: it ended then, not on
             // a day still ahead.
-            let ended = day(min(subscription.expiresAt, now), timeZone: timeZone, now: now, locale: locale)
+            let ended = day(
+                min(subscription.expiresAt, now), timeZone: timeZone, now: now, locale: locale, withYear: true)
             return String(localized: "Ended on \(ended)")
         }
-        let date = day(subscription.expiresAt, timeZone: timeZone, now: now, locale: locale)
+        let date = day(subscription.expiresAt, timeZone: timeZone, now: now, locale: locale, withYear: true)
         if subscription.renews == false {
             return String(localized: "Ends on \(date)")
         }

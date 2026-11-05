@@ -25,7 +25,7 @@ below still says "Family Connect" in prose, as the App Store and Google Play lis
 
 ## Short description (≤ 1000; keep ≤ 270)
 
-A private messenger for one family and nobody else: chats, photos, voice notes, polls, a family board and one-to-one calls. Start on our server, or move your family to one you run yourself — the server is free and open source.
+A private messenger for one family and nobody else: chats and groups, photos, voice notes, polls, a family board and one-to-one calls. Start on our server, or move your family to one you run yourself — the server is free and open source.
 
 ## Description (≤ 10,000)
 
@@ -33,17 +33,21 @@ Family Connect is a private messenger for one family and nobody else — no feed
 
 On Windows it is a Windows app, not a phone screen made wide: your chats in a list beside the conversation you are reading, a family board, the family's own settings for its owner, and a call in the corner of whatever you are doing. Close the window and it keeps running in the notification area, so a message or a call still reaches you, and it can start with Windows so that it is already listening when you sign in.
 
-It works out of the box: install, pick a username — no email address, no phone number — then create your family, and you become its owner, or join one with an invite code. The owner decides whether that code admits people instantly, needs approval, or admits nobody, and can rotate it, cap the membership, or remove someone.
+It works out of the box: install, pick a username — no email address, no phone number — then start your family and become its owner, or join one free with an invite code. The owner decides whether that code admits people instantly, needs approval, or admits nobody, and can rotate it, cap the membership, or remove someone.
 
 What makes Family Connect different is where your messages live. There is no vendor cloud: every installation talks to a single Family Connect server. Out of the box that is the default server we operate — and on it, we are the ones holding your family's messages and files. But the server software is free and open source (MIT, written in Rust), and "Change server" on the sign-in screen points the app at any other one. Put it on your own hardware and your conversations exist in exactly two places: your server and your family's devices.
 
+On our server, a new family needs its owner's Family Hosting subscription, monthly or yearly, bought in the Family Connect app on iPhone, iPad or Mac — the Windows app sells nothing. Members never pay, families started before subscriptions stay free, and your own server needs none.
+
 Day to day it works like any modern messenger:
 
-- One shared chat for the whole family, and a private one-to-one chat with any member of it
+- One shared chat for the whole family, groups for part of it, and a private one-to-one chat with any member
+- One account in several families — your parents' and your own — switched from the top of your chats
 - Photos, videos, voice notes and files of any kind — up to ten on a message, picked, pasted, dragged in, or shared from another app; a message's photos open as one album you page through
 - One-to-one voice and video calls
 - Your location sent once, drawn on a map, only when you choose — never continuously, never in the background
 - Replies, threads, editing what you have sent, @mentions, and reactions from hundreds of emoji
+- Formulas, diagrams and graphs drawn right in the message, and emoji as you type
 - Polls in the family chat, and a board of coloured notes, events and lists anyone can move
 - Birthdays, so nobody has to remember
 - Real-time delivery, typing indicators, read receipts in one-to-one chats, and unread counts on the taskbar
@@ -56,13 +60,13 @@ An optional assistant can answer questions in the family chat when the person ru
 
 What it does not have: ads, analytics, tracking, crash reporting, or the attribution SDKs that usually arrive with a free messenger.
 
-And the honest limits. Windows notifies you only while Family Connect is running — in its window or in the notification area. A quit app is not notified and does not ring, so leave it running if you want to be reachable on this PC — Settings can start it when you sign in, so that is one thing less to remember. There is no camera capture inside a chat and no message search yet. This is not end-to-end encryption and we will not imply that it is: messages and attachments travel encrypted to the server your family chose — plain http only for a server on your own network — and are stored there in readable form, so whoever runs it can read them. Calls are different: picture and sound go straight between the two devices wherever the network allows; where it does not, the call connects only if your server's operator runs a relay, which forwards the stream encrypted and cannot read it. Some things necessarily reach past your server, and each is switchable in Settings or named here: the map under a shared location, drawn from OpenStreetMap; previews under links, fetched from the linked site; and a public STUN server asked for your address when you place a call. How long old messages are kept is a setting for whoever runs the server.
+And the honest limits. Windows notifies you only while Family Connect is running — in its window or in the notification area. A quit app is not notified and does not ring, so leave it running if you want to be reachable on this PC — Settings can start it when you sign in, so that is one thing less to remember. There is no camera capture inside a chat and no message search yet. This is not end-to-end encryption and we will not imply that it is: messages and attachments travel encrypted to the server your family chose — plain http only for a server on your own network — and whoever runs it can read them. Calls are different: picture and sound go straight between the two devices wherever the network allows; where it does not, the call connects only if your server's operator runs a relay, which forwards the stream encrypted and cannot read it. Some things necessarily reach past your server, and each is switchable in Settings or named here: the map under a shared location, drawn from OpenStreetMap; previews under links, fetched from the linked site; and a public STUN server asked for your address when you place a call. How long old messages are kept is a setting for whoever runs the server.
 
 If you want your family's conversations off big-tech servers — and, when you are ready, on hardware you own — this is what Family Connect is for.
 
 ## Product features (≤ 20, each ≤ 200)
 
-1. One private chat for the whole family, plus one-to-one chats with any member
+1. One private chat for the whole family, groups for part of it, and one-to-one chats with any member
 2. Photos, videos, voice notes and files — up to ten on a message
 3. One-to-one voice and video calls
 4. Share files into a chat from any app with the Windows Share menu
@@ -79,8 +83,32 @@ If you want your family's conversations off big-tech servers — and, when you a
 15. Username and password only — no email address or phone number
 16. Nine languages
 17. Starts when you sign in to Windows, waiting in the notification area
+18. One account in several families, with a switcher at the top of your chats
+19. Formulas, diagrams and graphs drawn right in the message
 
 ## What's new in this version (≤ 1500)
+
+- Groups. New Group, above your chats, starts a chat for part of your family that only its members see. Whoever started it can rename it, add or remove people, or delete it; anyone can leave.
+- Several families. One account can now belong to more than one family — your parents' and your own. Start one of your own or join another with its invite code from Settings, and switch between them at the top of your chats.
+- Family Hosting. On our server a new family now takes its owner's subscription, bought in the Family Connect app on iPhone, iPad or Mac. Families already here stay free, members never pay, and your own server needs none.
+- Formulas, diagrams and graphs. Write maths between $ signs, or a code block tagged math, mermaid, dot or plot, and it is drawn in the message for everyone.
+- New lines your way. Enter sends; Enter with Shift, Ctrl or Alt starts a new line.
+- Capital letters. A sentence you type starts with a capital letter, as on a phone.
+- Emoji as you type. :) becomes 😊 and :fire: becomes 🔥; Backspace straight after puts back what you typed.
+- Animations. A GIF or animated WebP you send plays in the chat as a short silent loop, and animated stickers move.
+- The sticker button now sits inside the message box, and a video you send keeps its sound when it is made smaller.
+- On our server, what your family sends is now stored encrypted. It is still not end-to-end encryption: the server can read what it stores.
+
+*Written on 2026-11-05 against what `win/` gained since the v1.2 tag: #107 groups (`NewGroupButton`, `Groups`), #88
+several families (`ChatsView.Families`, Settings' New Family… / Join Another Family…), #89 (`PaidFamilies` — this client
+sells nothing and says where a family is started), #97 rich blocks (`RichDrawing`) and capitals (`Capitals`, always on), #95
+`NewLineKeys`, #101 `EmojiTyping`, #96 animations (`StickerAnimator`), #106 the stickers inside the field, #98
+`ContainerSound` — and #59, the SERVER's, true of fc.nettrash.me since 2026-11-04. Before submitting, on a real PC: send a
+GIF and an animated WebP and see both loop. If 1.2 never went out, paste the 1.2 text below this one as well.*
+
+## What's new in 1.2 — history
+
+*History: the 1.2 field, superseded by 1.3 above and kept as written — paste it only where the 1.3 note says to.*
 
 This one adds voice messages, a family sticker pack, video messages you can watch, and Family Connect in your language throughout.
 
@@ -167,21 +195,23 @@ Social. (Subcategory: none.)
 
 *Partner Center → Submission options → Notes for certification. Fill the placeholders from the live server first.*
 
-DEMO SERVER: https://fc.nettrash.me — built into this package, so the app opens on the sign-in screen with nothing to configure.
+DEMO SERVER: https://fc.nettrash.me — built in, so the app opens on sign-in with nothing to configure.
 
 DEMO ACCOUNTS: owner [DEMO_USER] / [DEMO_PASS]; second member [DEMO_USER_2] / [DEMO_PASS_2], same family, for typing, read receipts and a call from a second PC. Invite code [INVITE_CODE]. Their family holds chats, photos, a voice note, a location, polls and a board.
 
-WHAT IT IS: a client for a small open-source (MIT, Rust) chat server; each installation talks to one. No public feed, no user directory, no search for people: an account in no family can reach nobody, and the only ways in are creating a family or an invite code its owner controls.
+WHAT IT IS: a client for a small open-source (MIT, Rust) chat server. No public feed, no user directory, no people search: an account in no family reaches nobody; the only ways in are creating a family or its owner's invite code.
+
+PAID FAMILIES: on fc.nettrash.me a new family needs a subscription bought in our iPhone, iPad or Mac app. This app sells nothing and says so. The demo family predates subscriptions and is free.
 
 REPORT AND BLOCK: right-click a message → Safety → Report… or Block; or Family → a member's Safety menu. Reports reach the family owner under Family → Reports.
 
 DELETE ACCOUNT: Settings → Delete Account… (password, then a confirmation). Immediate and irreversible.
 
-GENERATIVE AI (policy 11.16). Where a server's operator turns one on, the product has an assistant: a member asks it in a private chat, or writes @ai in the family chat. The declaration under Properties → Product Declarations is ticked.
-- CONSENT: nothing a member writes reaches the model until they agree, and the first message that would asks. Settings takes it back. The demo owner has not agreed, so the sheet is there to see; the second account has.
-- REPORTING WHAT THE AI WROTE: right-click any assistant reply → Safety → "Report this reply…", on both surfaces it speaks on. It reaches whoever runs the server, not the family owner, who can neither read that thread nor change what a model said.
+GENERATIVE AI (policy 11.16). Where a server's operator turns it on, an assistant answers in a private chat, or to @ai in the family chat or a group. The declaration under Properties → Product Declarations is ticked.
+- CONSENT: nothing reaches the model until the member agrees; the first message that would asks, and Settings takes it back. The demo owner has not agreed, so the sheet is there to see; the second account has.
+- REPORTING WHAT THE AI WROTE: right-click any assistant reply → Safety → "Report this reply…". It reaches whoever runs the server, not the family owner.
 
-RUNFULLTRUST: a WinUI 3 desktop app packaged as MSIX — the Windows App SDK's standard model, not a special use.
+RUNFULLTRUST: a WinUI 3 desktop app in MSIX, the Windows App SDK's standard model.
 
 STARTS WITH WINDOWS: Settings → "Start when I sign in" uses the manifest's startupTask, off until asked.
 

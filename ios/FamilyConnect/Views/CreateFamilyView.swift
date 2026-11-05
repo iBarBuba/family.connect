@@ -101,6 +101,14 @@ struct CreateFamilyView: View {
 
     private func submit() {
         model.errorText = nil
+        // The keyboard goes BEFORE anything else happens. Left focused, the
+        // field was handed its keyboard back as the subscription sheet
+        // closed — UIKit restores a presenter's first responder on dismissal
+        // — at the very moment the family was created and this screen was
+        // torn down for the new family's chats, and the family chat then
+        // laid its composer out over a keyboard that was not there: the
+        // bar sat in the middle of an empty thread.
+        fieldFocused = false
         // A server that charges, and no active subscription: sell it first.
         // With one, nothing is shown — the create goes straight through.
         if session.needsSubscriptionToCreate {
