@@ -27,6 +27,8 @@ STAND_INS = {
     "[DEMO_USER_2]": "TEST_2",
     "[DEMO_PASS]": "x" * 16,
     "[DEMO_PASS_2]": "x" * 16,
+    "[EXPIRED_USER]": "TEST_3",
+    "[EXPIRED_PASS]": "x" * 16,
     "[INVITE_CODE]": "XXXXXXXX",
     "[SUPPORT_EMAIL]": "nettrash@nettrash.me",
     "[DEMO_SERVER_URL]": "https://fc.nettrash.me",

@@ -256,7 +256,7 @@ into each.*
 
 FAMILY HOSTING, MONTHLY (me.nettrash.FamilyConnect.family.monthly). Keeps a family on our server, fc.nettrash.me, for as long as its owner's subscription lasts, billed monthly. One subscription covers every family its owner owns. Members never pay, and every family that existed before subscriptions did stays free — the review family in the version's notes included.
 
-WHERE TO BUY IT. It is offered only when a NEW family is started, and the demo owner already owns one, so: Log Out → Register (any username and password, no email) → "Create a family" → type a name → Create Family. The subscription screen opens with both plans; buy either in Sandbox. The family is created as soon as the server has checked Apple's signature on the purchase.
+WHERE TO BUY IT. Sign in as the expired-subscription account in the version's review notes: Renew, on the banner above the chat list or in Settings, opens the subscription screen with both plans. A NEW family needs one too: Log Out → Register (any username and password, no email) → "Create a family" → type a name → Create Family. Buy either plan in Sandbox; the family is renewed, or created, as soon as the server has checked Apple's signature on the purchase.
 
 AFTERWARDS. Settings shows the subscription, with Manage Subscription (Apple's own management). Restore Purchases is on the subscription screen. If the subscription ends, every member is told, and the family is deleted 14 days later unless its owner renews; Delete Account warns about a live subscription.
 
@@ -266,7 +266,7 @@ ONE PURCHASE, THREE PLATFORMS. The same app sells it on iPhone, iPad and Mac.
 
 FAMILY HOSTING, YEARLY (me.nettrash.FamilyConnect.family.yearly). Keeps a family on our server, fc.nettrash.me, for as long as its owner's subscription lasts, billed yearly. One subscription covers every family its owner owns. Members never pay, and every family that existed before subscriptions did stays free — the review family in the version's notes included.
 
-WHERE TO BUY IT. It is offered only when a NEW family is started, and the demo owner already owns one, so: Log Out → Register (any username and password, no email) → "Create a family" → type a name → Create Family. The subscription screen opens with both plans; buy either in Sandbox. The family is created as soon as the server has checked Apple's signature on the purchase.
+WHERE TO BUY IT. Sign in as the expired-subscription account in the version's review notes: Renew, on the banner above the chat list or in Settings, opens the subscription screen with both plans. A NEW family needs one too: Log Out → Register (any username and password, no email) → "Create a family" → type a name → Create Family. Buy either plan in Sandbox; the family is renewed, or created, as soon as the server has checked Apple's signature on the purchase.
 
 AFTERWARDS. Settings shows the subscription, with Manage Subscription (Apple's own management). Restore Purchases is on the subscription screen. If the subscription ends, every member is told, and the family is deleted 14 days later unless its owner renews; Delete Account warns about a live subscription.
 
@@ -277,6 +277,17 @@ whose Create Family presents `SubscriptionSheet` when `needsSubscriptionToCreate
 made after `PUT /me/subscription` (`SubscriptionScreen.complete`); the Settings rows are
 `SubscriptionSettingsSection`; "14 days" is `[subscriptions] unpaid_days` at its default — change
 it here if fc.nettrash.me's config does.*
+
+*THE EXPIRED-SUBSCRIPTION ACCOUNT, `[EXPIRED_USER]` (asked for by App Review on 2026-11-06,
+guideline 2.1, submission 366fe018). Its family must be PAID and uncovered, which is what the
+reviewer renews: `families list` shows it as `paid … (subscription ended <date>) — DELETED ON
+<date>`. The deadline is real: the hourly sweep deletes the family 14 days after it noticed, and
+the familyless account goes 7 days after that. Park it between reviews with `families plan <id>
+free` (the next sweep clears the deadline); before a submission, `families plan <id> paid` re-arms
+it with a fresh 14 days at the next sweep, provided no subscription covers the account. A
+reviewer's Sandbox purchase does cover it, until that Sandbox subscription stops renewing. Never
+sign in as it on a device whose Apple ID holds a live Family Hosting subscription: the app hands
+the newest entitlement to the server at every launch.*
 
 ### App Store Promotion images
 
@@ -290,28 +301,29 @@ does not handle (there is no `PurchaseIntent` listener). Upload the images if yo
 both subscriptions out of the product page's promoted purchases until the app handles one — a
 promoted purchase that does nothing is a guideline 2.1 rejection waiting to happen.*
 
-## Notes for App Review (paste verbatim — 3984 as written, 3995 with the placeholders filled / 4000)
+## Notes for App Review (paste verbatim — 3984 as written, 3986 with the placeholders filled / 4000)
 
 DEMO SERVER: https://fc.nettrash.me — compiled in, nothing to configure.
 
 DEMO ACCOUNTS.
 - Owner: [DEMO_USER] / [DEMO_PASS]. Owns the reviewer family; history seeded: photos, video, voice note, open poll, location, board notes, a thread, a 1:1 chat.
-- Second: [DEMO_USER_2] / [DEMO_PASS_2], same family — sign in on a second device for typing indicators, read receipts and a call.
+- Second: [DEMO_USER_2] / [DEMO_PASS_2], same family — on a second device for typing, read receipts and a call.
+- Expired subscription: [EXPIRED_USER] / [EXPIRED_PASS]. Its family's subscription has ended.
 - Invite code [INVITE_CODE]. Support [SUPPORT_EMAIL].
 
 NEW IN 1.3. Groups: Chats → New Chat → New Group. Several families: Settings → Family.
 
-SUBSCRIPTION (3.1.2). A NEW family here needs its owner's subscription; existing ones, the review family included, stay free. [DEMO_USER] already owns a family, so to buy: Log Out → Register → "Create a family" (Sandbox).
+SUBSCRIPTION (3.1.2). As [EXPIRED_USER], Renew (banner above the chats, or Settings) opens the purchase screen; buy either plan in Sandbox and the banner goes. A NEW family also needs one; older ones, the review family too, are free.
 
-WHAT IT IS. A client for a small open-source (MIT, Rust) chat server. No vendor cloud: each installation talks to one server. On the device the app is named Family; the store record is Family Connect. Review uses the default server above, online throughout; "Change server…" is for a self-hosted one.
+WHAT IT IS. A client for a small open-source (MIT, Rust) chat server. On the device the app is named Family; the store record is Family Connect. Review uses the default server above, online throughout; "Change server…" is for a self-hosted one.
 
 CONTACT IS CONTAINED (guideline 1.2). No public feed, discovery, directory or user search — nothing is posted publicly. Registration is open (username, display name, password; no email, no phone), but an account in no family can start nothing: one-to-one chats, reports, blocks and calls are refused server-side unless both share a family. The only ways in are creating a family or presenting an 8-character invite code; a new family defaults to "Need approval", so the owner admits each member, may rotate the code, cap it, close joining or remove anyone.
 
 REPORT AND BLOCK. Long-press a message → "Safety" → "Report…" or "Block"; a person can also be reported or blocked from their Manage Family row the same way. Four fixed reasons. The moderator is the family owner: reports arrive in Settings → Family → Manage Family → Reports, and push them. A report naming the owner is never listed to them; that sheet shows the server's support contact instead — [SUPPORT_EMAIL], monitored by us.
 
-DELETE ACCOUNT (5.1.1(v)). Settings → last section, beside Log Out. It asks for the account password (a live session is not proof) and a confirmation, then runs at once, irreversibly. It erases the username (freeing it), display name, password, avatar, birthday, sessions and push tokens. It also flags a live subscription. One-to-one chats go for both people; family-chat messages, notes and reactions stay as "Deleted account". Ownership passes to the longest-standing member.
+DELETE ACCOUNT (5.1.1(v)). Settings → last section, beside Log Out. It asks for the account password (a live session is not proof) and a confirmation, then runs at once, irreversibly. It erases the username (freeing it), display name, password, avatar, birthday, sessions and push tokens, and warns about a live subscription. One-to-one chats go for both people; family-chat messages, notes and reactions stay as "Deleted account". Ownership passes to the longest-standing member.
 
-NOT END-TO-END ENCRYPTED, and the app does not claim to be. Message text, photos, files and locations are readable by the chosen server's operator — on the default server, the developer. Call media (DTLS-SRTP) is peer to peer, or goes via a relay that forwards the encrypted stream without reading it.
+NOT END-TO-END ENCRYPTED, and the app does not claim to be. Message text, photos, files and locations are readable by the chosen server's operator — on the default server, the developer. Call media (DTLS-SRTP) is peer to peer, or relayed by our server still encrypted.
 
 AI ASSISTANT — CONSENT (5.1.1(i), 5.1.2(i)). The optional assistant is the only feature sending anything to third parties: [AI_PROCESSOR], and the lookup services its screen names (web search, Open-Meteo, Wikipedia). Before a member's first message reaches it, that screen names each recipient and all that travels — the message; in the family chat only an @ai message, with the last 30 days / 200 messages (others' words, names, times) while history is on; a photo only when attached and allowed; a recording's sound only when its text is asked for (another member's only with the owner's switch and their consent); to lookups only the short query the assistant writes, after a second agreement. Nothing is sent until "I Agree", the server refuses (403) until then, and Settings → Assistant withdraws it. [DEMO_USER] has NOT agreed, so the screen appears on its first message; [DEMO_USER_2] has. Policy: nettrash.me/appstore/familyconnect/privacy.html
 
@@ -1142,30 +1154,31 @@ chat,messenger,private,self-hosted,server,calls,video,voice,photos,relatives,gra
 
 *("family" and "connect" are left out for the same reason as on iOS — the app name carries them, and if the record is named "Family" rather than "Family Connect", "connect" belongs here in place of "desktop". The iOS list's "group" is dropped: on a Mac the search that matters is for a desktop messenger, and there are no group calls to index. "mac" is deliberately absent — every app in this store is a Mac app, so the word buys nothing. "kids" stays out on both platforms: a keyword implying a child audience invites a Guideline 1.3 and age-rating question this app cannot answer.)*
 
-## macOS — Notes for App Review (paste verbatim — 3967 as written, 3990 with the placeholders filled / 4000)
+## macOS — Notes for App Review (paste verbatim — 3967 as written, 3981 with the placeholders filled / 4000)
 
 DEMO SERVER: [DEMO_SERVER_URL] — compiled in; nothing to configure.
 
 DEMO ACCOUNTS.
 - Owner: [DEMO_USER] / [DEMO_PASS]. Owns the seeded reviewer family: photos, video, voice note, polls, location, board notes, a 1:1 chat.
 - Second: [DEMO_USER_2] / [DEMO_PASS_2], same family — on a second Mac for typing, read receipts and a call.
+- Expired subscription: [EXPIRED_USER] / [EXPIRED_PASS]. Its family's subscription has ended.
 - Invite code [INVITE_CODE]. Support [SUPPORT_EMAIL].
 
 NEW IN 1.3. Groups: New Group in the toolbar. Several families: in Settings.
 
-SUBSCRIPTION (3.1.2). A NEW family here needs its owner's subscription; existing ones, the review family included, stay free. [DEMO_USER] already owns a family, so to buy: Log Out → Register → "Create a family" (Sandbox).
+SUBSCRIPTION (3.1.2). As [EXPIRED_USER], Renew (banner above the sidebar, or Settings) opens the purchase screen; buy either plan in Sandbox and the banner goes. A NEW family also needs one; older ones, the review family too, are free.
 
-WHAT IT IS. A native macOS 14+ build (named Family), not Catalyst; same app and bundle id as iOS. A client for an open-source chat server, online throughout the review. Toolbar: Board, Family, Settings (also Command-comma).
+WHAT IT IS. A native macOS 14+ build (named Family), not Catalyst; same app and bundle id as iOS. Its server is online throughout the review. Toolbar: Board, Family, Settings.
 
-CONTACT IS CONTAINED (guideline 1.2). No public feed, discovery, directory or user search. Registration is open (username, display name, password; no email, no phone), but an account in no family can start nothing: one-to-one chats, reports, blocks and calls are refused server-side unless both share a family. The only ways in are creating a family or an 8-character invite code; a new family defaults to "Need approval", so the owner admits each member, may rotate the code, cap it, close joining or remove anyone.
+CONTACT IS CONTAINED (guideline 1.2). No public feed, discovery, directory or user search. Registration is open (username, name, password; no email or phone), but an account in no family can start nothing: one-to-one chats, reports, blocks and calls are refused server-side unless both share a family. The only ways in are creating a family or an 8-character invite code; a new family defaults to "Need approval", so the owner admits each member, may rotate the code, cap it, close joining or remove anyone.
 
 REPORT AND BLOCK. Right-click a message → "Safety", or "Safety" on a member's row in the Family sheet. Four fixed reasons. The moderator is the family owner: reports arrive in that sheet, under Reports, and push them. A report naming the owner is never listed to them: the sheet shows [SUPPORT_EMAIL], which we monitor.
 
-DELETE ACCOUNT (5.1.1(v)). Settings in the toolbar → last section, beside Log Out. It asks for the account password (a live session is not proof) and a confirmation, then runs at once, irreversibly, erasing the username, display name, password, avatar, birthday and every token. It also flags a live subscription. One-to-one chats go for both people; family-chat messages, notes and reactions stay as "Deleted account".
+DELETE ACCOUNT (5.1.1(v)). Settings in the toolbar → last section, beside Log Out. It asks for the account password and a confirmation, then runs at once, irreversibly, erasing the username, display name, password, avatar, birthday and every token. It also flags a live subscription. One-to-one chats go for both people; family-chat messages, notes and reactions stay as "Deleted account".
 
 NOT END-TO-END ENCRYPTED, and the app does not claim to be. Message text, photos, files and locations are readable by the chosen server's operator — on the default server, the developer. Call media (DTLS-SRTP) is peer to peer, or relayed by our server still encrypted.
 
-com.apple.security.network.server. Calls are peer to peer: the WebRTC connection binds UDP sockets and the far side's ICE checks and media arrive on them — inbound traffic the sandbox counts as serving, so network.client alone leaves calls unconnected. Nothing else uses it: no listening port, no embedded server, no Bonjour.
+com.apple.security.network.server. Calls are peer to peer: WebRTC binds UDP sockets that receive the far side's ICE checks and media — inbound traffic the sandbox counts as serving, so network.client alone leaves calls unconnected. Nothing else uses it: no listening port, no embedded server, no Bonjour.
 
 AI ASSISTANT — CONSENT (5.1.1(i), 5.1.2(i)). The optional assistant is the only feature sending anything to third parties: [AI_PROCESSOR], and the lookup services its screen names (web search, Open-Meteo, Wikipedia). Before a member's first message reaches it, that screen names each recipient and all that travels — the message; in the family chat only an @ai message, with the last 30 days / 200 messages (others' words, names, times) while history is on; a photo only when attached and allowed; a recording's sound only when its text is asked for (another member's only with the owner's switch and their consent); to lookups only the short query the assistant writes, after a second agreement. Nothing is sent until "I Agree", the server refuses (403) until then, and Settings → Assistant withdraws it. [DEMO_USER] has NOT agreed, so it appears on its first message. Policy: nettrash.me/appstore/familyconnect/privacy.html
 
