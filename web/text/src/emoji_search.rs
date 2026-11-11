@@ -109,8 +109,9 @@ pub fn name(lang: Lang, emoji: &str) -> Option<&'static str> {
 }
 
 /// Empty queries return no search results: the UI then draws the catalogue.
-/// All query words must match; exact names/aliases come before prefixes and
-/// keywords. Ties keep catalogue order, with each emoji offered once.
+/// All query words must match; exact localised/English names and aliases come
+/// before name prefixes and keywords. Ties keep catalogue order, with each
+/// emoji offered once.
 pub fn search(lang: Lang, query: &str) -> Vec<Match> {
     let query = normalise(query);
     if query.is_empty() {
@@ -136,12 +137,19 @@ pub fn search(lang: Lang, query: &str) -> Vec<Match> {
             .get(lang.tag())
             .or_else(|| entry.names.get("en"));
         let Some(&name) = name else { continue };
+        let local_name = normalise(name);
+        let english_name = entry.names.get("en").map(|name| normalise(name));
         let rank = if exact_emoji
-            || normalise(name) == query
+            || local_name == query
+            || english_name.as_deref() == Some(query.as_str())
             || entry.aliases.iter().any(|alias| alias == &query)
         {
             0
-        } else if normalise(name).starts_with(&query) {
+        } else if local_name.starts_with(&query)
+            || english_name
+                .as_ref()
+                .is_some_and(|name| name.starts_with(&query))
+        {
             1
         } else {
             2
@@ -224,6 +232,36 @@ mod tests {
             search(Lang::En, "👍🏽").is_empty(),
             "not in the reaction catalogue"
         );
+    }
+
+    #[test]
+    fn english_exact_name_ranks_first_in_russian() {
+        let found = search(Lang::Ru, "  :ICE:  ");
+        assert_eq!(
+            found.first(),
+            Some(&Match {
+                emoji: "🧊",
+                name: "кубик льда",
+            })
+        );
+    }
+
+    #[test]
+    fn english_name_prefix_ranks_before_keyword_substrings_in_russian() {
+        let found = search(Lang::Ru, "ic");
+        let ice = found
+            .iter()
+            .position(|result| result.emoji == "🧊")
+            .unwrap();
+        let nice = found
+            .iter()
+            .position(|result| result.emoji == "😀")
+            .unwrap();
+        assert!(
+            ice < nice,
+            "English name prefix must precede the nice keyword"
+        );
+        assert_eq!(found[ice].name, "кубик льда");
     }
 
     #[test]
