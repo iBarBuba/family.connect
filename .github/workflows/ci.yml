@@ -83,7 +83,7 @@ jobs:
       linux: ${{ steps.filter.outputs.linux }}
       web: ${{ steps.filter.outputs.web }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - id: filter
@@ -183,7 +183,7 @@ jobs:
     # binary races initdb and panics.
     services:
       postgres:
-        image: postgres:16.15@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657
+        image: postgres:16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -196,19 +196,19 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
 
       # Pinned rather than `stable`. The clippy step below is -D warnings, so
       # an unpinned toolchain turns "rustc shipped a new lint" into a red build
       # with no commit to blame. 1.95.0 is what these gates were verified
       # green on; bump it deliberately.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable action; toolchain is explicit
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
 
@@ -302,7 +302,7 @@ jobs:
 
       - name: Upload test log
         if: failure()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v6
         with:
           name: server-test-log
           path: ${{ runner.temp }}/server-tests.log
@@ -498,7 +498,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
 
       # JetBrains' JDK 25, NOT the Temurin 17 every other Android repo here
       # uses: android/gradle/gradle-daemon-jvm.properties pins
@@ -608,7 +608,7 @@ jobs:
 
       - name: Upload reports
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v6
         with:
           name: android-reports
           path: |
@@ -625,7 +625,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
       # Every literal the Apple apps show is in the catalogue, in all nine localisations.
       - name: iOS and macOS
         run: python3 ios/scripts/check-strings.py
@@ -655,7 +655,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
       - name: Every copy equals web/rich
         run: |
           status=0
@@ -686,7 +686,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
 
       # The deployment target is only iOS 17, which makes an older image look
       # safe -- but the source calls MKMapItem(location:address:), which exists
@@ -821,7 +821,7 @@ jobs:
 
       - name: Upload result bundle
         if: failure()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v6
         with:
           name: ios-xcresult
           path: ${{ runner.temp }}/FamilyConnect.xcresult
@@ -835,7 +835,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
 
       - name: Show toolchain
         run: |
@@ -909,7 +909,7 @@ jobs:
 
       - name: Upload result bundle
         if: failure()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v6
         with:
           name: macos-xcresult
           path: ${{ runner.temp }}/FamilyConnect-macOS.xcresult
@@ -933,7 +933,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-dotnet@v5
         with:
@@ -1028,19 +1028,15 @@ jobs:
       # server's. It is pure Rust with no browser in it, so it runs natively in seconds, and this
       # job already runs whenever it changes. Counted like every suite here: libtest exits 0 for a
       # run that matched nothing. The floor is slack (430 against 477 on 2026-10-05) so that
-      # removing a test is maintenance, while losing a module is not. Its tracked lockfile
-      # freezes the shared Web rules' dependency resolution too.
-      - name: Install Rust for the shared Web rules
-        if: matrix.os == 'ubuntu-24.04'
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable action; explicit version
-        with:
-          toolchain: 1.95.0
+      # removing a test is maintenance, while losing a module is not. No `--locked`: web/.gitignore
+      # keeps Cargo.lock out of git for everything under web/, so a fresh checkout has none and
+      # `--locked` refuses to create one (exit 101) — the oracle step below resolves the same way.
       - name: The shared text crate's own tests
         if: matrix.os == 'ubuntu-24.04'
         working-directory: web/text
         run: |
           set -o pipefail
-          cargo test --locked 2>&1 | tee "$RUNNER_TEMP/web-text-tests.log"
+          cargo test 2>&1 | tee "$RUNNER_TEMP/web-text-tests.log"
           awk '
             /^test result:/ {
               for (i = 1; i <= NF; i++) {
@@ -1071,13 +1067,13 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
         run: |
           cd win/tools/board-oracle
-          cargo run --locked --quiet > ../../tests/FamilyConnect.Core.Tests/Fixtures/board-vectors.json
-          cargo run --locked --quiet -- chat > ../../tests/FamilyConnect.Core.Tests/Fixtures/chat-vectors.json
-          cargo run --locked --quiet -- media-plan > "$RUNNER_TEMP/media-plan-vectors.json"
-          cargo run --locked --quiet -- record > "$RUNNER_TEMP/record-vectors.json"
-          cargo run --locked --quiet -- waveform > "$RUNNER_TEMP/waveform-vectors.json"
-          cargo run --locked --quiet -- emoji-typing > "$RUNNER_TEMP/emoji-typing-vectors.json"
-          cargo run --locked --quiet -- animation-plan > "$RUNNER_TEMP/animation-plan-vectors.json"
+          cargo run --quiet > ../../tests/FamilyConnect.Core.Tests/Fixtures/board-vectors.json
+          cargo run --quiet -- chat > ../../tests/FamilyConnect.Core.Tests/Fixtures/chat-vectors.json
+          cargo run --quiet -- media-plan > "$RUNNER_TEMP/media-plan-vectors.json"
+          cargo run --quiet -- record > "$RUNNER_TEMP/record-vectors.json"
+          cargo run --quiet -- waveform > "$RUNNER_TEMP/waveform-vectors.json"
+          cargo run --quiet -- emoji-typing > "$RUNNER_TEMP/emoji-typing-vectors.json"
+          cargo run --quiet -- animation-plan > "$RUNNER_TEMP/animation-plan-vectors.json"
           cd ../../..
           git diff --exit-code -- win/tests/FamilyConnect.Core.Tests/Fixtures \
             || { echo "::error::the oracle fixtures are out of date -- regenerate them (win/README.md)"; exit 1; }
@@ -1104,7 +1100,7 @@ jobs:
 
       - name: Upload test log
         if: failure()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v6
         with:
           name: win-test-log-${{ matrix.os }}
           path: ${{ runner.temp }}/win-test.log
@@ -1126,7 +1122,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-dotnet@v5
         with:
@@ -1238,7 +1234,7 @@ jobs:
           Write-Host "MSIX version OK: $expected."
 
       - name: Upload the MSIX
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v6
         with:
           name: familyconnect-${{ matrix.platform }}-msix
           path: AppPackages/**/*.msix
@@ -1272,7 +1268,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
 
       - name: The Ubuntu 26.04 image
         run: linux/scripts/dev.sh image
@@ -1317,7 +1313,7 @@ jobs:
         run: linux/scripts/package-rpm.sh ${{ matrix.arch }}
 
       - name: Upload the packages
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v6
         with:
           name: family-connect-linux-${{ matrix.arch }}
           path: |
@@ -1329,7 +1325,7 @@ jobs:
 
       - name: Upload test log
         if: failure()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v6
         with:
           name: linux-test-log-${{ matrix.arch }}
           path: ${{ runner.temp }}/linux-tests.log

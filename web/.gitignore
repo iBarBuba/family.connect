@@ -1,3 +1,6 @@
-# Build output. Dependency lockfiles are tracked for reproducible Web CI.
+# Build output and nested crate locks follow the existing project policy.
 /dist
 target
+Cargo.lock
+# Only the application lockfile is tracked for the new Web CI job.
+!/Cargo.lock

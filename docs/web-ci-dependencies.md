@@ -2,8 +2,8 @@
 
 Dependency changes in this scope are deliberate repository changes, reviewed together with the
 lockfiles, checksums and validation results. CI does not run update commands or follow a browser
-release channel. The scope is Web, its server/PostgreSQL fixture and the shared Rust checks that
-verify Web data. Native-client toolchains and the Linux release workflow are outside this change.
+release channel. The scope is only the new Web CI job and the server-artifact handoff added for it. Existing
+CI jobs retain their previous action references, services, toolchains and dependency policies.
 
 | Input | Pin |
 | --- | --- |
@@ -12,12 +12,12 @@ verify Web data. Native-client toolchains and the Linux release workflow are out
 | Node / bundled npm | Node 26.13.0 in `web/e2e/.node-version`; npm 11.20.0 in `package.json` and the CI version check; `check-latest: false` |
 | Rust and host C linker/build libraries | `rust:1.95.0-trixie` by SHA256 digest; explicit 1.95.0 rustfmt/Clippy and wasm32 target |
 | Rust bootstrap | Included in the digest-pinned Rust build image; self-updates disabled, exact-version component installation uses `--no-self-update` |
-| Web and shared/oracle Rust dependencies | Tracked `web/Cargo.lock`, `web/text/Cargo.lock` and `win/tools/board-oracle/Cargo.lock`; CI uses `--locked` |
-| Server Rust dependencies | Existing tracked `server/Cargo.lock` and locked server build; its binary is reused by Web |
+| Web Rust dependencies | Tracked `web/Cargo.lock`, including the Web application’s resolution of path dependencies; the new Web job uses `--locked` |
+| Reused server build | Consumed from the existing server job without changing that job’s dependency policy |
 | Trunk | Exact 0.22.1 archive and SHA256; release version checking disabled; Trunk runs offline after locked dependencies are fetched |
 | wasm-bindgen CLI | Exact 0.2.130 archive and SHA256, matching the crate in Web's lockfile; installed on PATH before Trunk |
-| PostgreSQL fixture | The previously tested PostgreSQL 16.15 image by SHA256 digest in Server and Web |
-| GitHub Actions used by Web/Server | Full commit SHAs for checkout, artifact upload/download, Rust setup/cache and Node setup; shared uses in the existing CI file use the same pins |
+| New Web PostgreSQL fixture | PostgreSQL 16.15 by SHA256 digest in the Web job only; the existing server service is untouched |
+| New CI steps | Full commit SHAs for actions in the new Web job and the new server-artifact upload step; pre-existing action references are untouched |
 | Emoji search data | Existing CLDR source commit and input SHA256 manifest under `tools/emoji/` |
 
 The Web job uses two pinned Docker environments on the existing runner: Rust builds/checks/serves Web, and Playwright runs the existing server binary and browser test. They use the runner loopback network and share the checkout, ephemeral evidence and explicitly pinned Node installation. The server is built once by the existing server job.
