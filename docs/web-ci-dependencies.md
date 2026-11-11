@@ -10,8 +10,8 @@ verify Web data. Native-client toolchains and the Linux release workflow are out
 | Playwright Test, Playwright and Playwright Core | Exact 1.65.0 packages and integrity hashes in `web/e2e/package-lock.json`; installed with `npm ci --ignore-scripts` |
 | Browser and Linux userland | `mcr.microsoft.com/playwright:v1.65.0-noble` by SHA256 digest in the existing CI's Web job; Chromium 158.0.8127.18, revision 1254 |
 | Node / bundled npm | Node 26.13.0 in `web/e2e/.node-version`; npm 11.20.0 in `package.json` and the CI version check; `check-latest: false` |
-| Rust | Explicit 1.95.0 toolchain, rustfmt/Clippy and wasm32 target |
-| Rust bootstrap in the Web image | rustup 1.29.3 by versioned URL and committed SHA256; self-updates disabled |
+| Rust and host C linker/build libraries | `rust:1.95.0-trixie` by SHA256 digest; explicit 1.95.0 rustfmt/Clippy and wasm32 target |
+| Rust bootstrap | Included in the digest-pinned Rust build image; self-updates disabled, exact-version component installation uses `--no-self-update` |
 | Web and shared/oracle Rust dependencies | Tracked `web/Cargo.lock`, `web/text/Cargo.lock` and `win/tools/board-oracle/Cargo.lock`; CI uses `--locked` |
 | Server Rust dependencies | Existing tracked `server/Cargo.lock` and locked server build; its binary is reused by Web |
 | Trunk | Exact 0.22.1 archive and SHA256; release version checking disabled; Trunk runs offline after locked dependencies are fetched |
@@ -19,6 +19,8 @@ verify Web data. Native-client toolchains and the Linux release workflow are out
 | PostgreSQL fixture | The previously tested PostgreSQL 16.15 image by SHA256 digest in Server and Web |
 | GitHub Actions used by Web/Server | Full commit SHAs for checkout, artifact upload/download, Rust setup/cache and Node setup; shared uses in the existing CI file use the same pins |
 | Emoji search data | Existing CLDR source commit and input SHA256 manifest under `tools/emoji/` |
+
+The Web job uses two pinned Docker environments on the existing runner: Rust builds/checks/serves Web, and Playwright runs the existing server binary and browser test. They use the runner loopback network and share the checkout, ephemeral evidence and explicitly pinned Node installation. The server is built once by the existing server job.
 
 The Web job has no `apt upgrade`, `npm update`, `cargo update`, unversioned `npx`, browser-channel
 selection or automatic browser installation. Its browser and required OS libraries are already in
