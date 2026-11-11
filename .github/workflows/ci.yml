@@ -368,10 +368,12 @@ jobs:
           node --version
           npm --version
 
+      # Web does not check in Cargo.lock; resolve it as the existing Trunk/local build does.
       - name: Check Web format and clippy
         run: |
-          cargo fmt --manifest-path web/Cargo.toml --all -- --check
-          cargo clippy --manifest-path web/Cargo.toml --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
+          set -o pipefail
+          cargo fmt --manifest-path web/Cargo.toml --all -- --check 2>&1 | tee "$RUNNER_TEMP/web-checks.log"
+          cargo clippy --manifest-path web/Cargo.toml --target wasm32-unknown-unknown --all-targets -- -D warnings 2>&1 | tee -a "$RUNNER_TEMP/web-checks.log"
 
       - name: Start the server and build/serve Web
         run: |
@@ -401,7 +403,6 @@ jobs:
           target = "$GITHUB_WORKSPACE/web/index.html"
           dist = "$GITHUB_WORKSPACE/web/dist"
           release = true
-          locked = true
           [serve]
           addresses = ["127.0.0.1"]
           port = 58081
@@ -467,6 +468,7 @@ jobs:
             ${{ runner.temp }}/web-e2e
             ${{ runner.temp }}/web-server.log
             ${{ runner.temp }}/web-trunk.log
+            ${{ runner.temp }}/web-checks.log
           if-no-files-found: warn
           retention-days: 14
 
