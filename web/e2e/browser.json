@@ -1,7 +1,0 @@
-{
-  "browser": {
-    "browserName": "chromium",
-    "launchOptions": { "channel": "chrome", "headless": true },
-    "contextOptions": { "locale": "en", "viewport": { "width": 1280, "height": 720 } }
-  }
-}

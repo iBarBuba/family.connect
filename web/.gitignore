@@ -1,5 +1,3 @@
-# Trunk's output, and the lock file this repo does not track for an app —
-# the same rule nettrash.me follows.
+# Build output. Dependency lockfiles are tracked for reproducible Web CI.
 /dist
-Cargo.lock
 target

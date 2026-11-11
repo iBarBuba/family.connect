@@ -1,7 +1,10 @@
-// Executed by Playwright CLI's run-code. Uses real REST/WebSocket traffic;
-// only disposable local accounts/family are fixtures. No camera is opened.
-async (page, { baseURL, outputDir }) => {
-    const assert = (value, message) => { if (!value) throw new Error(message); };
+import { test, expect } from '@playwright/test';
+import { writeFile } from 'node:fs/promises';
+
+// Real REST/WebSocket traffic with disposable local fixtures. No camera is opened.
+test('reaction_search_two_accounts_e2e', async ({ page, baseURL }, testInfo) => {
+    const outputDir = testInfo.outputDir;
+    const assert = (value, message) => expect(value, message).toBe(true);
     const origin = new URL(baseURL).origin;
     const suffix = Date.now().toString(36);
     const password = `ReactionE2E-${suffix}!`;
@@ -111,7 +114,7 @@ async (page, { baseURL, outputDir }) => {
     assert(await article(second).locator('.chips .chip').filter({ hasText: '❤️' }).count() === 0, 'reaction was replaced');
     await openPicker(page);
     const recents = await picker(page).locator('[data-emoji-section=recent] button').evaluateAll(nodes => nodes.map(node => node.dataset.emoji));
-    assert(JSON.stringify(recents) === JSON.stringify(['🔥', '❤️']), 'recents retain order without duplicates');
+    expect(recents, 'recents retain order without duplicates').toEqual(['🔥', '❤️']);
     await page.screenshot({ path: `${outputDir}/05-recents.png` });
     await search(page).fill('fire');
     await picker(page).locator('.emoji-content [data-emoji="🔥"]').click();
@@ -134,8 +137,8 @@ async (page, { baseURL, outputDir }) => {
             await search(local).fill(query);
             const fire = picker(local).locator('.emoji-content [data-emoji="🔥"]');
             await fire.waitFor();
+            await expect(fire, `${locale} accessible name is localised`).toHaveAttribute('aria-label', expectedLabel);
             const label = await fire.getAttribute('aria-label');
-            assert(label === expectedLabel, `${locale} accessible name is localised`);
             languageResults.push({ locale, query, label });
             if (locale === 'ru') await local.screenshot({ path: `${outputDir}/06-search-russian.png` });
         } finally { await context.close(); }
@@ -173,7 +176,7 @@ async (page, { baseURL, outputDir }) => {
     await page.emulateMedia({ colorScheme: 'light' });
     await openPicker(page);
     const restoredRecents = await picker(page).locator('[data-emoji-section=recent] button').evaluateAll(nodes => nodes.map(node => node.dataset.emoji));
-    assert(JSON.stringify(restoredRecents) === JSON.stringify(['🔥', '❤️']), 'reopening restores recent choices');
+    expect(restoredRecents, 'reopening restores recent choices').toEqual(['🔥', '❤️']);
     await search(page).press('Escape');
     await page.getByRole('button', { name: 'Log out', exact: true }).click();
     await page.getByRole('dialog', { name: 'Log out?' }).getByRole('button', { name: 'Log Out', exact: true }).click();
@@ -181,11 +184,17 @@ async (page, { baseURL, outputDir }) => {
     const saved = await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('fc.reaction.recents.')));
     assert(saved.length === 0, 'logout clears recent reaction data');
     await second.close();
-    return {
+    const summary = {
         test: 'reaction_search_two_accounts_e2e', status: 'passed',
         familyId: family.id, catalogueCount, languageResults, recents,
         reactionEvents: frameTypes.filter(type => type === 'reaction').length,
         searchApiRequests: searchRequests.length, mobileLayout: layout,
         assertions: ['search focus', 'empty state', 'clear', 'category navigation', 'alias ranking', 'Unicode bytes', 'deduplication', 'client-only search', 'set/replace/remove delivered over WebSocket', 'account isolation', 'nine browser locales', 'dark/mobile/short viewport', 'recent order and reopening', 'Escape', 'logout clears data'],
     };
-}
+    const summaryPath = testInfo.outputPath('summary.json');
+    await writeFile(summaryPath, JSON.stringify(summary, null, 2) + '\n');
+    await testInfo.attach('reaction-search-summary', { path: summaryPath, contentType: 'application/json' });
+    for (const name of ['03-search-heart.png', '08-search-mobile.png', '09-short-mobile-viewport.png']) {
+        await testInfo.attach(name, { path: testInfo.outputPath(name), contentType: 'image/png' });
+    }
+});
