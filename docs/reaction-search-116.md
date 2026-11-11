@@ -54,7 +54,9 @@ python3 web/e2e/run-reaction-search.py --url http://127.0.0.1:58081 --video
 
 This creates disposable local test accounts and a family, uses Playwright CLI 0.1.24, and writes screenshots, CLI logs and `summary.json` to `output/playwright/reaction-search/`. The URL is restricted to localhost to avoid creating fixtures on a live server. Video uses browser capture, not a webcam. It requires Playwright's FFmpeg component; if recording cannot start, the scenario continues with screenshots. A failing scenario captures a failure screenshot and exits non-zero.
 
-The dedicated `Web` workflow runs generation checks, format/Clippy, native rules, server/Web builds, this real-server e2e and the full browser suite on relevant pushes. Its `web-evidence` artifact retains screenshots and logs for 14 days; a full-suite failure remains a failed check.
+CI follows the repository's existing workflow. The new shared search tests run through the existing Windows/oracle job's `web/text` test step; the existing `strings` job checks the new translations. The existing resource/oracle checks remain in place. No second Web workflow, new CI job, or duplicate server build is added by this delivery. The browser component checks and real-server e2e are run locally with the commands above; adding them to hosted CI needs a separately agreed extension.
+
+An initial standalone Web workflow was tried and removed after review because it duplicated existing checks and expanded CI without prior agreement. Its [recorded run](https://github.com/iBarBuba/family.connect/actions/runs/43059598028) passed the new picker tests and the nine-locale two-account e2e on Ubuntu. The full browser suite there finished with 670 passed and 57 failures, including media capability/encoding failures and other browser-dependent assertions; this is not a green full-Web result. The failed run and its evidence are retained in GitHub rather than represented as passed or silently suppressed. Preparing a supported full-browser CI environment is separate from this first Web/shared-data PR.
 
 ## Review evidence
 
