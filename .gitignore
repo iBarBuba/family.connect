@@ -54,6 +54,8 @@ android/app/src/nettrash/google-services.json
 web/dist/
 web/target/
 web/Cargo.lock
+# Browser evidence is selected explicitly for review, never staged wholesale.
+output/playwright/
 
 # Windows client (win/) — the .NET build output, and the board oracle's own Cargo output.
 # `bin/` and `obj/` are per-project and there are several, so they are globbed; the lock file
