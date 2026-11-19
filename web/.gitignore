@@ -1,6 +1,5 @@
-# Build output and nested crate locks follow the existing project policy.
+# Trunk's output, and the lock file this repo does not track for an app —
+# the same rule nettrash.me follows.
 /dist
-target
 Cargo.lock
-# Only the application lockfile is tracked for the new Web CI job.
-!/Cargo.lock
+target

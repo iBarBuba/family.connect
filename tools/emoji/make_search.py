@@ -3,7 +3,7 @@
 
 python3 tools/emoji/make_search.py [--source-dir /path/to/cldr-49] [--check]
 Without --source-dir, downloads the ten pinned inputs to a temporary directory.
-No downloads or translation services are used by clients at runtime.
+The Web client bundles English and serves the other languages as static files.
 """
 
 import argparse
@@ -42,8 +42,11 @@ def generate(source):
         f"# Unicode CLDR 49, commit {COMMIT}. Unicode-3.0; see UNICODE-LICENSE.txt.\n"
         "# locale<TAB>catalogue emoji<TAB>localised name<TAB>keywords separated by |\n"
     )
-    rows = []
+    files = {
+        ROOT / "web/text/data/UNICODE-LICENSE.txt": (source / "LICENSE").read_text(encoding="utf-8"),
+    }
     for locale, cldr in LOCALES.items():
+        rows = []
         path = source / f"common/annotations/{cldr}.xml"
         entries = {}
         for entry in ET.parse(path).iter("annotation"):
@@ -59,10 +62,9 @@ def generate(source):
             if any(char in name + keywords for char in "\t\r\n"):
                 raise ValueError(f"Invalid TSV annotation for {glyph!r}")
             rows.append(f"{locale}\t{glyph}\t{name}\t{keywords}\n")
-    return {
-        ROOT / "web/text/data/emoji-search.tsv": header + "".join(rows),
-        ROOT / "web/text/data/UNICODE-LICENSE.txt": (source / "LICENSE").read_text(encoding="utf-8"),
-    }
+        output = "web/text/data/emoji-search.tsv" if locale == "en" else f"web/emoji-search/{locale}.tsv"
+        files[ROOT / output] = header + "".join(rows)
+    return files
 
 
 def main():
@@ -89,6 +91,7 @@ def main():
                 if not path.exists() or path.read_text(encoding="utf-8") != text:
                     raise SystemExit(f"Stale generated file: {path.relative_to(ROOT)}")
             else:
+                path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text, encoding="utf-8")
         print(f"CLDR 49: {len(catalogue())} emoji × {len(LOCALES)} locales; "
               + ("generated files verified" if args.check else "generated files written"))

@@ -3,14 +3,21 @@
 //! app (fc_text::reactions, fc_text::emoji), so a message's reactions read
 //! the same everywhere.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use fc_text::emoji::EMOJI_CATALOG;
 pub use fc_text::emoji::QUICK_REACTIONS;
-use fc_text::emoji_search;
-use fc_text::i18n::t;
+use fc_text::emoji_search::{self, Annotations};
+use fc_text::i18n::{t, Lang};
 use fc_text::reactions::{self as rules, ReactionDetail};
-use web_sys::HtmlInputElement;
+use futures::future::{select, Either, LocalBoxFuture, Shared};
+use futures::FutureExt;
+use gloo_net::http::Request;
+use gloo_timers::future::TimeoutFuture;
+use wasm_bindgen_futures::spawn_local;
+use web_sys::{AbortController, AbortSignal, HtmlInputElement};
 use yew::prelude::*;
 
 use crate::model::Reaction;
@@ -62,16 +69,109 @@ pub struct EmojiPickerProps {
     pub on_close: Callback<()>,
 }
 
+type LocaleLoad = Shared<LocalBoxFuture<'static, Option<Rc<Annotations>>>>;
+
+thread_local! {
+    // Each language shares one request and keeps its parsed catalogue for the page.
+    static LOCALE_LOADS: RefCell<HashMap<Lang, LocaleLoad>> = RefCell::new(HashMap::new());
+}
+
+fn locale_url(lang: Lang) -> String {
+    format!(
+        "emoji-search/{}.tsv?v={}",
+        lang.tag(),
+        env!("FC_EMOJI_SEARCH_VERSION")
+    )
+}
+
+async fn read_locale(lang: Lang, signal: AbortSignal) -> Option<Annotations> {
+    let response = Request::get(&locale_url(lang))
+        .abort_signal(Some(&signal))
+        .send()
+        .await
+        .ok()?;
+    if !response.ok() {
+        return None;
+    }
+    Annotations::parse(lang, &response.text().await.ok()?)
+}
+
+async fn fetch_locale(lang: Lang) -> Option<Rc<Annotations>> {
+    let abort = AbortController::new().ok()?;
+    match select(
+        Box::pin(read_locale(lang, abort.signal())),
+        TimeoutFuture::new(10_000),
+    )
+    .await
+    {
+        Either::Left((result, _)) => result.map(Rc::new),
+        Either::Right(_) => {
+            abort.abort();
+            None
+        }
+    }
+}
+
+fn start_locale_load(lang: Lang) -> LocaleLoad {
+    LOCALE_LOADS.with(|loads| {
+        loads
+            .borrow_mut()
+            .entry(lang)
+            .or_insert_with(|| {
+                async move {
+                    let result = fetch_locale(lang).await;
+                    // A later opening can retry a failed or timed-out request.
+                    if result.is_none() {
+                        LOCALE_LOADS.with(|loads| loads.borrow_mut().remove(&lang));
+                    }
+                    result
+                }
+                .boxed_local()
+                .shared()
+            })
+            .clone()
+    })
+}
+
+#[hook]
+fn use_locale(lang: Lang) -> (Option<Rc<Annotations>>, bool) {
+    let finished = use_state(|| None);
+    let loaded = LOCALE_LOADS.with(|loads| {
+        loads
+            .borrow()
+            .get(&lang)
+            .and_then(|load| load.peek())
+            .cloned()
+            .flatten()
+    });
+    let waiting = lang != Lang::En && loaded.is_none() && *finished != Some(lang);
+    use_effect_with(lang, move |&lang| {
+        let active = Rc::new(Cell::new(true));
+        if lang != Lang::En {
+            let active = active.clone();
+            spawn_local(async move {
+                start_locale_load(lang).await;
+                if active.get() {
+                    finished.set(Some(lang));
+                }
+            });
+        }
+        move || active.set(false)
+    });
+    (loaded, waiting)
+}
+
 /// Search stays above one scrollable catalogue; category shortcuts stay below.
 #[function_component(EmojiPicker)]
 pub fn emoji_picker(props: &EmojiPickerProps) -> Html {
     let query = use_state(String::new);
     let input = use_node_ref();
     let panel = use_node_ref();
-    let lang = fc_text::i18n::lang();
+    let (local, waiting) = use_locale(fc_text::i18n::lang());
+    let local = local.as_deref();
     let recent = crate::session::reaction_recents(props.my_user_id);
     let searching = !query.trim().is_empty();
-    let results = emoji_search::search(lang, &query);
+    let results = emoji_search::search(&query, local);
     let change = {
         let query = query.clone();
         Callback::from(move |event: InputEvent| {
@@ -139,12 +239,13 @@ pub fn emoji_picker(props: &EmojiPickerProps) -> Html {
                         <section aria-label={t("Search results")}>
                             <h3>{ t("Search results") }</h3>
                             if results.is_empty() {
-                                <p class="emoji-empty" role="status">{ t("No emoji found") }</p>
+                                <p class="emoji-empty" role="status">{ if waiting { t("Loading…") } else { t("No emoji found") } }</p>
                             }
                             <div class="emoji-grid">
-                                { for results.iter().map(|found| html! {
-                                    <button type="button" title={found.name} aria-label={found.name}
-                                        data-emoji={found.emoji} onclick={pick(found.emoji)}>{ found.emoji }</button>
+                                { for results.iter().map(|found| {
+                                    let name = AttrValue::from(found.name.to_owned());
+                                    html! { <button type="button" title={name.clone()} aria-label={name}
+                                        data-emoji={found.emoji} onclick={pick(found.emoji)}>{ found.emoji }</button> }
                                 }) }
                             </div>
                         </section>
@@ -154,8 +255,8 @@ pub fn emoji_picker(props: &EmojiPickerProps) -> Html {
                                 <h3>{ t("Recent emoji") }</h3>
                                 <div class="emoji-grid">
                                     { for recent.iter().map(|emoji| {
-                                        let name = emoji_search::name(lang, emoji).unwrap_or(emoji);
-                                        html! { <button type="button" title={name.to_string()} aria-label={name.to_string()}
+                                        let name = AttrValue::from(emoji_search::name(emoji, local).unwrap_or(emoji).to_owned());
+                                        html! { <button type="button" title={name.clone()} aria-label={name}
                                             data-emoji={emoji.clone()} onclick={pick(emoji)}>{ emoji }</button> }
                                     }) }
                                 </div>
@@ -166,8 +267,8 @@ pub fn emoji_picker(props: &EmojiPickerProps) -> Html {
                                 <h3>{ t(group.name) }</h3>
                                 <div class="emoji-grid">
                                     { for group.emoji.iter().map(|emoji| {
-                                        let name = emoji_search::name(lang, emoji).unwrap_or(emoji);
-                                        html! { <button type="button" title={name} aria-label={name}
+                                        let name = AttrValue::from(emoji_search::name(emoji, local).unwrap_or(emoji).to_owned());
+                                        html! { <button type="button" title={name.clone()} aria-label={name}
                                             data-emoji={*emoji} onclick={pick(emoji)}>{ *emoji }</button> }
                                     }) }
                                 </div>
@@ -201,6 +302,8 @@ mod tests {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::{Element, HtmlElement};
+
+    use crate::fake_server::{Answer, FakeServer};
 
     struct Picker {
         root: Element,
@@ -374,7 +477,14 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn picker_uses_localised_names_and_keyboard_dismissal() {
-        fc_text::i18n::use_lang(fc_text::i18n::Lang::Ru);
+        let server = FakeServer::answering(|_| {
+            Answer::Bytes(
+                200,
+                include_bytes!("../../emoji-search/ru.tsv").to_vec(),
+                "text/tab-separated-values",
+            )
+        });
+        fc_text::i18n::use_lang(Lang::Ru);
         let picker = Picker::mount(0).await;
         assert_eq!(
             picker.input().get_attribute("aria-label").as_deref(),
@@ -392,6 +502,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fire.get_attribute("aria-label").as_deref(), Some("огонь"));
+        let root = format!("{}/", document.location().unwrap().origin().unwrap());
+        assert_eq!(
+            server.lines(&[&format!("{root}emoji-search/")]),
+            [format!("GET {root}{}", locale_url(Lang::Ru))]
+        );
         let init = web_sys::KeyboardEventInit::new();
         init.set_key("Escape");
         init.set_bubbles(true);
@@ -406,6 +521,73 @@ mod tests {
         assert!(picker.picked.borrow().is_empty());
         picker.finish();
         fc_text::i18n::use_lang(fc_text::i18n::Lang::En);
+    }
+
+    #[wasm_bindgen_test]
+    async fn english_needs_no_request_and_failed_locale_retries_then_stays_cached() {
+        let requests = Rc::new(Cell::new(0));
+        let server = FakeServer::answering({
+            let requests = requests.clone();
+            move |request| {
+                if !request.path.ends_with(&locale_url(Lang::Fr)) {
+                    return Answer::Nothing;
+                }
+                let previous = requests.replace(requests.get() + 1);
+                if previous == 0 {
+                    Answer::Nothing
+                } else {
+                    Answer::Bytes(
+                        200,
+                        include_bytes!("../../emoji-search/fr.tsv").to_vec(),
+                        "text/tab-separated-values",
+                    )
+                }
+            }
+        });
+        fc_text::i18n::use_lang(Lang::En);
+        let picker = Picker::mount(0).await;
+        let root = format!(
+            "{}/",
+            web_sys::window().unwrap().location().origin().unwrap()
+        );
+        let prefix = format!("{root}emoji-search/");
+        assert!(server.lines(&[&prefix]).is_empty());
+        picker.finish();
+
+        let fire_label = |picker: &Picker| {
+            picker
+                .root
+                .query_selector(".emoji-content [data-emoji='🔥']")
+                .unwrap()
+                .unwrap()
+                .get_attribute("aria-label")
+                .unwrap()
+        };
+        fc_text::i18n::use_lang(Lang::Fr);
+        let picker = Picker::mount(0).await;
+        picker.search("fire").await;
+        assert_eq!(fire_label(&picker), "fire");
+        let request = format!("GET {root}{}", locale_url(Lang::Fr));
+        assert_eq!(
+            server.lines(&[&prefix]).as_slice(),
+            std::slice::from_ref(&request)
+        );
+        picker.finish();
+
+        let picker = Picker::mount(0).await;
+        picker.search("feu").await;
+        assert_eq!(fire_label(&picker), "feu");
+        picker.search("fire").await;
+        assert_eq!(fire_label(&picker), "feu");
+        assert_eq!(server.lines(&[&prefix]), [request.clone(), request.clone()]);
+        picker.finish();
+
+        let picker = Picker::mount(0).await;
+        picker.search("feu").await;
+        assert_eq!(fire_label(&picker), "feu");
+        assert_eq!(server.lines(&[&prefix]), [request.clone(), request]);
+        picker.finish();
+        fc_text::i18n::use_lang(Lang::En);
     }
 
     #[wasm_bindgen_test]
